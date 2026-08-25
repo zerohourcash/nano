@@ -9,12 +9,13 @@ Offline-first платформа для автономной организац�
 - `bit-core`: детерминированный block-lattice, Ed25519, роли, governance, Bit, имущество, продажи и бухгалтерские проекции.
 - `bit-chat`: подписанные каналы, XChaCha20-Poly1305, антиспам, файлы и сигнализация будущих WebRTC-звонков.
 - `bit-knowledge`: подписанная локальная база знаний с revision DAG, offline-конфликтами, merge и ссылками на изображения/blobs.
+- `bit-agent`: безопасная граница локальной нейросети: структурированные предложения, capability-политики, preview и запрет автономной подписи критических действий.
 - `bit-node`: HTTP/LAN-нода и SQLite WAL с полной перепроверкой ledger при старте.
 - `src`, `public`, `test`: ранний JavaScript/PWA-прототип, сохранённый для регрессии UX и сетевых сценариев.
 
 Один телефон может состоять в нескольких организациях. Данные, роли, балансы и ключи-псевдонимы разделяются по `community_id`, чтобы профили нельзя было связать между организациями.
 
-Подробнее: [product scope](docs/PRODUCT-SCOPE.md), [Rust architecture](docs/ADR-001-rust-architecture.md), [mesh chat](docs/ADR-002-chat.md), [resilience references](docs/ADR-003-resilience-and-references.md), [transport contract](docs/TRANSPORT.md).
+Подробнее: [product scope](docs/PRODUCT-SCOPE.md), [Rust architecture](docs/ADR-001-rust-architecture.md), [mesh chat](docs/ADR-002-chat.md), [resilience references](docs/ADR-003-resilience-and-references.md), [local AI](docs/ADR-004-local-ai.md), [transport contract](docs/TRANSPORT.md).
 
 ## Требования
 
@@ -74,6 +75,7 @@ curl http://127.0.0.1:8787/v1/state
 - Файлы шифруются, делятся на проверяемые чанки по 64 КиБ и могут докачиваться с разных узлов.
 - Антиспам ограничивает rate, TTL, hops, размеры, дубликаты и неавторизованный трафик.
 - База знаний сохраняет обе параллельные offline-редакции и требует явной подписанной merge-ревизии для публикации единой версии.
+- Локальная модель не получает ключ подписи: платежи, передача имущества, членство, роли и удаление аудита всегда требуют точного preview и подтверждения человеком.
 
 ## Git и релизы
 
