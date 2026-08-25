@@ -10,8 +10,9 @@ import { Diagnostics } from './diagnostics.js';
 
 const PORT=Number(process.env.PORT||8787), MESH_PORT=Number(process.env.MESH_PORT||47871);
 const STATIC_PEERS=(process.env.PEERS||'').split(',').map(x=>x.trim()).filter(Boolean);
-const PROD=process.env.NODE_ENV==='production', API_TOKEN=process.env.API_TOKEN||'', MESH_SECRET=process.env.MESH_SECRET||'';
+const PROD=process.env.NODE_ENV==='production', PUBLIC_TEST_MODE=process.env.PUBLIC_TEST_MODE==='1', API_TOKEN=process.env.API_TOKEN||'', MESH_SECRET=process.env.MESH_SECRET||'';
 if(PROD&&(!API_TOKEN||API_TOKEN.length<24||!MESH_SECRET||MESH_SECRET.length<24))throw Error('Production требует API_TOKEN и MESH_SECRET длиной не менее 24 символов');
+if(PROD&&PUBLIC_TEST_MODE)throw Error('PUBLIC_TEST_MODE запрещён в production');
 const DATA=path.resolve(process.env.DATA_DIR||'data'), PUBLIC=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'../public');
 const trusted=(process.env.TRUSTED_ACTORS||'').split(',').map(x=>x.trim()).filter(Boolean);
 const ledger=new Ledger(DATA,process.env.NODE_NAME||`node-${PORT}`,{trustedActors:PROD?trusted:undefined}), peers=new Map(), diagnostics=new Diagnostics();
@@ -23,6 +24,7 @@ const server=http.createServer(async(req,res)=>{try{
   const u=new URL(req.url,'http://local');
   if(req.method==='OPTIONS'){res.writeHead(204,{'access-control-allow-origin':'*','access-control-allow-methods':'GET,POST,DELETE,OPTIONS','access-control-allow-headers':'content-type,authorization'});return res.end()}
   if(req.method==='GET'&&u.pathname==='/api/qr'){const id=u.searchParams.get('assetId');if(!id||id.length>128)throw Error('Некорректный assetId');const svg=await QRCode.toString(`nano-inventory:asset:${id}`,{type:'svg',errorCorrectionLevel:'H',margin:2});res.writeHead(200,{'content-type':'image/svg+xml','content-disposition':`inline; filename="asset-${id.replace(/[^a-zA-Z0-9_-]/g,'_')}.svg"`});return res.end(svg)}
+  if(req.method==='GET'&&u.pathname==='/api/test-session'&&PUBLIC_TEST_MODE)return json(res,200,{token:API_TOKEN,warning:'Публичная тестовая сессия'});
   const auth=req.headers.authorization?.replace(/^Bearer /,'')||'';
   if(u.pathname.startsWith('/api/')&&API_TOKEN&&!safeEqual(auth,API_TOKEN))return json(res,401,{error:'Требуется токен доступа'});
   if(req.method==='GET'&&u.pathname==='/api/state')return json(res,200,ledger.state());
@@ -39,7 +41,7 @@ const server=http.createServer(async(req,res)=>{try{
   if(!full.startsWith(PUBLIC)||!fs.existsSync(full))return json(res,404,{error:'not found'});
   const ext=path.extname(full),ct={'.html':'text/html','.js':'text/javascript','.css':'text/css','.json':'application/json'}[ext]||'application/octet-stream';res.writeHead(200,{'content-type':ct+'; charset=utf-8'});fs.createReadStream(full).pipe(res);
 }catch(e){diagnostics.record('error','http',e.message,`${req.method} ${req.url}`);json(res,400,{error:e.message})}});
-server.listen(PORT,'0.0.0.0',()=>console.log(`Nano Inventory: http://localhost:${PORT} (${ledger.identity.actor.slice(0,12)})`));
+server.listen(PORT,'0.0.0.0',()=>console.log(`Nano Inventory: http://localhost:${PORT} (${ledger.identity.actor.slice(0,12)})${PUBLIC_TEST_MODE?' [PUBLIC TEST MODE]':''}`));
 
 async function sync(host,port){try{const r=await fetch(`http://${host}:${port}/api/pull`,{method:'POST',headers:{'content-type':'application/json',...(API_TOKEN?{authorization:`Bearer ${API_TOKEN}`}:{})},body:JSON.stringify({frontiers:ledger.frontiers()}),signal:AbortSignal.timeout(2500)});if(!r.ok)throw Error(`HTTP ${r.status}`);const x=await r.json(),result=ledger.import(x.events||[]);diagnostics.sync(true);if(result.rejected)diagnostics.record('warning','sync',`Отклонено событий: ${result.rejected}`,`${host}:${port}`)}catch(e){diagnostics.sync(false);diagnostics.record('warning','sync',e.message,`${host}:${port}`)}}
 const udp=dgram.createSocket({type:'udp4',reuseAddr:true});
