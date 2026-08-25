@@ -9,3 +9,4 @@ reference/
 coverage/
 *.profraw
 *.profdata
+*.zip
