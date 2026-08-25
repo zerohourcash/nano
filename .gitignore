@@ -1,0 +1,11 @@
+data/*
+!data/.gitkeep
+*.log
+.DS_Store
+node_modules/
+target/
+bit-data/
+reference/
+coverage/
+*.profraw
+*.profdata
