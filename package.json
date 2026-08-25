@@ -1,1 +1,1 @@
-{"name":"bit-community-prototype","version":"0.2.0","private":true,"type":"module","scripts":{"start":"node src/server.js","test":"node --test"},"engines":{"node":">=20"},"dependencies":{"qrcode":"^1.5.4"}}
+{"name":"bit-community-prototype","version":"0.2.0","private":true,"type":"module","scripts":{"start":"node src/server.js","test":"node --test","test:e2e":"playwright test","test:e2e:ui":"playwright test --ui"},"engines":{"node":">=20"},"dependencies":{"qrcode":"^1.5.4"},"devDependencies":{"@playwright/test":"^1.62.1"}}

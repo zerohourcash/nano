@@ -35,6 +35,7 @@ Quality gate выполняет:
 - `clippy -D warnings` для всех targets/features;
 - Rust unit, regression, cryptographic, governance, persistence и corruption tests;
 - JavaScript unit/regression tests;
+- Playwright E2E в Chromium для desktop и Pixel 7 с реальной подписью операций и визуальными артефактами;
 - аудит npm-зависимостей;
 - deployment smoke-test, создание актива и восстановление после перезапуска.
 
@@ -53,6 +54,13 @@ npm start
 Откройте `http://localhost:8787`. Телефон в той же Wi-Fi-сети открывает `http://IP-КОМПЬЮТЕРА:8787`; для доступа к камере вне localhost браузеру обычно нужен HTTPS. В разделе «Диагностика» отображаются uptime, размер локальной истории, mesh-соседи, отказы синхронизации и очищаемый журнал ошибок. Токены в диагностике редактируются.
 
 Этот UI является тестовой вертикалью. Финальная мобильная оболочка должна вызывать Rust crates через UniFFI; JavaScript-ledger не следует считать production-криптографическим ядром.
+
+Отдельный горячий прогон интерфейса:
+
+```bash
+npx playwright install chromium
+npm run test:e2e
+```
 
 ### Rust-нода
 

@@ -10,3 +10,6 @@ coverage/
 *.profraw
 *.profdata
 *.zip
+test-results/
+playwright-report/
+.playwright-data/
