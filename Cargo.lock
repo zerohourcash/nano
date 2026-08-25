@@ -146,6 +146,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "bit-knowledge"
+version = "0.1.0"
+dependencies = [
+ "bit-core",
+ "blake3",
+ "ed25519-dalek",
+ "postcard",
+ "rand 0.8.7",
+ "serde",
+ "thiserror",
+ "uuid",
+]
+
+[[package]]
 name = "bit-node"
 version = "0.1.0"
 dependencies = [

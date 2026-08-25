@@ -8,12 +8,13 @@ Offline-first платформа для автономной организац�
 
 - `bit-core`: детерминированный block-lattice, Ed25519, роли, governance, Bit, имущество, продажи и бухгалтерские проекции.
 - `bit-chat`: подписанные каналы, XChaCha20-Poly1305, антиспам, файлы и сигнализация будущих WebRTC-звонков.
+- `bit-knowledge`: подписанная локальная база знаний с revision DAG, offline-конфликтами, merge и ссылками на изображения/blobs.
 - `bit-node`: HTTP/LAN-нода и SQLite WAL с полной перепроверкой ledger при старте.
 - `src`, `public`, `test`: ранний JavaScript/PWA-прототип, сохранённый для регрессии UX и сетевых сценариев.
 
 Один телефон может состоять в нескольких организациях. Данные, роли, балансы и ключи-псевдонимы разделяются по `community_id`, чтобы профили нельзя было связать между организациями.
 
-Подробнее: [Rust architecture](docs/ADR-001-rust-architecture.md), [mesh chat](docs/ADR-002-chat.md), [transport contract](docs/TRANSPORT.md).
+Подробнее: [product scope](docs/PRODUCT-SCOPE.md), [Rust architecture](docs/ADR-001-rust-architecture.md), [mesh chat](docs/ADR-002-chat.md), [resilience references](docs/ADR-003-resilience-and-references.md), [transport contract](docs/TRANSPORT.md).
 
 ## Требования
 
@@ -72,6 +73,7 @@ curl http://127.0.0.1:8787/v1/state
 - Чат не блокирует финансовый ledger и имеет собственные frontiers/retention.
 - Файлы шифруются, делятся на проверяемые чанки по 64 КиБ и могут докачиваться с разных узлов.
 - Антиспам ограничивает rate, TTL, hops, размеры, дубликаты и неавторизованный трафик.
+- База знаний сохраняет обе параллельные offline-редакции и требует явной подписанной merge-ревизии для публикации единой версии.
 
 ## Git и релизы
 

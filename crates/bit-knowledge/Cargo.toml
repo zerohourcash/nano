@@ -1,0 +1,16 @@
+[package]
+name = "bit-knowledge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+bit-core = { path = "../bit-core" }
+blake3.workspace = true
+ed25519-dalek.workspace = true
+postcard.workspace = true
+rand.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
