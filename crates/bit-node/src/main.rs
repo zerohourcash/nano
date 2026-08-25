@@ -5,7 +5,7 @@ use axum::{
     Json, Router,
     extract::State,
     http::{HeaderMap, StatusCode},
-    routing::{get, post},
+    routing::{delete, get, post},
 };
 use bit_core::{Block, CommunityId, Identity, Ledger, Operation, PROTOCOL_VERSION};
 use serde::{Deserialize, Serialize};
@@ -44,6 +44,36 @@ struct AssetInput {
     serial: String,
     location: String,
     value_minor: i64,
+}
+#[derive(Deserialize)]
+struct InviteInput {
+    ttl_ms: i64,
+}
+#[derive(Serialize)]
+struct InviteOutput {
+    invite: String,
+    expires_at_ms: i64,
+}
+#[derive(Deserialize)]
+struct EnrollInput {
+    invite: String,
+    account: String,
+    name: String,
+    session_ttl_ms: i64,
+}
+#[derive(Serialize)]
+struct SessionOutput {
+    token: String,
+    account: String,
+    expires_at_ms: i64,
+}
+#[derive(Deserialize)]
+struct RevokeInput {
+    account: String,
+}
+#[derive(Serialize)]
+struct DeviceOutput {
+    account: String,
 }
 
 #[tokio::main]
@@ -84,6 +114,10 @@ async fn main() -> Result<()> {
         .route("/v1/state", get(state_view))
         .route("/v1/blocks", post(import_block))
         .route("/v1/admin/assets", post(create_asset))
+        .route("/v1/admin/device-invites", post(create_device_invite))
+        .route("/v1/admin/devices", delete(revoke_device))
+        .route("/v1/auth/enroll", post(enroll_device))
+        .route("/v1/auth/me", get(auth_me))
         .layer(TraceLayer::new_for_http())
         .with_state(state);
     let addr = std::env::var("BIT_LISTEN").unwrap_or_else(|_| "0.0.0.0:8787".into());
@@ -91,6 +125,64 @@ async fn main() -> Result<()> {
     tracing::info!(%addr, "Bit node listening");
     axum::serve(listener, app).await?;
     Ok(())
+}
+async fn create_device_invite(
+    State(s): State<Shared>,
+    headers: HeaderMap,
+    Json(x): Json<InviteInput>,
+) -> Result<Json<InviteOutput>, (StatusCode, String)> {
+    let mut a = s.lock().await;
+    authorize(&headers, &a.token)?;
+    let created = now();
+    let invite = a.store.create_invite(created, x.ttl_ms).map_err(bad)?;
+    Ok(Json(InviteOutput {
+        invite,
+        expires_at_ms: created.saturating_add(x.ttl_ms),
+    }))
+}
+async fn enroll_device(
+    State(s): State<Shared>,
+    Json(x): Json<EnrollInput>,
+) -> Result<Json<SessionOutput>, (StatusCode, String)> {
+    let bytes = hex::decode(&x.account).map_err(bad)?;
+    let account = <[u8; 32]>::try_from(bytes).map_err(|_| bad("account must be 32 bytes"))?;
+    let created = now();
+    let mut a = s.lock().await;
+    let token = a
+        .store
+        .enroll_device(&x.invite, account, &x.name, created, x.session_ttl_ms)
+        .map_err(bad)?;
+    Ok(Json(SessionOutput {
+        token,
+        account: x.account,
+        expires_at_ms: created.saturating_add(x.session_ttl_ms),
+    }))
+}
+async fn auth_me(
+    State(s): State<Shared>,
+    headers: HeaderMap,
+) -> Result<Json<DeviceOutput>, (StatusCode, String)> {
+    let token = bearer(&headers)?;
+    let a = s.lock().await;
+    let account = a
+        .store
+        .authenticate_device(token, now())
+        .map_err(|_| (StatusCode::UNAUTHORIZED, "unauthorized".into()))?;
+    Ok(Json(DeviceOutput {
+        account: hex::encode(account),
+    }))
+}
+async fn revoke_device(
+    State(s): State<Shared>,
+    headers: HeaderMap,
+    Json(x): Json<RevokeInput>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let bytes = hex::decode(x.account).map_err(bad)?;
+    let account = <[u8; 32]>::try_from(bytes).map_err(|_| bad("account must be 32 bytes"))?;
+    let mut a = s.lock().await;
+    authorize(&headers, &a.token)?;
+    a.store.revoke_device(account, now()).map_err(bad)?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn health() -> Json<Health> {
@@ -163,15 +255,19 @@ async fn commit(s: &Shared, block: Block) -> Result<bit_core::Hash> {
     Ok(hash)
 }
 fn authorize(headers: &HeaderMap, token: &str) -> Result<(), (StatusCode, String)> {
-    let got = headers
-        .get("authorization")
-        .and_then(|x| x.to_str().ok())
-        .and_then(|x| x.strip_prefix("Bearer "));
+    let got = bearer(headers).ok();
     if got == Some(token) {
         Ok(())
     } else {
         Err((StatusCode::UNAUTHORIZED, "unauthorized".into()))
     }
+}
+fn bearer(headers: &HeaderMap) -> Result<&str, (StatusCode, String)> {
+    headers
+        .get("authorization")
+        .and_then(|x| x.to_str().ok())
+        .and_then(|x| x.strip_prefix("Bearer "))
+        .ok_or((StatusCode::UNAUTHORIZED, "unauthorized".into()))
 }
 fn now() -> i64 {
     SystemTime::now()
