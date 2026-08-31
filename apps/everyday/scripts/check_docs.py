@@ -4,7 +4,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
 transport = (ROOT / "docs" / "TRANSPORT.md").read_text(encoding="utf-8")
-main = (ROOT / "apps" / "everyday" / "backend" / "src" / "main.rs").read_text(encoding="utf-8")
+architecture = (ROOT / "docs" / "ARCHITECTURE.md").read_text(encoding="utf-8")
+main = (ROOT / "apps" / "everyday" / "backend" / "src" / "lib.rs").read_text(encoding="utf-8")
 
 required_docs = {
     "/sync/journal": "journal endpoint",
@@ -22,6 +23,10 @@ for marker, label in required_docs.items():
 for obsolete in ("BLAKE2b-256", "/api/events", 'protocol: "nano-inventory/1"'):
     if obsolete in transport:
         raise SystemExit(f"TRANSPORT.md: найден устаревший контракт: {obsolete}")
+
+for obsolete in ("BLAKE2b-хеширование", "`assetPrev`", "монотонный `seq`"):
+    if obsolete in architecture:
+        raise SystemExit(f"ARCHITECTURE.md: найден устаревший ledger-контракт: {obsolete}")
 
 required_routes = (
     '"/sync/journal"',

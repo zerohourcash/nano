@@ -134,18 +134,21 @@ export MESHKEEPER_DEPLOY_USER=meshkeeper
 «Создать группу». После регистрации первого владельца открытая регистрация
 закрывается, остальные входят по QR-приглашению.
 
-## 4б. Android-приложение
+## 4б. Автономное Android-приложение
 
-APK — тонкий клиент: открывает интерфейс прямо с сервера, своей копии
-бэкенда больше не носит. Раньше внутри был отдельный узел на Java, который
-обязан был повторять каждое изменение основного узла и неизбежно отставал.
+APK содержит тот же Rust backend, SQLite и собранную PWA, что desktop-версия.
+Foreground service запускает `libmeshkeeper_node.so`: UI/API доступны только на
+`http://localhost:8765`, а LAN-порт `8766` публикует исключительно защищённые
+token-ом `/sync/*` и CAS routes. Старой копии бизнес-логики на Java больше нет.
+Сервер необязателен; при его наличии телефон использует его как обычный peer.
 
-Сборка (нужны JDK 17 и Android SDK):
+Сборка (нужны JDK 17, Android SDK/NDK, Rust Android targets и `cargo-ndk`):
 
 ```bash
 npm run build                    # сначала фронтенд
 cd android
-gradle :app:assembleDebug        # APK в app/build/outputs/apk/debug/
+gradle :app:assembleDebug        # Rust ABI собираются автоматически
+# APK: app/build/outputs/apk/debug/app-debug.apk
 ```
 
 Две особенности Windows:
@@ -160,8 +163,9 @@ gradle :app:assembleDebug        # APK в app/build/outputs/apk/debug/
 `MESHKEEPER_ANDROID_KEYSTORE`, `..._STORE_PASSWORD`, `..._KEY_ALIAS`,
 `..._KEY_PASSWORD`. Без них собирается только debug-вариант.
 
-При первом запуске приложение спрашивает адрес сервера — введите его один
-раз, дальше он сохраняется.
+При первом запуске адрес сервера можно оставить пустым. Приложение создаст
+криптографически случайный mesh-токен и локальную базу в `noBackupFilesDir`.
+Для связи с существующей mesh-сетью введите её HTTPS peer и общий token.
 
 ## 5. Локальные узлы
 

@@ -95,6 +95,20 @@
                 android:textColor="#6B6E9E"
                 android:textSize="13sp" />
 
+            <EditText
+                android:id="@+id/syncToken"
+                android:layout_width="match_parent"
+                android:layout_height="48dp"
+                android:layout_marginTop="10dp"
+                android:background="@drawable/bg_input"
+                android:hint="общий mesh-токен (пусто = создать)"
+                android:inputType="textPassword"
+                android:paddingStart="16dp"
+                android:paddingEnd="16dp"
+                android:textColor="#303466"
+                android:textColorHint="#9B9EC4"
+                android:textSize="14sp" />
+
             <Button
                 android:id="@+id/btnJoin"
                 android:layout_width="match_parent"

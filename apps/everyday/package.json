@@ -28,7 +28,9 @@
     "pwa:icons": "python3 scripts/generate-pwa-icons.py",
     "pwa:check": "node scripts/check-pwa.mjs",
     "docs:check": "python3 scripts/check_docs.py",
-    "verify": "npm run check && npm run lint && npm test && npm run docs:check && cargo test --manifest-path backend/Cargo.toml"
+    "mobile:node:test": "python3 scripts/mobile_node_test.py",
+    "android:check": "python3 scripts/check_android_node.py",
+    "verify": "npm run check && npm run lint && npm test && npm run docs:check && npm run android:check && cargo test --manifest-path backend/Cargo.toml"
   },
   "dependencies": {
     "@gsap/react": "^2.1.2",

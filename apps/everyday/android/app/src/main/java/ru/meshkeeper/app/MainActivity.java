@@ -9,6 +9,7 @@ import android.content.pm.PackageManager;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.SystemClock;
 import android.view.View;
 import android.webkit.PermissionRequest;
 import android.webkit.CookieManager;
@@ -24,6 +25,9 @@ import android.widget.TextView;
 import android.widget.Toast;
 
 import java.util.Arrays;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.security.SecureRandom;
 
 import androidx.activity.result.ActivityResultLauncher;
 import androidx.activity.result.contract.ActivityResultContracts;
@@ -39,10 +43,12 @@ import com.journeyapps.barcodescanner.ScanOptions;
 public class MainActivity extends AppCompatActivity {
     private static final String PREFS = "meshkeeper";
     private static final String KEY_RELAY = "relay";
+    private static final String KEY_TOKEN = "sync_token";
 
     private WebView web;
     private View setup;
     private EditText serverUrl;
+    private EditText syncToken;
     private TextView lanHint;
     private String pendingMode = "join";
     /** Адрес сервера, с которого открыт интерфейс. Пустой — интерфейс не загружен. */
@@ -80,12 +86,14 @@ public class MainActivity extends AppCompatActivity {
         web = findViewById(R.id.web);
         setup = findViewById(R.id.setup);
         serverUrl = findViewById(R.id.serverUrl);
+        syncToken = findViewById(R.id.syncToken);
         lanHint = findViewById(R.id.lanHint);
         Button btnJoin = findViewById(R.id.btnJoin);
         Button btnCreate = findViewById(R.id.btnCreate);
 
         SharedPreferences prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
         serverUrl.setText(prefs.getString(KEY_RELAY, ""));
+        syncToken.setText(prefs.getString(KEY_TOKEN, ""));
 
         WebSettings s = web.getSettings();
         s.setJavaScriptEnabled(true);
@@ -122,8 +130,8 @@ public class MainActivity extends AppCompatActivity {
 
             @Override
             public void onPageFinished(WebView view, String url) {
-                // Раньше сюда подставлялся LAN-адрес телефона-узла; теперь
-                // приглашения ведут на сервер, и подставлять нечего.
+                view.evaluateJavascript(
+                        "window.__meshkeeperNodeMode='android-rust';", null);
             }
         });
         web.setWebChromeClient(new WebChromeClient() {
@@ -141,9 +149,7 @@ public class MainActivity extends AppCompatActivity {
             public boolean onShowFileChooser(WebView webView, ValueCallback<Uri[]> filePathCallback, FileChooserParams fileChooserParams) {
                 if (fileCallback != null) fileCallback.onReceiveValue(null);
                 fileCallback = filePathCallback;
-                Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
-                intent.setType("image/*");
-                intent.addCategory(Intent.CATEGORY_OPENABLE);
+                Intent intent = fileChooserParams.createIntent();
                 try {
                     fileLauncher.launch(Intent.createChooser(intent, "Фото QR"));
                     return true;
@@ -195,8 +201,7 @@ public class MainActivity extends AppCompatActivity {
     private class JsBridge {
         @android.webkit.JavascriptInterface
         public String lanOrigin() {
-            // Узла на телефоне нет — интерфейс сам возьмёт свой origin.
-            return "";
+            return RustNode.localOrigin();
         }
 
         @android.webkit.JavascriptInterface
@@ -210,15 +215,11 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
-    /**
-     * Подсказка на экране настройки. Узел на телефоне больше не поднимается:
-     * данные живут на сервере, поэтому приложению нужен только его адрес.
-     */
     private void showSetupHint() {
         String saved = getSharedPreferences(PREFS, MODE_PRIVATE).getString(KEY_RELAY, "");
         lanHint.setText(saved.isEmpty()
-                ? "Укажите адрес сервера MeshKeeper, например https://meshkeeper.example.com"
-                : "Сервер: " + saved);
+                ? "Автономный режим: база и Rust-узел находятся на этом телефоне"
+                : "Локальный узел синхронизируется с: " + saved);
     }
 
     private void askNotify() {
@@ -242,15 +243,61 @@ public class MainActivity extends AppCompatActivity {
             Toast.makeText(this, e.getMessage(), Toast.LENGTH_LONG).show();
             return;
         }
-        if (relay.isEmpty()) {
-            Toast.makeText(this, "Укажите адрес сервера", Toast.LENGTH_LONG).show();
+        String token = syncToken.getText().toString().trim();
+        if (token.isEmpty()) token = randomToken();
+        if (token.length() < 32) {
+            Toast.makeText(this, "Mesh-токен должен содержать не менее 32 символов", Toast.LENGTH_LONG).show();
             return;
         }
-        getSharedPreferences(PREFS, MODE_PRIVATE).edit().putString(KEY_RELAY, relay).apply();
-        serverOrigin = relay;
+        getSharedPreferences(PREFS, MODE_PRIVATE).edit()
+                .putString(KEY_RELAY, relay)
+                .putString(KEY_TOKEN, token)
+                .apply();
+        syncToken.setText(token);
+        Intent service = new Intent(this, NodeService.class)
+                .putExtra(NodeService.EXTRA_RELAY, relay)
+                .putExtra(NodeService.EXTRA_TOKEN, token);
+        ContextCompat.startForegroundService(this, service);
+        serverOrigin = RustNode.localOrigin();
         setup.setVisibility(View.GONE);
         web.setVisibility(View.VISIBLE);
-        web.loadUrl(relay + "/login?app=1&mode=" + mode);
+        waitForNodeAndLoad(mode);
+    }
+
+    private void waitForNodeAndLoad(String mode) {
+        new Thread(() -> {
+            String error = "Локальный узел не запустился";
+            for (int attempt = 0; attempt < 100; attempt++) {
+                try {
+                    HttpURLConnection connection = (HttpURLConnection)
+                            new URL(RustNode.localOrigin() + "/health").openConnection();
+                    connection.setConnectTimeout(500);
+                    connection.setReadTimeout(500);
+                    if (connection.getResponseCode() == 200) {
+                        runOnUiThread(() -> web.loadUrl(
+                                RustNode.localOrigin() + "/login?app=1&mode=" + mode));
+                        return;
+                    }
+                } catch (Exception exception) {
+                    error = exception.getMessage();
+                }
+                SystemClock.sleep(100);
+            }
+            String message = error;
+            runOnUiThread(() -> {
+                Toast.makeText(this, "Ошибка Rust-узла: " + message, Toast.LENGTH_LONG).show();
+                web.setVisibility(View.GONE);
+                setup.setVisibility(View.VISIBLE);
+            });
+        }, "meshkeeper-health-wait").start();
+    }
+
+    private static String randomToken() {
+        byte[] bytes = new byte[32];
+        new SecureRandom().nextBytes(bytes);
+        StringBuilder out = new StringBuilder(64);
+        for (byte value : bytes) out.append(String.format("%02x", value & 0xff));
+        return out.toString();
     }
 
     @Override
@@ -283,19 +330,10 @@ public class MainActivity extends AppCompatActivity {
         if (requestCode == 45 && granted) startNativeScan();
     }
 
-    /**
-     * Доверяем ровно тому серверу, который настроен в приложении.
-     *
-     * Раньше здесь был localhost — приложение носило внутри собственную копию
-     * бэкенда на Java. Эта копия должна была повторять каждое изменение
-     * основного узла и неизбежно отставала, поэтому телефон стал тонким
-     * клиентом сервера. Проверка осталась строгой: схема, хост и порт должны
-     * совпасть, всё остальное уходит во внешний браузер.
-     */
     private boolean isTrustedLocalOrigin(Uri uri) {
         if (uri == null || serverOrigin.isEmpty()) return false;
         Uri trusted = Uri.parse(serverOrigin);
-        return "https".equalsIgnoreCase(uri.getScheme())
+        return "http".equalsIgnoreCase(uri.getScheme())
                 && uri.getHost() != null
                 && uri.getHost().equalsIgnoreCase(trusted.getHost())
                 && uri.getPort() == trusted.getPort();

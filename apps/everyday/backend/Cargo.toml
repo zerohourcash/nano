@@ -6,6 +6,9 @@ version = "0.1.0"
 edition = "2021"
 description = "Локальный узел учёта: подписанный журнал, без обязательного центрального сервера"
 
+[lib]
+crate-type = ["rlib", "cdylib"]
+
 [features]
 # Шифрование базы на диске (SQLCipher). Выключено по умолчанию: сборке нужен
 # OpenSSL, которого нет в типовом окружении Windows. Включать так:
@@ -33,3 +36,6 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 chacha20poly1305 = "0.10"
 argon2 = "0.5"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
+
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21"
