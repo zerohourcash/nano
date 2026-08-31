@@ -146,6 +146,14 @@ fn migrate(conn: &Connection) -> Result<()> {
          CREATE TABLE IF NOT EXISTS content_node_config (
            singleton INTEGER PRIMARY KEY CHECK(singleton=1),
            mode TEXT NOT NULL CHECK(mode IN ('smart','metadata','full'))
+         );
+         CREATE TABLE IF NOT EXISTS content_catalog (
+           hash TEXT PRIMARY KEY, mime TEXT NOT NULL, size INTEGER NOT NULL,
+           updated_at TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS content_providers (
+           hash TEXT NOT NULL, url TEXT NOT NULL, last_seen TEXT NOT NULL,
+           PRIMARY KEY(hash,url)
          );",
     )?;
     // ТЗ §8: группа может требовать фото-подтверждение при списании.

@@ -441,6 +441,8 @@ pub fn export_journal_since(conn: &Connection, recipient_frontier: Option<&Value
         "photos": photos,
         "documents": documents,
         "blobs": crate::content::manifests(conn),
+        "contentCatalog": crate::content::catalog(conn),
+        "contentProviders": crate::content::provider_manifest(conn),
     });
     if let Err(error) = ledger::sign_journal(conn, &mut journal) {
         return json!({"ok": false, "error": format!("Не удалось подписать журнал: {error}")});
@@ -1239,6 +1241,10 @@ pub fn apply_remote_journal(conn: &Connection, journal: &Value, peer_url: &str) 
         return json!({"ok":false,"error":error.to_string()});
     }
     let result = import_journal(conn, journal);
+    if let Err(error) = crate::content::observe_journal(conn, journal, peer_url) {
+        let _ = conn.execute_batch("ROLLBACK TO verified_sync; RELEASE verified_sync");
+        return json!({"ok":false,"error":format!("CAS-каталог отклонён: {error}")});
+    }
     if let Err(error) = ledger::verify_all(conn) {
         let _ = conn.execute_batch("ROLLBACK TO verified_sync; RELEASE verified_sync");
         return json!({"ok":false,"error":format!("Криптографическая проверка входящего журнала: {error}")});

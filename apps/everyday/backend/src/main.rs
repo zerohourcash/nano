@@ -16,10 +16,12 @@ use axum::{
     routing::{any, get, post},
     Json, Router,
 };
+use hmac::{Hmac, Mac};
 use parking_lot::Mutex;
 use rusqlite::Connection;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use sha2::Sha256;
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
 use tower_http::services::ServeDir;
 
@@ -376,6 +378,34 @@ fn sync_authorized(headers: &HeaderMap) -> bool {
             == 0
 }
 
+fn blob_capability(secret: &str, hash: &str) -> String {
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("HMAC accepts any key");
+    mac.update(b"everyday/cas-capability/v1\0");
+    mac.update(hash.as_bytes());
+    format!("cas1:{hash}:{}", hex::encode(mac.finalize().into_bytes()))
+}
+
+fn blob_authorized(headers: &HeaderMap, hash: &str) -> bool {
+    if sync_authorized(headers) {
+        return true;
+    }
+    let Some(secret) = sync_token() else {
+        return false;
+    };
+    let expected = format!("Bearer {}", blob_capability(&secret, hash));
+    let got = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    got.len() == expected.len()
+        && got
+            .as_bytes()
+            .iter()
+            .zip(expected.as_bytes())
+            .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+            == 0
+}
+
 async fn sync_hello(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl IntoResponse {
     if !sync_authorized(&headers) {
         return (
@@ -451,7 +481,7 @@ async fn sync_blob_get(
     Query(query): Query<BlobQuery>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    if !sync_authorized(&headers) {
+    if !blob_authorized(&headers, &hash) {
         return (
             StatusCode::UNAUTHORIZED,
             Json(json!({"error":"sync disabled"})),
@@ -480,7 +510,10 @@ async fn sync_missing_blobs(
         let db = state.db.lock();
         content::wanted_missing(&db, journal)
     };
-    let manifest = journal.get("blobs").unwrap_or(&Value::Null);
+    let manifest = journal
+        .get("contentCatalog")
+        .or_else(|| journal.get("blobs"))
+        .unwrap_or(&Value::Null);
     for hash in missing {
         let expected = manifest
             .as_array()
@@ -495,12 +528,26 @@ async fn sync_missing_blobs(
                 let db = state.db.lock();
                 content::download_offset(&db, &hash)
             };
-            let response = client
-                .get(format!("{upstream}/sync/blob/{hash}?offset={offset}"))
-                .bearer_auth(token)
-                .send()
-                .await?
-                .error_for_status()?;
+            let providers = {
+                let db = state.db.lock();
+                content::providers(&db, &hash, upstream)
+            };
+            let mut response = None;
+            for provider in providers {
+                if let Ok(candidate) = client
+                    .get(format!("{provider}/sync/blob/{hash}?offset={offset}"))
+                    .bearer_auth(blob_capability(token, &hash))
+                    .send()
+                    .await
+                {
+                    if candidate.status().is_success() {
+                        response = Some(candidate);
+                        break;
+                    }
+                }
+            }
+            let response = response
+                .ok_or_else(|| anyhow::anyhow!("ни один CAS-провайдер не доступен для {hash}"))?;
             let response_bytes = response.bytes().await?;
             let payload: Value = serde_json::from_slice(&response_bytes)?;
             if payload.get("mime").and_then(Value::as_str) != expected_mime
@@ -626,7 +673,9 @@ async fn sync_once(client: &reqwest::Client, state: &Arc<AppState>, upstream: &s
                         remote_frontier,
                         json!({
                             "blobs": journal.get("blobs").cloned().unwrap_or_else(|| json!([])),
-                            "photos": journal.get("photos").cloned().unwrap_or_else(|| json!([]))
+                            "photos": journal.get("photos").cloned().unwrap_or_else(|| json!([])),
+                            "contentCatalog": journal.get("contentCatalog").cloned().unwrap_or_else(|| journal.get("blobs").cloned().unwrap_or_else(|| json!([]))),
+                            "contentProviders": journal.get("contentProviders").cloned().unwrap_or_else(|| json!([]))
                         }),
                     )
                 }

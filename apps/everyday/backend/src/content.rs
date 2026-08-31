@@ -35,6 +35,7 @@ pub fn ingest_data_url(conn: &Connection, value: &str) -> anyhow::Result<Option<
         "INSERT OR IGNORE INTO content_blobs(hash,mime,size,data,created_at) VALUES(?1,?2,?3,?4,?5)",
         params![hash,mime,data.len() as i64,data,chrono::Utc::now().to_rfc3339()],
     )?;
+    remember_catalog(conn, &hash, mime, data.len())?;
     // Созданный на этом устройстве объект нельзя удалить до явного unpin.
     conn.execute(
         "INSERT OR IGNORE INTO content_pins(hash,reason,created_at) VALUES(?1,'local',?2)",
@@ -69,6 +70,157 @@ pub fn manifests(conn: &Connection) -> Value {
         }
     }
     Value::Array(out)
+}
+
+fn remember_catalog(conn: &Connection, hash: &str, mime: &str, size: usize) -> anyhow::Result<()> {
+    if hash.len() != 64
+        || !hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || size == 0
+        || size > MAX_BLOB_SIZE
+        || mime.len() > 100
+    {
+        bail!("некорректная запись CAS-каталога")
+    }
+    conn.execute(
+        "INSERT INTO content_catalog(hash,mime,size,updated_at) VALUES(?1,?2,?3,?4)
+         ON CONFLICT(hash) DO UPDATE SET mime=excluded.mime,size=excluded.size,updated_at=excluded.updated_at",
+        params![hash,mime,size as i64,chrono::Utc::now().to_rfc3339()],
+    )?;
+    Ok(())
+}
+
+pub fn catalog(conn: &Connection) -> Value {
+    let mut out = Vec::new();
+    if let Ok(mut statement) = conn.prepare(
+        "SELECT hash,mime,size FROM content_catalog UNION SELECT hash,mime,size FROM content_blobs ORDER BY hash",
+    ) {
+        if let Ok(rows) = statement.query_map([], |row| Ok(json!({"hash":row.get::<_,String>(0)?,"mime":row.get::<_,String>(1)?,"size":row.get::<_,i64>(2)?}))) {
+            out.extend(rows.flatten());
+        }
+    }
+    Value::Array(out)
+}
+
+pub fn provider_manifest(conn: &Connection) -> Value {
+    let mut out = Vec::new();
+    if let Ok(mut statement) =
+        conn.prepare("SELECT hash,url FROM content_providers ORDER BY hash,url")
+    {
+        if let Ok(rows) = statement.query_map([], |row| {
+            Ok(json!({"hash":row.get::<_,String>(0)?,"url":row.get::<_,String>(1)?}))
+        }) {
+            out.extend(rows.flatten());
+        }
+    }
+    Value::Array(out)
+}
+
+pub fn observe_journal(conn: &Connection, journal: &Value, peer_url: &str) -> anyhow::Result<()> {
+    let peer_url = peer_url.trim().trim_end_matches('/');
+    if crate::validate_peer_url(peer_url).is_err() {
+        bail!("недопустимый URL CAS-провайдера")
+    }
+    let catalog_value = journal
+        .get("contentCatalog")
+        .or_else(|| journal.get("blobs"));
+    if catalog_value
+        .and_then(Value::as_array)
+        .is_some_and(|entries| entries.len() > 100_000)
+    {
+        bail!("CAS-каталог превышает лимит")
+    }
+    for entry in catalog_value
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let (Some(hash), Some(mime), Some(size)) = (
+            entry.get("hash").and_then(Value::as_str),
+            entry.get("mime").and_then(Value::as_str),
+            entry.get("size").and_then(Value::as_u64),
+        ) else {
+            continue;
+        };
+        remember_catalog(conn, hash, mime, size as usize)?;
+    }
+    for hash in journal
+        .get("blobs")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.get("hash").and_then(Value::as_str))
+    {
+        remember_provider(conn, hash, peer_url)?;
+    }
+    let provider_value = journal.get("contentProviders");
+    if provider_value
+        .and_then(Value::as_array)
+        .is_some_and(|entries| entries.len() > 800_000)
+    {
+        bail!("список CAS-провайдеров превышает лимит")
+    }
+    for entry in provider_value
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let (Some(hash), Some(url)) = (
+            entry.get("hash").and_then(Value::as_str),
+            entry.get("url").and_then(Value::as_str),
+        ) else {
+            continue;
+        };
+        let url = url.trim().trim_end_matches('/');
+        if crate::validate_peer_url(url).is_ok() {
+            remember_provider(conn, hash, url)?;
+        }
+    }
+    Ok(())
+}
+
+fn remember_provider(conn: &Connection, hash: &str, url: &str) -> anyhow::Result<()> {
+    if hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("некорректный hash провайдера")
+    }
+    let exists = conn
+        .query_row(
+            "SELECT 1 FROM content_providers WHERE hash=?1 AND url=?2",
+            params![hash, url],
+            |_| Ok(()),
+        )
+        .is_ok();
+    let count = conn
+        .query_row(
+            "SELECT count(*) FROM content_providers WHERE hash=?1",
+            [hash],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or(0);
+    if exists || count < 8 {
+        conn.execute(
+            "INSERT INTO content_providers(hash,url,last_seen) VALUES(?1,?2,?3)
+            ON CONFLICT(hash,url) DO UPDATE SET last_seen=excluded.last_seen",
+            params![hash, url, chrono::Utc::now().to_rfc3339()],
+        )?;
+    }
+    Ok(())
+}
+
+pub fn providers(conn: &Connection, hash: &str, first: &str) -> Vec<String> {
+    let mut out = vec![first.trim().trim_end_matches('/').to_string()];
+    if let Ok(mut statement) =
+        conn.prepare("SELECT url FROM content_providers WHERE hash=?1 ORDER BY last_seen DESC")
+    {
+        if let Ok(rows) = statement.query_map([hash], |row| row.get::<_, String>(0)) {
+            for url in rows.flatten() {
+                if crate::validate_peer_url(&url).is_ok() && !out.contains(&url) {
+                    out.push(url);
+                }
+            }
+        }
+    }
+    out.truncate(8);
+    out
 }
 
 pub fn backup_data(conn: &Connection) -> Value {
@@ -123,6 +275,7 @@ pub fn restore_backup_data(conn: &Connection, entries: &Value) -> anyhow::Result
             "INSERT OR IGNORE INTO content_blobs(hash,mime,size,data,created_at) VALUES(?1,?2,?3,?4,?5)",
             params![hash,mime,declared as i64,data,chrono::Utc::now().to_rfc3339()],
         )?;
+        remember_catalog(conn, hash, mime, declared)?;
     }
     Ok(restored)
 }
@@ -173,7 +326,8 @@ pub fn wanted_missing(conn: &Connection, journal: &Value) -> Vec<String> {
     let mut wanted = std::collections::BTreeSet::new();
     if mode == "full" || mode == "all" {
         for hash in journal
-            .get("blobs")
+            .get("contentCatalog")
+            .or_else(|| journal.get("blobs"))
             .and_then(Value::as_array)
             .into_iter()
             .flatten()
@@ -201,7 +355,8 @@ pub fn wanted_missing(conn: &Connection, journal: &Value) -> Vec<String> {
         }
     }
     let advertised: std::collections::BTreeSet<String> = journal
-        .get("blobs")
+        .get("contentCatalog")
+        .or_else(|| journal.get("blobs"))
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
@@ -269,7 +424,9 @@ pub fn status(conn: &Connection) -> Value {
             |row| row.get::<_, i64>(0),
         )
         .unwrap_or(0);
-    json!({"mode":mode(conn),"blobs":count("content_blobs"),"pinned":count("content_pins"),"pending":count("blob_downloads"),"bytes":bytes})
+    json!({"mode":mode(conn),"blobs":count("content_blobs"),"catalogEntries":count("content_catalog"),
+        "providers":count("content_providers"),"pinned":count("content_pins"),
+        "pending":count("blob_downloads"),"bytes":bytes})
 }
 
 pub fn pin(conn: &Connection, hash: &str, reason: &str) -> anyhow::Result<()> {
@@ -359,6 +516,7 @@ pub fn accept_chunk(conn: &Connection, p: &Value) -> anyhow::Result<bool> {
             bail!("SHA-256 загруженного blob не совпал")
         }
         conn.execute("INSERT OR IGNORE INTO content_blobs(hash,mime,size,data,created_at) VALUES(?1,?2,?3,?4,?5)",params![hash,mime,total as i64,data,chrono::Utc::now().to_rfc3339()])?;
+        remember_catalog(conn, hash, mime, total)?;
         conn.execute("DELETE FROM blob_downloads WHERE hash=?1", [hash])?;
     }
     Ok(complete)
@@ -374,7 +532,9 @@ mod tests {
             "CREATE TABLE content_blobs(hash TEXT PRIMARY KEY,mime TEXT NOT NULL,size INTEGER NOT NULL,data BLOB NOT NULL,created_at TEXT NOT NULL);
              CREATE TABLE blob_downloads(hash TEXT PRIMARY KEY,mime TEXT NOT NULL,total_size INTEGER NOT NULL,data BLOB NOT NULL,updated_at TEXT NOT NULL);
              CREATE TABLE content_pins(hash TEXT PRIMARY KEY,reason TEXT NOT NULL,created_at TEXT NOT NULL);
-             CREATE TABLE content_node_config(singleton INTEGER PRIMARY KEY,mode TEXT NOT NULL);",
+             CREATE TABLE content_node_config(singleton INTEGER PRIMARY KEY,mode TEXT NOT NULL);
+             CREATE TABLE content_catalog(hash TEXT PRIMARY KEY,mime TEXT NOT NULL,size INTEGER NOT NULL,updated_at TEXT NOT NULL);
+             CREATE TABLE content_providers(hash TEXT NOT NULL,url TEXT NOT NULL,last_seen TEXT NOT NULL,PRIMARY KEY(hash,url));",
         ).unwrap();
         db
     }
@@ -458,5 +618,21 @@ mod tests {
             wanted_missing(&db, &journal),
             vec![thumb, original, document]
         );
+    }
+
+    #[test]
+    fn metadata_node_gossips_catalog_and_bounds_providers() {
+        let db = database();
+        let hash = "a".repeat(64);
+        let journal =
+            json!({"contentCatalog":[{"hash":hash,"mime":"image/jpeg","size":42}],"blobs":[]});
+        observe_journal(&db, &journal, "http://127.0.0.1:8000").unwrap();
+        assert_eq!(catalog(&db)[0]["hash"], hash);
+        for port in 8001..8012 {
+            let provider = json!({"contentProviders":[{"hash":hash,"url":format!("http://127.0.0.1:{port}")}],"contentCatalog":[]});
+            observe_journal(&db, &provider, "http://127.0.0.1:8000").unwrap();
+        }
+        assert_eq!(providers(&db, &hash, "http://127.0.0.1:8000").len(), 8);
+        assert_eq!(manifests(&db), json!([]));
     }
 }

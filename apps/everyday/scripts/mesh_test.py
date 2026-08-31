@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import base64
+import sqlite3
 import urllib.request
 
 from sync_test import (
@@ -40,8 +41,8 @@ def main() -> int:
     failures.clear()
     a_port, b_port, c_port = free_port(), free_port(), free_port()
     common = {"MESHKEEPER_SYNC_TOKEN": TOKEN, "MESHKEEPER_SYNC_INTERVAL": "5"}
-    a = Node("mesh-a", a_port, {**common, "MESHKEEPER_ADVERTISE_URL": f"http://127.0.0.1:{a_port}"})
-    b = Node("mesh-b", b_port, {**common, "MESHKEEPER_ADVERTISE_URL": f"http://127.0.0.1:{b_port}"})
+    a = Node("mesh-a", a_port, {**common, "MESHKEEPER_CONTENT_MODE": "full", "MESHKEEPER_ADVERTISE_URL": f"http://127.0.0.1:{a_port}"})
+    b = Node("mesh-b", b_port, {**common, "MESHKEEPER_CONTENT_MODE": "metadata", "MESHKEEPER_ADVERTISE_URL": f"http://127.0.0.1:{b_port}"})
     c: Node | None = None
     try:
         check("узлы A и B запущены", a.wait_ready() and b.wait_ready())
@@ -139,6 +140,13 @@ def main() -> int:
                 == mesh_photo,
                 timeout=30,
             ),
+        )
+        with sqlite3.connect(b.db) as db:
+            b_blobs = db.execute("SELECT count(*) FROM content_blobs").fetchone()[0]
+        check(
+            "metadata-ретранслятор передал каталог, не сохраняя файл",
+            b_blobs == 0,
+            f"content_blobs={b_blobs}",
         )
 
         taken = c.call(
