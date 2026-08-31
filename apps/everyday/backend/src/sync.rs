@@ -1,4 +1,9 @@
 use crate::{db, json as jsn, ledger};
+use base64::{engine::general_purpose::STANDARD_NO_PAD, Engine};
+use chacha20poly1305::aead::{Aead, KeyInit, Payload};
+use chacha20poly1305::{XChaCha20Poly1305, XNonce};
+use hmac::{Hmac, Mac};
+use rand::RngCore;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -9,6 +14,8 @@ use std::collections::{HashMap, HashSet};
 /// обмена подхватывает его в течение секунды.
 static SYNC_NOW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 pub const MAX_PEERS: i64 = 32;
+const TRANSPORT_BUNDLE_AAD: &[u8] = b"everyday-sync-bundle\0v2\0XChaCha20-Poly1305";
+const TRANSPORT_BUNDLE_LIMIT: usize = 30 * 1024 * 1024;
 
 pub fn request_sync_now() {
     SYNC_NOW.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -462,31 +469,117 @@ pub fn export_journal(conn: &Connection) -> Value {
 /// Транспортно-независимый пакет: его можно передать файлом, Bluetooth Share,
 /// Wi-Fi Direct, USB или любым store-and-forward каналом. Бинарные CAS-объекты
 /// сюда намеренно не входят; journal содержит только manifests и ссылки.
-pub fn export_transport_bundle(conn: &Connection) -> Value {
+fn transport_bundle_key(secret: &str) -> anyhow::Result<[u8; 32]> {
+    if secret.chars().count() < 32 {
+        anyhow::bail!("mesh-токен transport bundle должен содержать не менее 32 символов");
+    }
+    // HKDF-Extract + single-block HKDF-Expand (RFC 5869), domain-separated
+    // from HTTP bearer and per-blob capabilities.
+    let mut extract = <Hmac<Sha256> as Mac>::new_from_slice(b"everyday/transport-bundle/salt/v2")?;
+    extract.update(secret.as_bytes());
+    let prk = extract.finalize().into_bytes();
+    let mut expand = <Hmac<Sha256> as Mac>::new_from_slice(&prk)?;
+    expand.update(b"everyday/transport-bundle/key/v2");
+    expand.update(&[1]);
+    Ok(expand.finalize().into_bytes().into())
+}
+
+fn encrypt_transport_journal(journal: &Value, secret: &str) -> anyhow::Result<Value> {
+    let plaintext = serde_json::to_vec(journal)?;
+    if plaintext.len() > TRANSPORT_BUNDLE_LIMIT {
+        anyhow::bail!("Transport bundle превышает лимит 30 МБ");
+    }
+    let mut nonce = [0_u8; 24];
+    rand::thread_rng().fill_bytes(&mut nonce);
+    let cipher = XChaCha20Poly1305::new_from_slice(&transport_bundle_key(secret)?)?;
+    let ciphertext = cipher
+        .encrypt(
+            XNonce::from_slice(&nonce),
+            Payload {
+                msg: &plaintext,
+                aad: TRANSPORT_BUNDLE_AAD,
+            },
+        )
+        .map_err(|_| anyhow::anyhow!("Не удалось зашифровать transport bundle"))?;
+    Ok(json!({
+        "format": "everyday-sync-bundle",
+        "version": 2,
+        "createdAt": chrono::Utc::now().to_rfc3339(),
+        "cipher": "XChaCha20-Poly1305",
+        "kdf": "HKDF-SHA256",
+        "nonce": STANDARD_NO_PAD.encode(nonce),
+        "ciphertext": STANDARD_NO_PAD.encode(ciphertext),
+    }))
+}
+
+fn decrypt_transport_journal(bundle: &Value, secret: &str) -> anyhow::Result<Value> {
+    if bundle.get("cipher").and_then(Value::as_str) != Some("XChaCha20-Poly1305")
+        || bundle.get("kdf").and_then(Value::as_str) != Some("HKDF-SHA256")
+    {
+        anyhow::bail!("Неподдерживаемое шифрование transport bundle");
+    }
+    let nonce =
+        STANDARD_NO_PAD.decode(bundle.get("nonce").and_then(Value::as_str).unwrap_or(""))?;
+    let ciphertext = STANDARD_NO_PAD.decode(
+        bundle
+            .get("ciphertext")
+            .and_then(Value::as_str)
+            .unwrap_or(""),
+    )?;
+    if nonce.len() != 24 || ciphertext.len() > TRANSPORT_BUNDLE_LIMIT + 16 {
+        anyhow::bail!("Некорректный размер transport bundle");
+    }
+    let cipher = XChaCha20Poly1305::new_from_slice(&transport_bundle_key(secret)?)?;
+    let plaintext = cipher
+        .decrypt(
+            XNonce::from_slice(&nonce),
+            Payload {
+                msg: &ciphertext,
+                aad: TRANSPORT_BUNDLE_AAD,
+            },
+        )
+        .map_err(|_| anyhow::anyhow!("Неверный mesh-токен или transport bundle повреждён"))?;
+    Ok(serde_json::from_slice(&plaintext)?)
+}
+
+pub fn export_transport_bundle(conn: &Connection, secret: Option<&str>) -> Value {
     if let Ok(public_key) = ledger::node_public_key(conn) {
         let _ = conn.execute(
             "INSERT OR IGNORE INTO trusted_node_keys(public_key,label,source,created_at) VALUES(?1,'Этот узел','local',?2)",
             params![public_key, chrono::Utc::now().to_rfc3339()],
         );
     }
-    json!({
-        "format": "everyday-sync-bundle",
-        "version": 1,
-        "createdAt": chrono::Utc::now().to_rfc3339(),
-        "journal": export_journal(conn),
-    })
+    let Some(secret) = secret else {
+        return json!({"ok":false,"error":"Для защищённого offline bundle задайте MESHKEEPER_SYNC_TOKEN"});
+    };
+    encrypt_transport_journal(&export_journal(conn), secret)
+        .unwrap_or_else(|error| json!({"ok":false,"error":error.to_string()}))
 }
 
-pub fn import_transport_bundle(conn: &Connection, bundle: &Value) -> Value {
-    if bundle.get("format").and_then(Value::as_str) != Some("everyday-sync-bundle")
-        || bundle.get("version").and_then(Value::as_u64) != Some(1)
-    {
+pub fn import_transport_bundle(conn: &Connection, bundle: &Value, secret: Option<&str>) -> Value {
+    if bundle.get("format").and_then(Value::as_str) != Some("everyday-sync-bundle") {
         return json!({"ok":false,"error":"Неподдерживаемый формат transport bundle"});
     }
-    let Some(journal) = bundle.get("journal") else {
-        return json!({"ok":false,"error":"В transport bundle отсутствует journal"});
+    let version = bundle.get("version").and_then(Value::as_u64);
+    let decrypted;
+    let journal = if version == Some(2) {
+        let Some(secret) = secret else {
+            return json!({"ok":false,"error":"Для расшифровки bundle нужен MESHKEEPER_SYNC_TOKEN"});
+        };
+        decrypted = match decrypt_transport_journal(bundle, secret) {
+            Ok(value) => value,
+            Err(error) => return json!({"ok":false,"error":error.to_string()}),
+        };
+        &decrypted
+    } else if version == Some(1) {
+        let Some(journal) = bundle.get("journal") else {
+            return json!({"ok":false,"error":"В transport bundle отсутствует journal"});
+        };
+        journal
+    } else {
+        return json!({"ok":false,"error":"Неподдерживаемая версия transport bundle"});
     };
-    if serde_json::to_vec(journal).map_or(true, |bytes| bytes.len() > 30 * 1024 * 1024) {
+    if serde_json::to_vec(journal).map_or(true, |bytes| bytes.len() > TRANSPORT_BUNDLE_LIMIT) {
         return json!({"ok":false,"error":"Transport bundle превышает лимит 30 МБ"});
     }
     // Файл не доказывает, что объявленный HTTP-адрес сейчас принадлежит
@@ -1737,6 +1830,7 @@ pub fn touch_peer_error(conn: &Connection, url: &str, err: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    const BUNDLE_SECRET: &str = "offline-bundle-test-secret-at-least-32-chars";
 
     #[test]
     fn transport_bundle_round_trips_and_rejects_tampering() {
@@ -1747,9 +1841,14 @@ mod tests {
         let source = crate::db::open(&source_path).unwrap();
         let target = crate::db::open(&target_path).unwrap();
         source.execute("INSERT INTO workspaces(name,internal_id_prefix,created_at,guid) VALUES('Offline org','O-',?1,?2)",params![chrono::Utc::now().to_rfc3339(),uuid::Uuid::new_v4().to_string()]).unwrap();
-        let bundle = export_transport_bundle(&source);
+        let bundle = export_transport_bundle(&source, Some(BUNDLE_SECRET));
         assert_eq!(bundle["format"], "everyday-sync-bundle");
-        assert_eq!(import_transport_bundle(&target, &bundle)["ok"], true);
+        assert_eq!(bundle["version"], 2);
+        assert!(bundle.get("journal").is_none());
+        assert_eq!(
+            import_transport_bundle(&target, &bundle, Some(BUNDLE_SECRET))["ok"],
+            true
+        );
         assert_eq!(
             target
                 .query_row("SELECT count(*) FROM workspaces", [], |row| row
@@ -1758,16 +1857,42 @@ mod tests {
             1
         );
 
+        let wrong_key = import_transport_bundle(
+            &target,
+            &bundle,
+            Some("wrong-offline-bundle-secret-at-least-32-chars"),
+        );
+        assert_eq!(wrong_key["ok"], false);
         let mut forged = bundle;
-        forged["journal"]["workspaces"][0]["name"] = json!("FORGED");
-        let rejected = import_transport_bundle(&target, &forged);
+        let ciphertext = forged["ciphertext"].as_str().unwrap().to_string();
+        let replacement = if ciphertext.starts_with('A') {
+            "B"
+        } else {
+            "A"
+        };
+        forged["ciphertext"] = json!(format!("{replacement}{}", &ciphertext[1..]));
+        let rejected = import_transport_bundle(&target, &forged, Some(BUNDLE_SECRET));
         assert_eq!(rejected["ok"], false);
         assert!(rejected["error"]
             .as_str()
             .unwrap_or_default()
-            .contains("hash mismatch"));
+            .contains("повреждён"));
+
+        // Read-only migration path for packages produced by pre-v2 nodes.
+        let legacy_target_path =
+            std::env::temp_dir().join(format!("bundle-legacy-{}.db", uuid::Uuid::new_v4()));
+        let legacy_target = crate::db::open(&legacy_target_path).unwrap();
+        let legacy = json!({
+            "format":"everyday-sync-bundle", "version":1,
+            "createdAt":chrono::Utc::now().to_rfc3339(), "journal":export_journal(&source)
+        });
+        assert_eq!(
+            import_transport_bundle(&legacy_target, &legacy, None)["ok"],
+            true
+        );
         drop((source, target));
-        for path in [source_path, target_path] {
+        drop(legacy_target);
+        for path in [source_path, target_path, legacy_target_path] {
             let _ = std::fs::remove_file(path);
         }
     }
@@ -1787,20 +1912,24 @@ mod tests {
         let expires = (chrono::Utc::now() + chrono::Duration::hours(2)).to_rfc3339();
         source.execute("INSERT INTO invites(workspace_id,token,role,max_uses,used_count,revoked,created_at,expires_at) VALUES(?1,?2,'member',1,0,0,?3,?4)",params![workspace,raw,chrono::Utc::now().to_rfc3339(),expires]).unwrap();
 
-        let bundle = export_transport_bundle(&source);
+        let bundle = export_transport_bundle(&source, Some(BUNDLE_SECRET));
         let serialized = serde_json::to_string(&bundle).unwrap();
         assert!(
             !serialized.contains(raw),
             "bearer token leaked into sync bundle"
         );
+        let decrypted = decrypt_transport_journal(&bundle, BUNDLE_SECRET).unwrap();
         assert_eq!(
-            bundle["journal"]["invites"][0]["tokenDigest"]
+            decrypted["invites"][0]["tokenDigest"]
                 .as_str()
                 .unwrap()
                 .len(),
             64
         );
-        assert_eq!(import_transport_bundle(&target, &bundle)["ok"], true);
+        assert_eq!(
+            import_transport_bundle(&target, &bundle, Some(BUNDLE_SECRET))["ok"],
+            true
+        );
         let stored: String = target
             .query_row("SELECT token FROM invites", [], |row| row.get(0))
             .unwrap();

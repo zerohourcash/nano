@@ -66,22 +66,34 @@ broadcast `255.255.255.255:8767`; desktop-узлы включают его яв�
 
 ## Файл и системный Share
 
-`everyday-sync-bundle` версии 1 оборачивает полный подписанный journal:
+`everyday-sync-bundle` версии 2 шифрует полный подписанный journal:
 
 ```json
 {
   "format": "everyday-sync-bundle",
-  "version": 1,
+  "version": 2,
   "createdAt": "RFC3339",
-  "journal": { "v": 1, "journalHash": "…" }
+  "cipher": "XChaCha20-Poly1305",
+  "kdf": "HKDF-SHA256",
+  "nonce": "base64-no-pad",
+  "ciphertext": "base64-no-pad"
 }
 ```
+
+Ключ envelope доменно отделяется от HTTP bearer и CAS capabilities через
+HKDF-SHA256 с отдельными salt/info. AEAD использует случайный 192-битный nonce
+и фиксированный AAD формата. Поэтому системный Share, Bluetooth-посредник или
+потерянный USB-носитель не раскрывает участников, чат и бухгалтерию. После
+расшифровки остаётся обязательной независимая Ed25519-проверка journal и ledger.
+Экспорт без `MESHKEEPER_SYNC_TOKEN` запрещён. Legacy v1 принимается только для
+миграции старых подписанных файлов, но новые plaintext-пакеты не создаются.
 
 В «Админка → Офлайн-узлы» пакет можно передать системным Share через Bluetooth,
 Wi‑Fi Direct, AirDrop, USB или произвольный store-and-forward канал. Импорт имеет
 лимит 30 МБ и сам является Ed25519-подписанной операцией принимающего устройства.
 URL из переносимого файла не добавляется в peers автоматически. Подмена любого
-поля journal обнаруживается. CAS-бинарники в bundle не включаются.
+поля ciphertext обнаруживается AEAD, а подмена journal — его подписью.
+CAS-бинарники в bundle не включаются.
 
 ## CAS transport
 

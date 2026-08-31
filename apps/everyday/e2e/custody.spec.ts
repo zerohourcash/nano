@@ -119,12 +119,19 @@ test('browser signs a real custody transaction and ledger retains its proof', as
   const transportBundle = await trpc<{
     format: string
     version: number
-    journal: { journalHash: string; workspaces: Array<{ name: string }> }
+    cipher: string
+    kdf: string
+    nonce: string
+    ciphertext: string
   }>(page, 'sync.exportBundle', null, false)
   expect(transportBundle.format).toBe('everyday-sync-bundle')
-  expect(transportBundle.journal.journalHash).toMatch(/^[a-f0-9]{64}$/)
+  expect(transportBundle.version).toBe(2)
+  expect(transportBundle.cipher).toBe('XChaCha20-Poly1305')
+  expect(transportBundle.kdf).toBe('HKDF-SHA256')
+  expect(transportBundle.ciphertext.length).toBeGreaterThan(100)
+  expect(JSON.stringify(transportBundle)).not.toContain('Безопасность E2E')
   const forgedBundle = structuredClone(transportBundle)
-  forgedBundle.journal.workspaces[0].name = 'Подмена через Bluetooth-файл'
+  forgedBundle.ciphertext = `${forgedBundle.ciphertext.startsWith('A') ? 'B' : 'A'}${forgedBundle.ciphertext.slice(1)}`
 
   await page.goto('/admin')
   await page.getByRole('button', { name: 'Офлайн-узлы' }).first().click()
@@ -156,5 +163,5 @@ test('browser signs a real custody transaction and ledger retains its proof', as
     buffer: Buffer.from(JSON.stringify(forgedBundle)),
   })
   const forgedImportPayload = await (await forgedImportResponse).json()
-  expect(forgedImportPayload[0]?.error?.json?.message).toMatch(/hash mismatch/)
+  expect(forgedImportPayload[0]?.error?.json?.message).toMatch(/повреждён|mesh-токен/)
 })

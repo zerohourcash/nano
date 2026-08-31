@@ -32,6 +32,7 @@ export default defineConfig({
       MESHKEEPER_DEMO_DATA: '0',
       MESHKEEPER_DEMO_LOGIN: '0',
       MESHKEEPER_OPEN_REGISTRATION: '0',
+      MESHKEEPER_SYNC_TOKEN: 'playwright-offline-bundle-token-at-least-32-chars',
     },
   },
 })

@@ -109,7 +109,7 @@ export default function OfflineNodesSection() {
     )
     if (navigator.canShare?.({ files: [file] })) {
       try {
-        await navigator.share({ files: [file], title: 'Everyday: подписанный пакет синхронизации' })
+        await navigator.share({ files: [file], title: 'Everyday: зашифрованный пакет синхронизации' })
         toast('Пакет передан системному меню обмена')
         return
       } catch (error) {
@@ -325,7 +325,7 @@ export default function OfflineNodesSection() {
           <h3 className="text-[17px] font-semibold text-ink-900">Обмен без прямого соединения</h3>
         </div>
         <p className="text-sm text-ink-500">
-          Подписанный пакет содержит транзакции, текст и CAS-manifests, но не тяжёлые файлы. Передайте его через системный Bluetooth Share, Wi‑Fi Direct, AirDrop, USB или любой доступный канал.
+          Зашифрованный и подписанный пакет содержит транзакции, текст и CAS-manifests, но не тяжёлые файлы. Передайте его через системный Bluetooth Share, Wi‑Fi Direct, AirDrop, USB или любой доступный канал.
         </p>
         <div className="flex flex-wrap gap-2">
           <button className={btnPrimaryCls} disabled={bundleQ.isFetching} onClick={() => void exportTransportBundle()}>
@@ -340,7 +340,7 @@ export default function OfflineNodesSection() {
             }} />
           </label>
         </div>
-        <p className="text-[12px] text-ink-300">Повторы безопасны; подпись и хэш проверяются до изменения локальной базы.</p>
+        <p className="text-[12px] text-ink-300">Посредник не видит содержимое; AEAD, подпись и хэш проверяются до изменения локальной базы.</p>
       </section>
 
       <section className={cardCls + ' p-5 space-y-3'}>
