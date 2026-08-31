@@ -161,7 +161,7 @@ pub fn export_journal(conn: &Connection) -> Value {
     }
     let mut history = Vec::new();
     if let Ok(mut stmt) = conn.prepare(
-        "SELECT id, workspace_id, item_id, type, actor_user_id, from_label, to_label, quantity_delta, comment, hash, created_at, guid FROM history_entries ORDER BY id",
+        "SELECT id, workspace_id, item_id, type, actor_user_id, from_label, to_label, quantity_delta, comment, hash, created_at, guid, prev_hash, signature, pubkey FROM history_entries ORDER BY id",
     ) {
         for row in stmt.query_map([], |r| {
             let ws: i64 = r.get(1)?;
@@ -179,6 +179,9 @@ pub fn export_journal(conn: &Connection) -> Value {
                 "opId": r.get::<_, String>(9)?,
                 "createdAt": r.get::<_, String>(10)?,
                 "guid": r.get::<_, Option<String>>(11)?,
+                "prevHash": r.get::<_, Option<String>>(12)?,
+                "signature": r.get::<_, Option<String>>(13)?,
+                "pubkey": r.get::<_, Option<String>>(14)?,
             }))
         }).into_iter().flatten().flatten() {
             history.push(row);
@@ -514,8 +517,8 @@ pub fn import_journal(conn: &Connection, journal: &Value) -> Value {
                 .and_then(|g| id_by_guid(conn, "users", g))
                 .unwrap_or(1);
             let _ = conn.execute(
-                "INSERT OR IGNORE INTO history_entries (workspace_id, item_id, type, actor_user_id, from_label, to_label, quantity_delta, comment, hash, created_at, guid)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+                "INSERT OR IGNORE INTO history_entries (workspace_id, item_id, type, actor_user_id, from_label, to_label, quantity_delta, comment, hash, created_at, guid, prev_hash, signature, pubkey)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
                 params![
                     ws, item,
                     h.get("type").and_then(|v| v.as_str()).unwrap_or("update"),
@@ -526,7 +529,10 @@ pub fn import_journal(conn: &Connection, journal: &Value) -> Value {
                     h.get("comment").and_then(|v| v.as_str()),
                     hash,
                     h.get("createdAt").and_then(|v| v.as_str()).unwrap_or(""),
-                    h.get("guid").and_then(|v| v.as_str())
+                    h.get("guid").and_then(|v| v.as_str()),
+                    h.get("prevHash").and_then(|v| v.as_str()),
+                    h.get("signature").and_then(|v| v.as_str()),
+                    h.get("pubkey").and_then(|v| v.as_str())
                 ],
             );
             ops += 1;

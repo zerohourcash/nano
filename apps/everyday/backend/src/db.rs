@@ -1,5 +1,5 @@
 use crate::ledger;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
 use std::path::Path;
 
@@ -16,6 +16,7 @@ pub fn open(path: &Path) -> Result<Connection> {
     if std::env::var("MESHKEEPER_DEMO_DATA").as_deref() == Ok("1") {
         seed_if_empty(&conn)?;
     }
+    ledger::verify_all(&conn).context("проверка криптографического журнала")?;
     Ok(conn)
 }
 

@@ -186,6 +186,7 @@ def main() -> int:
         )
         check("сервер объявляет роль server", srv_health.get("role") == "server", str(srv_health))
         check("узел объявляет роль node", node_health.get("role") == "node", str(node_health))
+        check("узлы используют подписанные account-chain", srv_health.get("journal") == "signed-account-chains" and node_health.get("journal") == "signed-account-chains", str(srv_health))
 
         print("\n== 2. Обмен закрыт без токена ==")
         try:

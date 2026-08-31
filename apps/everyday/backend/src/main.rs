@@ -272,7 +272,7 @@ async fn health() -> impl IntoResponse {
     Json(json!({
         "ok": true,
         "node": "meshkeeper-node",
-        "journal": "audit-log",
+        "journal": "signed-account-chains",
         "role": node_role(),
         "sync": if sync_token().is_some() { "enabled" } else { "disabled" },
     }))
