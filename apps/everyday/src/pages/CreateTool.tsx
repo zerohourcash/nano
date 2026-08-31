@@ -182,7 +182,6 @@ export default function CreateTool() {
   const { data: sites } = trpc.admin.buildingSites.list.useQuery({})
   const { data: organizationNodes } = trpc.admin.organizationNodes.list.useQuery({})
   const { data: users } = trpc.admin.users.list.useQuery({})
-  const { data: me } = trpc.meta.currentUser.useQuery()
   const { data: workspaces } = trpc.meta.workspaces.useQuery()
   const { data: nextId } = trpc.items.nextInternalId.useQuery({})
 
@@ -225,14 +224,11 @@ export default function CreateTool() {
     },
   })
 
-  // Автозаполнение следующего вн. номера и ответственного по умолчанию
+  // Автозаполнение следующего внутреннего номера. Ответственного не назначаем:
+  // складской предмет должен оставаться свободным до явной выдачи.
   useEffect(() => {
     if (nextNum && !getValues('internalIdNum')) setValue('internalIdNum', nextNum)
   }, [nextNum, getValues, setValue])
-
-  useEffect(() => {
-    if (me && !getValues('responsibleUserId')) setValue('responsibleUserId', me.id)
-  }, [me, getValues, setValue])
 
   useEffect(() => {
     if (statuses?.length && !getValues('statusId')) {
@@ -320,7 +316,6 @@ export default function CreateTool() {
             setToast(`Инструмент ${item?.internalId ?? ''} создан — можно добавить следующий`)
             requestAnimationFrame(() => setFocus('title'))
             // заново подставить дефолты
-            if (me) setValue('responsibleUserId', me.id)
             if (statuses?.length) {
               const inStock = statuses.find((s) => s.slug === 'in-stock') ?? statuses[0]
               setValue('statusId', inStock.id)

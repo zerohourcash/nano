@@ -41,18 +41,13 @@ test('browser signs a real custody transaction and ledger retains its proof', as
     name: 'Электроинструмент',
   })
 
-  const storages = await trpc<Array<{ id: number }>>(page, 'admin.storages.list', {
-    workspaceId: workspaces[0].id,
-  }, false)
-  const item = await trpc<{ id: number }>(page, 'items.create', {
-    workspaceId: workspaces[0].id,
-    title: 'Перфоратор E2E',
-    internalId: 'E2E-0001',
-    categoryId: category.id,
-    storageId: storages[0].id,
-  })
-  const itemId = item.id
-  await page.goto(`/tool/${itemId}`)
+  await page.goto('/create')
+  await page.getByPlaceholder('Например: Перфоратор Bosch GBH 8-45 DV').fill('Перфоратор E2E')
+  await page.locator('select').first().selectOption(String(category.id))
+  await page.getByRole('button', { name: 'Создать инструмент' }).click()
+  await expect(page).toHaveURL(/\/tool\/\d+/, { timeout: 10_000 })
+  const itemId = Number(page.url().match(/\/tool\/(\d+)/)?.[1])
+  expect(itemId).toBeGreaterThan(0)
   await page.getByRole('button', { name: 'Взять', exact: true }).first().click()
   await expect(page.getByText('Взять: Перфоратор E2E')).toBeVisible()
   await page.getByRole('checkbox').last().check()
