@@ -325,15 +325,16 @@ fn upstream_url() -> Option<String> {
         .filter(|u| !u.is_empty())
 }
 
-fn validate_upstream_url(upstream: &str) -> Result<(), String> {
-    let url = reqwest::Url::parse(upstream).map_err(|_| "MESHKEEPER_UPSTREAM: некорректный URL")?;
+pub(crate) fn validate_peer_url(upstream: &str) -> Result<(), String> {
+    let url = reqwest::Url::parse(upstream).map_err(|_| "Некорректный адрес peer")?;
     if !url.username().is_empty()
         || url.password().is_some()
         || url.query().is_some()
         || url.fragment().is_some()
+        || url.path() != "/"
     {
         return Err(
-            "MESHKEEPER_UPSTREAM не должен содержать логин, пароль, query или fragment".into(),
+            "Адрес peer не должен содержать путь, логин, пароль, query или fragment".into(),
         );
     }
     if url.scheme() == "https" {
@@ -344,11 +345,11 @@ fn validate_upstream_url(upstream: &str) -> Result<(), String> {
     if url.scheme() == "http" && (loopback || explicitly_allowed) {
         return Ok(());
     }
-    Err("MESHKEEPER_UPSTREAM требует HTTPS; для изолированной тестовой LAN задайте MESHKEEPER_ALLOW_INSECURE_SYNC=1".into())
+    Err("Peer требует HTTPS; для изолированной доверенной LAN задайте MESHKEEPER_ALLOW_INSECURE_SYNC=1".into())
 }
 
 /// Общий секрет сервера и локальных узлов. Не задан — обмен выключен.
-fn sync_token() -> Option<String> {
+pub(crate) fn sync_token() -> Option<String> {
     std::env::var("MESHKEEPER_SYNC_TOKEN")
         .ok()
         .filter(|t| t.chars().count() >= 32)
@@ -414,9 +415,9 @@ async fn sync_journal_post(
     }
     let db = state.db.lock();
     let from = body
-        .get("nodeId")
+        .get("nodeUrl")
         .and_then(|v| v.as_str())
-        .unwrap_or("peer");
+        .unwrap_or_default();
     Json(sync::apply_remote_journal(&db, &body, from)).into_response()
 }
 
@@ -425,7 +426,7 @@ async fn sync_journal_post(
 /// Работает офлайн-first: если сервер недоступен, узел продолжает работать на
 /// своей базе, ошибка попадает в «Админка → Офлайн-узлы», а следующая попытка
 /// произойдёт на следующем тике.
-async fn upstream_loop(state: Arc<AppState>, upstream: String, token: String) {
+async fn peer_loop(state: Arc<AppState>, upstream: Option<String>, token: String) {
     let client = match reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(20))
         .build()
@@ -441,12 +442,25 @@ async fn upstream_loop(state: Arc<AppState>, upstream: String, token: String) {
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(15)
         .clamp(5, 3600);
-    eprintln!("Синхронизация с {upstream} каждые {interval} с");
+    eprintln!("P2P-синхронизация каждые {interval} с");
     let mut waited = interval; // первый проход — сразу после старта
     loop {
         let asked_now = sync::take_sync_request();
         if asked_now || waited >= interval {
-            sync_once(&client, &state, &upstream, &token).await;
+            let mut peers = {
+                let db = state.db.lock();
+                sync::peer_urls(&db)
+            };
+            if let Some(url) = upstream.as_ref() {
+                peers.push(url.clone());
+            }
+            peers.sort();
+            peers.dedup();
+            let local_urls = [sync::local_http_base(), sync::guess_lan_base()];
+            peers.retain(|peer| !local_urls.iter().any(|local| local == peer));
+            for peer in peers {
+                sync_once(&client, &state, &peer, &token).await;
+            }
             waited = 0;
         }
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
@@ -458,7 +472,7 @@ async fn sync_once(client: &reqwest::Client, state: &Arc<AppState>, upstream: &s
     {
         let db = state.db.lock();
         sync::ensure_node(&db);
-        sync::add_peer(&db, upstream, Some("Сервер"), None);
+        sync::add_peer(&db, upstream, None, None);
     }
 
     // 1. Забираем изменения сервера.
@@ -566,18 +580,23 @@ async fn main() {
     });
     let upstream = upstream_url();
     if let Some(url) = upstream.as_deref() {
-        if let Err(message) = validate_upstream_url(url) {
+        if let Err(message) = validate_peer_url(url) {
             panic!("{message}");
         }
     }
+    if let Ok(url) = std::env::var("MESHKEEPER_ADVERTISE_URL") {
+        if let Err(message) = validate_peer_url(url.trim()) {
+            panic!("MESHKEEPER_ADVERTISE_URL: {message}");
+        }
+    }
     match (upstream, sync_token()) {
-        (Some(upstream), Some(token)) => {
-            tokio::spawn(upstream_loop(state.clone(), upstream, token));
+        (upstream, Some(token)) => {
+            tokio::spawn(peer_loop(state.clone(), upstream, token));
+            eprintln!("Режим mesh: принимаю и инициирую обмен через /sync/journal");
         }
         (Some(_), None) => {
             panic!("MESHKEEPER_UPSTREAM требует MESHKEEPER_SYNC_TOKEN не короче 32 символов")
         }
-        (None, Some(_)) => eprintln!("Режим сервера: принимаю обмен на /sync/journal"),
         (None, None) => eprintln!("Автономный режим: обмен с сервером выключен"),
     }
     let web_root = std::env::var("MESHKEEPER_WEB_ROOT")

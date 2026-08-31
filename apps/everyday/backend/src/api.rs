@@ -754,10 +754,18 @@ fn dispatch_inner(
         "sync.peers" => Ok(crate::sync::list_peers(conn)),
         "sync.addPeer" => {
             let url = s(input, "url").ok_or_else(|| ApiError::bad("Укажите адрес узла"))?;
-            if !url.starts_with("http://") && !url.starts_with("https://") {
+            crate::validate_peer_url(&url).map_err(ApiError::bad)?;
+            if crate::sync_token().is_none() {
                 return Err(ApiError::bad(
-                    "Адрес должен начинаться с http:// или https://",
+                    "Для P2P-обмена задайте MESHKEEPER_SYNC_TOKEN не короче 32 символов",
                 ));
+            }
+            let normalized = url.trim().trim_end_matches('/');
+            if [crate::sync::local_http_base(), crate::sync::guess_lan_base()]
+                .iter()
+                .any(|local| local == normalized)
+            {
+                return Err(ApiError::bad("Нельзя добавить этот узел в peers самого себя"));
             }
             Ok(crate::sync::add_peer(
                 conn,
@@ -765,6 +773,20 @@ fn dispatch_inner(
                 s(input, "name").as_deref(),
                 None,
             ))
+        }
+        "sync.removePeer" => {
+            let url = s(input, "url").ok_or_else(|| ApiError::bad("Укажите адрес узла"))?;
+            if std::env::var("MESHKEEPER_UPSTREAM")
+                .ok()
+                .map(|value| value.trim().trim_end_matches('/').to_string())
+                .as_deref()
+                == Some(url.trim().trim_end_matches('/'))
+            {
+                return Err(ApiError::bad(
+                    "Постоянный upstream удаляется только из конфигурации запуска",
+                ));
+            }
+            Ok(crate::sync::remove_peer(conn, &url))
         }
         "sync.conflicts" => Ok(crate::sync::list_conflicts(conn)),
         "sync.resolveConflict" => {
@@ -779,13 +801,13 @@ fn dispatch_inner(
             .map_err(|e| ApiError::bad(e.to_string()))
         }
         "sync.pullNow" => {
-            if std::env::var("MESHKEEPER_UPSTREAM")
+            let no_upstream = std::env::var("MESHKEEPER_UPSTREAM")
                 .ok()
                 .filter(|u| !u.trim().is_empty())
-                .is_none()
-            {
+                .is_none();
+            if no_upstream && crate::sync::peer_urls(conn).is_empty() {
                 return Err(ApiError::bad(
-                    "Сервер не настроен: задайте MESHKEEPER_UPSTREAM на этом узле",
+                    "Нет узлов для обмена: добавьте локальный peer или задайте MESHKEEPER_UPSTREAM",
                 ));
             }
             crate::sync::request_sync_now();
@@ -1077,20 +1099,7 @@ fn auth_login(conn: &Connection, input: &Value) -> ApiResult {
 /// ни «В работе», ни «На проверке» (ТЗ §9), а конфликты синхронизации не смогут
 /// пометить предмет как требующий проверки.
 fn seed_workspace_defaults(conn: &Connection, ws: i64, owner: i64) -> Result<(), ApiError> {
-    for (name, slug, color, bg) in [
-        ("В работе", "in-work", "#2E9E5B", "#C8FCD2"),
-        ("В ремонте", "in-repair", "#A87C0F", "#FBFCC8"),
-        ("На складе", "in-stock", "#5E629B", "#EDEDF7"),
-        ("На проверке", "needs-check", "#A87C0F", "#FBFCC8"),
-        ("Списан", "written-off", "#D64545", "#FAD8D1"),
-    ] {
-        conn.execute(
-            "INSERT INTO statuses (name, workspace_id, type, slug, color, bg)
-             SELECT ?2, ?1, 'status', ?3, ?4, ?5
-             WHERE NOT EXISTS (SELECT 1 FROM statuses WHERE workspace_id=?1 AND slug=?3)",
-            params![ws, name, slug, color, bg],
-        )?;
-    }
+    db::ensure_workspace_statuses(conn, ws).map_err(|error| ApiError::bad(error.to_string()))?;
     conn.execute(
         "INSERT INTO storages (name, responsible_user_id, workspace_id, address)
          SELECT 'Основной склад', ?2, ?1, ''

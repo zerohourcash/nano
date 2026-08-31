@@ -268,6 +268,7 @@ pub fn export_journal(conn: &Connection) -> Value {
         "v": 1,
         "nodeId": node_id,
         "nodeName": name,
+        "nodeUrl": guess_lan_base(),
         "exportedAt": chrono::Utc::now().to_rfc3339(),
         "workspaces": workspaces,
         "users": users,
@@ -287,6 +288,7 @@ fn upsert_workspace(conn: &Connection, w: &Value) -> i64 {
             params![guid],
             |r| r.get::<_, i64>(0),
         ) {
+            let _ = db::ensure_workspace_statuses(conn, id);
             return id;
         }
     }
@@ -302,7 +304,9 @@ fn upsert_workspace(conn: &Connection, w: &Value) -> i64 {
             if guid.is_empty() { uuid::Uuid::new_v4().to_string().replace('-', "") } else { guid.to_string() }
         ],
     );
-    conn.last_insert_rowid()
+    let id = conn.last_insert_rowid();
+    let _ = db::ensure_workspace_statuses(conn, id);
+    id
 }
 
 fn upsert_user(conn: &Connection, u: &Value) -> i64 {
@@ -461,6 +465,29 @@ pub fn import_journal(conn: &Connection, journal: &Value) -> Value {
             let st = status_id(conn, ws, slug);
             if !guid.is_empty() {
                 if let Some(local_id) = id_by_guid(conn, "items", guid) {
+                    let local_clock: Option<String> = conn
+                        .query_row(
+                            "SELECT MAX(created_at) FROM history_entries WHERE item_id=?1",
+                            params![local_id],
+                            |row| row.get(0),
+                        )
+                        .ok()
+                        .flatten();
+                    let incoming_clock = journal
+                        .get("history")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter(|event| {
+                            event.get("itemGuid").and_then(Value::as_str) == Some(guid)
+                        })
+                        .filter_map(|event| event.get("createdAt").and_then(Value::as_str))
+                        .max();
+                    let incoming_is_newer = match (incoming_clock, local_clock.as_deref()) {
+                        (Some(incoming), Some(local)) => incoming > local,
+                        (Some(_), None) => true,
+                        _ => false,
+                    };
                     let local_resp: Option<i64> = conn
                         .query_row(
                             "SELECT responsible_user_id FROM items WHERE id=?1",
@@ -495,22 +522,30 @@ pub fn import_journal(conn: &Connection, journal: &Value) -> Value {
                         }
                         notify_conflict(conn, ws, local_id, &desc);
                         conflicts += 1;
-                    } else {
+                    } else if incoming_is_newer {
                         let incoming_title = it.get("title").and_then(|v| v.as_str()).unwrap_or("");
                         let title_ok = !incoming_title.is_empty()
                             && !incoming_title.contains('Ã')
                             && !incoming_title.contains('\u{FFFD}');
                         let _ = conn.execute(
                             "UPDATE items SET title=CASE WHEN ?5 THEN COALESCE(?2,title) ELSE title END,
-                             due_at=COALESCE(?3,due_at), responsible_user_id=?4,
+                             due_at=?3, responsible_user_id=?4, status_id=COALESCE(?10,status_id),
                              source_system=COALESCE(?6,source_system), external_id=COALESCE(?7,external_id),
                              metadata_json=COALESCE(?8,metadata_json),
-                             organization_node_id=COALESCE(?9,organization_node_id) WHERE id=?1",
+                             organization_node_id=?9,
+                             calibrated_until=?11, min_quantity=?12, quantity=?13,
+                             unit=?14, cost=?15, comment=?16 WHERE id=?1",
                             params![local_id, incoming_title, it.get("dueAt").and_then(|v| v.as_str()), resp, title_ok as i64,
                                 it.get("sourceSystem").and_then(|v| v.as_str()),
                                 it.get("externalId").and_then(|v| v.as_str()),
                                 it.get("metadata").filter(|v| v.is_object()).map(Value::to_string),
-                                organization_node],
+                                organization_node, st,
+                                it.get("calibratedUntil").and_then(Value::as_str),
+                                it.get("minQuantity").and_then(Value::as_f64),
+                                it.get("quantity").and_then(Value::as_f64),
+                                it.get("unit").and_then(Value::as_str),
+                                it.get("cost").and_then(Value::as_f64),
+                                it.get("comment").and_then(Value::as_str)],
                         );
                     }
                     items_n += 1;
@@ -744,6 +779,23 @@ pub fn list_peers(conn: &Connection) -> Value {
     Value::Array(out)
 }
 
+pub fn peer_urls(conn: &Connection) -> Vec<String> {
+    let Ok(mut stmt) = conn.prepare("SELECT url FROM peers ORDER BY id") else {
+        return Vec::new();
+    };
+    stmt.query_map([], |row| row.get::<_, String>(0))
+        .map(|rows| rows.flatten().collect())
+        .unwrap_or_default()
+}
+
+pub fn remove_peer(conn: &Connection, url: &str) -> Value {
+    let url = url.trim().trim_end_matches('/');
+    let removed = conn
+        .execute("DELETE FROM peers WHERE url=?1", params![url])
+        .unwrap_or(0);
+    json!({"ok": true, "removed": removed})
+}
+
 pub fn add_peer(conn: &Connection, url: &str, name: Option<&str>, node_id: Option<&str>) -> Value {
     let url = url.trim().trim_end_matches('/').to_string();
     let _ = conn.execute(
@@ -825,6 +877,12 @@ pub fn local_http_base() -> String {
 }
 
 pub fn guess_lan_base() -> String {
+    if let Ok(url) = std::env::var("MESHKEEPER_ADVERTISE_URL") {
+        let normalized = url.trim().trim_end_matches('/');
+        if normalized.starts_with("http://") || normalized.starts_with("https://") {
+            return normalized.to_string();
+        }
+    }
     let bind = std::env::var("MESHKEEPER_BIND").unwrap_or_else(|_| "0.0.0.0:8080".into());
     let port = bind.rsplit(':').next().unwrap_or("8080");
     if let Ok(sock) = std::net::UdpSocket::bind("0.0.0.0:0") {
@@ -850,14 +908,16 @@ pub fn apply_remote_journal(conn: &Connection, journal: &Value, peer_url: &str) 
     }
     let name = journal.get("nodeName").and_then(|v| v.as_str());
     let nid = journal.get("nodeId").and_then(|v| v.as_str());
-    add_peer(conn, peer_url, name, nid);
-    let _ = conn.execute(
-        "UPDATE peers SET last_sync=?1, last_error=NULL WHERE url=?2",
-        params![
-            chrono::Utc::now().to_rfc3339(),
-            peer_url.trim().trim_end_matches('/')
-        ],
-    );
+    if crate::validate_peer_url(peer_url).is_ok() {
+        add_peer(conn, peer_url, name, nid);
+        let _ = conn.execute(
+            "UPDATE peers SET last_sync=?1, last_error=NULL WHERE url=?2",
+            params![
+                chrono::Utc::now().to_rfc3339(),
+                peer_url.trim().trim_end_matches('/')
+            ],
+        );
+    }
     result
 }
 
@@ -963,10 +1023,17 @@ pub fn status(conn: &Connection) -> Value {
             .flatten()
         })
         .unwrap_or((None, None));
+    let role = if upstream.is_some() {
+        "node"
+    } else if !peer_urls(conn).is_empty() {
+        "mesh"
+    } else {
+        "server"
+    };
     json!({
         "nodeId": id,
         "name": name,
-        "role": if upstream.is_some() { "node" } else { "server" },
+        "role": role,
         "upstream": upstream,
         "lastSync": last_sync,
         "lastError": last_error,

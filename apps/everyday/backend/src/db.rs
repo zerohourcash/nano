@@ -288,6 +288,24 @@ fn migrate(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+pub fn ensure_workspace_statuses(conn: &Connection, workspace_id: i64) -> Result<()> {
+    for (name, slug, color, bg) in [
+        ("В работе", "in-work", "#2E9E5B", "#C8FCD2"),
+        ("В ремонте", "in-repair", "#A87C0F", "#FBFCC8"),
+        ("На складе", "in-stock", "#5E629B", "#EDEDF7"),
+        ("На проверке", "needs-check", "#A87C0F", "#FBFCC8"),
+        ("Списан", "written-off", "#D64545", "#FAD8D1"),
+    ] {
+        conn.execute(
+            "INSERT INTO statuses (name, workspace_id, type, slug, color, bg)
+             SELECT ?2, ?1, 'status', ?3, ?4, ?5
+             WHERE NOT EXISTS (SELECT 1 FROM statuses WHERE workspace_id=?1 AND slug=?3)",
+            params![workspace_id, name, slug, color, bg],
+        )?;
+    }
+    Ok(())
+}
+
 /// Проставляет недостающие GUID. Вызывается при открытии базы и перед каждой
 /// выгрузкой: строка, созданная уже после старта, иначе уехала бы с guid=null,
 /// и всё, что на неё ссылается, отбрасывалось бы на приёмной стороне.

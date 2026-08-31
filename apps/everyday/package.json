@@ -21,6 +21,7 @@
     "test:e2e": "npm run build && playwright test",
     "smoke": "python3 scripts/smoke_runner.py",
     "sync:test": "python3 scripts/sync_test.py",
+    "mesh:test": "python3 scripts/mesh_test.py",
     "import:facekit": "node scripts/import-facekit-snapshot.mjs",
     "pwa:icons": "python3 scripts/generate-pwa-icons.py",
     "pwa:check": "node scripts/check-pwa.mjs",

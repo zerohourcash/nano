@@ -5,7 +5,7 @@ export const syncRouter = createRouter({
   status: publicQuery.query(async () => ({
     nodeId: "",
     name: "",
-    role: "" as "node" | "server",
+    role: "" as "node" | "server" | "mesh",
     upstream: null as string | null,
     lastSync: null as string | null,
     lastError: null as string | null,
@@ -34,6 +34,9 @@ export const syncRouter = createRouter({
   addPeer: publicQuery
     .input(z.object({ url: z.string().min(4), name: z.string().optional() }))
     .mutation(async ({ input }) => ({ ok: true, url: input.url })),
+  removePeer: publicQuery
+    .input(z.object({ url: z.string().min(4) }))
+    .mutation(async () => ({ ok: true, removed: 1 })),
   pullNow: publicQuery
     .input(z.object({ url: z.string().min(4).optional() }).optional())
     .mutation(async () => ({ ok: true, queued: true })),

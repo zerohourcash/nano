@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { GitBranch, Network, Radio, RefreshCw, ShieldAlert, Download, Upload } from 'lucide-react'
+import { GitBranch, Network, Radio, RefreshCw, ShieldAlert, Download, Upload, Trash2 } from 'lucide-react'
 import { trpc } from '@/providers/trpc'
 import { cn } from '@/lib/utils'
 import { SectionHeader, btnPrimaryCls, btnSecondaryCls, cardCls, inputCls, useToast } from './ui'
@@ -23,6 +23,13 @@ export default function OfflineNodesSection() {
       utils.sync.status.invalidate()
       toast('Узел добавлен, журнал подтянется сам')
       setPeerUrl('')
+    },
+    onError: (e) => toast(e.message, 'error'),
+  })
+  const removePeer = trpc.sync.removePeer.useMutation({
+    onSuccess: () => {
+      utils.sync.status.invalidate()
+      toast('Узел удалён из mesh')
     },
     onError: (e) => toast(e.message, 'error'),
   })
@@ -57,12 +64,12 @@ export default function OfflineNodesSection() {
   })
 
   const st = statusQ.data
-  const isNode = st?.role === 'node'
+  const isNode = st?.role === 'node' || st?.role === 'mesh'
   const peers = st?.peers ?? []
   const conflicts = (conflictsQ.data ?? []).filter((c) => c.status === 'open')
 
   const onImportFile = async (file: File) => {
-    if (password.length < 8) {
+    if (password.length < 12) {
       toast('Сначала введите пароль архива', 'error')
       return
     }
@@ -82,19 +89,19 @@ export default function OfflineNodesSection() {
         </div>
         <p className="text-sm text-ink-500">
           {isNode
-            ? 'Локальный узел: работает на своей базе и обменивается изменениями с сервером, когда есть связь.'
-            : 'Центральный сервер: хранит общую базу и принимает обмен от локальных узлов.'}
+            ? 'Mesh-узел: работает на своей базе и обменивается изменениями со всеми доступными peers.'
+            : 'Принимающий узел: хранит локальную базу и готов к подключению участников mesh.'}
         </p>
         <div className="grid sm:grid-cols-2 gap-2 text-sm">
           <div>
-            Роль: <b>{isNode ? 'локальный узел' : 'сервер'}</b>
+            Роль: <b>{st?.role === 'mesh' ? 'mesh-узел' : isNode ? 'локальный узел' : 'принимающий узел'}</b>
           </div>
           <div>Имя: <b>{st?.name || '…'}</b></div>
           <div className="font-mono-num break-all">ID: {st?.nodeId || '…'}</div>
           <div className="sm:col-span-2 font-mono-num break-all">URL: {st?.url}</div>
         </div>
 
-        {isNode && (
+        {st?.upstream && (
           <div className="rounded-xl border border-brand-100 p-3 space-y-2 text-sm">
             <div className="font-mono-num break-all">Сервер: {st?.upstream}</div>
             <div className="flex flex-wrap items-center gap-2">
@@ -169,11 +176,18 @@ export default function OfflineNodesSection() {
                   sync {p.lastSync ?? 'ещё нет'} {p.lastError ? `· ${p.lastError}` : ''}
                 </span>
               </span>
-              {isNode && (
+              <span className="flex gap-2">
                 <button className={btnSecondaryCls} onClick={() => pull.mutate({})}>
                   <RefreshCw size={14} /> Сейчас
                 </button>
-              )}
+                <button
+                  className={btnSecondaryCls}
+                  aria-label={`Удалить узел ${p.name || p.url}`}
+                  onClick={() => removePeer.mutate({ url: p.url })}
+                >
+                  <Trash2 size={14} />
+                </button>
+              </span>
             </li>
           ))}
         </ul>
@@ -209,12 +223,12 @@ export default function OfflineNodesSection() {
         <input
           className={inputCls}
           type="password"
-          placeholder="Пароль архива от 8 символов"
+          placeholder="Пароль архива от 12 символов"
           value={password}
           onChange={(e) => setPassword(e.target.value)}
         />
         <div className="flex flex-wrap gap-2">
-          <button className={btnPrimaryCls} disabled={password.length < 8 || exp.isPending} onClick={() => exp.mutate({ password })}>
+          <button className={btnPrimaryCls} disabled={password.length < 12 || exp.isPending} onClick={() => exp.mutate({ password })}>
             <Download size={16} /> Скачать архив
           </button>
           <label className={btnSecondaryCls + ' cursor-pointer'}>
