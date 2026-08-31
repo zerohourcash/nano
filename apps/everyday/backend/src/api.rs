@@ -1332,9 +1332,13 @@ impl Invite {
 }
 
 fn invite_by_token(conn: &Connection, token: &str) -> Result<Invite, ApiError> {
+    // Mesh-журнал никогда не раскрывает bearer-токен приглашения. На принимающей
+    // ноде хранится только его SHA-256; введённый QR-токен остаётся доказательством
+    // владения и сопоставляется локально.
+    let token_digest = format!("sha256:{}", hex::encode(Sha256::digest(token.as_bytes())));
     conn.query_row(
-        "SELECT id, workspace_id, role, max_uses, used_count, revoked, expires_at FROM invites WHERE token=?1",
-        params![token],
+        "SELECT id, workspace_id, role, max_uses, used_count, revoked, expires_at FROM invites WHERE token=?1 OR token=?2",
+        params![token, token_digest],
         |r| {
             Ok(Invite {
                 id: r.get(0)?,

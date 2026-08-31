@@ -304,7 +304,7 @@ def main() -> int:
             {"id": server_item["id"], "organizationNodeId": room["id"]},
         )
 
-        server.call(
+        mesh_invite = server.call(
             "admin.workspaces.createInvite",
             {"workspaceId": ws_id, "role": "viewer", "maxUses": 1},
         )
@@ -312,7 +312,14 @@ def main() -> int:
         journal_req.add_header("authorization", f"Bearer {TOKEN}")
         with urllib.request.urlopen(journal_req, timeout=5) as response:
             journal = json.loads(response.read().decode())
-        check("активные приглашения не экспортируются", journal.get("invites") == [], str(journal.get("invites")))
+        synced_invites = journal.get("invites", [])
+        check(
+            "приглашение экспортируется только как SHA-256 capability",
+            len(synced_invites) == 1
+            and len(synced_invites[0].get("tokenDigest", "")) == 64
+            and mesh_invite["token"] not in json.dumps(journal),
+            str(synced_invites),
+        )
 
         node.call("sync.pullNow", {})
 
@@ -324,6 +331,11 @@ def main() -> int:
             in node.call("auth.login", {"phone": OWNER_PHONE, "password": OWNER_PASSWORD})
         )
         check("синхронизированный сотрудник входит на узле", logged_in)
+        invite_available_offline = wait_for(
+            lambda: node.call("auth.inviteInfo", {"token": mesh_invite["token"]}).get("role")
+            == "viewer"
+        )
+        check("QR-приглашение проверяется на узле после pull", invite_available_offline)
 
         node_ws = node.call("meta.workspaces", None, mutation=False)
         node_ws_id = node_ws[0]["id"] if isinstance(node_ws, list) and node_ws else None

@@ -10,10 +10,6 @@ use std::collections::{HashMap, HashSet};
 static SYNC_NOW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 pub const MAX_PEERS: i64 = 32;
 
-fn sync_invites_enabled() -> bool {
-    std::env::var("MESHKEEPER_SYNC_INVITES").as_deref() == Ok("1")
-}
-
 pub fn request_sync_now() {
     SYNC_NOW.store(true, std::sync::atomic::Ordering::Relaxed);
 }
@@ -313,21 +309,25 @@ pub fn export_journal_since(conn: &Connection, recipient_frontier: Option<&Value
         retain_after_frontier(&mut history, recipient_frontier);
     }
     let mut invites = Vec::new();
-    if sync_invites_enabled() {
-        if let Ok(mut stmt) = conn.prepare(
-            "SELECT token, workspace_id, role, max_uses, used_count, revoked, created_at FROM invites",
+    // Реплицируем возможность локального onboarding, но не сам bearer secret.
+    // Получатель доказывает владение токеном, предъявляя значение из QR.
+    if let Ok(mut stmt) = conn.prepare(
+            "SELECT token, workspace_id, role, max_uses, used_count, revoked, created_at, expires_at FROM invites",
         ) {
             for row in stmt
                 .query_map([], |r| {
                     let ws: i64 = r.get(1)?;
+                    let token: String = r.get(0)?;
+                    let digest = token.strip_prefix("sha256:").map(str::to_owned).unwrap_or_else(|| hex::encode(Sha256::digest(token.as_bytes())));
                     Ok(json!({
-                        "token": r.get::<_, String>(0)?,
+                        "tokenDigest": digest,
                         "workspaceGuid": guid_of(conn, "workspaces", ws),
                         "role": r.get::<_, String>(2)?,
                         "maxUses": r.get::<_, i64>(3)?,
                         "usedCount": r.get::<_, i64>(4)?,
                         "revoked": r.get::<_, i64>(5)? != 0,
                         "createdAt": r.get::<_, String>(6)?,
+                        "expiresAt": r.get::<_, Option<String>>(7)?,
                     }))
                 })
                 .into_iter()
@@ -336,7 +336,6 @@ pub fn export_journal_since(conn: &Connection, recipient_frontier: Option<&Value
             {
                 invites.push(row);
             }
-        }
     }
     let mut memberships = Vec::new();
     if let Ok(mut stmt) =
@@ -571,6 +570,29 @@ fn upsert_user(conn: &Connection, u: &Value) -> i64 {
         ],
     );
     conn.last_insert_rowid()
+}
+
+/// Finds both locally-created raw capabilities and replicated one-way forms
+/// without ever materialising the original token in a journal.
+fn find_invite_by_digest(conn: &Connection, digest: &str) -> Option<i64> {
+    let mut stmt = conn.prepare("SELECT id,token FROM invites").ok()?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })
+        .ok()?;
+    let wanted = digest.to_ascii_lowercase();
+    for row in rows.flatten() {
+        let candidate = row
+            .1
+            .strip_prefix("sha256:")
+            .map(str::to_owned)
+            .unwrap_or_else(|| hex::encode(Sha256::digest(row.1.as_bytes())));
+        if candidate == wanted {
+            return Some(row.0);
+        }
+    }
+    None
 }
 
 /// Проставляет хеш пароля, если локально его ещё нет. Существующий хеш
@@ -1022,41 +1044,54 @@ pub fn import_journal(conn: &Connection, journal: &Value) -> Value {
             }
         }
     }
-    if sync_invites_enabled() {
-        if let Some(arr) = journal.get("invites").and_then(|v| v.as_array()) {
-            for inv in arr {
-                let token = inv.get("token").and_then(|v| v.as_str()).unwrap_or("");
-                let ws_g = inv
-                    .get("workspaceGuid")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let Some(ws) = id_by_guid(conn, "workspaces", ws_g) else {
-                    continue;
-                };
-                if token.is_empty() {
-                    continue;
-                }
-                let exists: i64 = conn
-                    .query_row(
-                        "SELECT COUNT(*) FROM invites WHERE token=?1",
-                        params![token],
-                        |r| r.get(0),
-                    )
-                    .unwrap_or(0);
-                if exists == 0 {
-                    let _ = conn.execute(
-                    "INSERT INTO invites (workspace_id, token, role, max_uses, used_count, revoked, created_at) VALUES (?1,?2,?3,?4,?5,?6,?7)",
+    if let Some(arr) = journal.get("invites").and_then(|v| v.as_array()) {
+        for inv in arr {
+            // v1 peers could explicitly export raw tokens. Accept those only
+            // when the operator enabled the old compatibility switch, and
+            // immediately convert them to a one-way digest at rest.
+            let digest = inv
+                .get("tokenDigest")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .or_else(|| {
+                    let raw = inv.get("token").and_then(Value::as_str)?;
+                    (std::env::var("MESHKEEPER_SYNC_INVITES").as_deref() == Ok("1"))
+                        .then(|| hex::encode(Sha256::digest(raw.as_bytes())))
+                })
+                .unwrap_or_default();
+            let ws_g = inv
+                .get("workspaceGuid")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let Some(ws) = id_by_guid(conn, "workspaces", ws_g) else {
+                continue;
+            };
+            if digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_hexdigit()) {
+                continue;
+            }
+            let encoded = format!("sha256:{}", digest.to_ascii_lowercase());
+            let existing = find_invite_by_digest(conn, &digest);
+            if let Some(id) = existing {
+                // Состояние возможности только ужесточается при merge:
+                // отзыв и больший счётчик использований нельзя откатить.
+                let _ = conn.execute(
+                        "UPDATE invites SET used_count=MAX(used_count,?2), revoked=MAX(revoked,?3) WHERE id=?1",
+                        params![id, inv.get("usedCount").and_then(Value::as_i64).unwrap_or(0), if inv.get("revoked").and_then(Value::as_bool).unwrap_or(false) {1} else {0}],
+                    );
+            } else {
+                let _ = conn.execute(
+                    "INSERT INTO invites (workspace_id, token, role, max_uses, used_count, revoked, created_at, expires_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
                     params![
                         ws,
-                        token,
+                        encoded,
                         inv.get("role").and_then(|v| v.as_str()).unwrap_or("member"),
                         inv.get("maxUses").and_then(|v| v.as_i64()).unwrap_or(20),
                         inv.get("usedCount").and_then(|v| v.as_i64()).unwrap_or(0),
                         if inv.get("revoked").and_then(|v| v.as_bool()).unwrap_or(false) { 1 } else { 0 },
-                        inv.get("createdAt").and_then(|v| v.as_str()).unwrap_or("")
+                        inv.get("createdAt").and_then(|v| v.as_str()).unwrap_or(""),
+                        inv.get("expiresAt").and_then(Value::as_str),
                     ],
                 );
-                }
             }
         }
     }
@@ -1731,6 +1766,71 @@ mod tests {
             .as_str()
             .unwrap_or_default()
             .contains("hash mismatch"));
+        drop((source, target));
+        for path in [source_path, target_path] {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    #[test]
+    fn invitation_capability_syncs_as_digest_and_works_after_offline_pull() {
+        let source_path =
+            std::env::temp_dir().join(format!("invite-source-{}.db", uuid::Uuid::new_v4()));
+        let target_path =
+            std::env::temp_dir().join(format!("invite-target-{}.db", uuid::Uuid::new_v4()));
+        let source = crate::db::open(&source_path).unwrap();
+        let mut target = crate::db::open(&target_path).unwrap();
+        let workspace_guid = uuid::Uuid::new_v4().to_string();
+        source.execute("INSERT INTO workspaces(name,internal_id_prefix,created_at,guid) VALUES('Offline org','O-',?1,?2)",params![chrono::Utc::now().to_rfc3339(),workspace_guid]).unwrap();
+        let workspace = source.last_insert_rowid();
+        let raw = "5b0847bdfca64707a94b2d94eaeba8fa";
+        let expires = (chrono::Utc::now() + chrono::Duration::hours(2)).to_rfc3339();
+        source.execute("INSERT INTO invites(workspace_id,token,role,max_uses,used_count,revoked,created_at,expires_at) VALUES(?1,?2,'member',1,0,0,?3,?4)",params![workspace,raw,chrono::Utc::now().to_rfc3339(),expires]).unwrap();
+
+        let bundle = export_transport_bundle(&source);
+        let serialized = serde_json::to_string(&bundle).unwrap();
+        assert!(
+            !serialized.contains(raw),
+            "bearer token leaked into sync bundle"
+        );
+        assert_eq!(
+            bundle["journal"]["invites"][0]["tokenDigest"]
+                .as_str()
+                .unwrap()
+                .len(),
+            64
+        );
+        assert_eq!(import_transport_bundle(&target, &bundle)["ok"], true);
+        let stored: String = target
+            .query_row("SELECT token FROM invites", [], |row| row.get(0))
+            .unwrap();
+        assert!(stored.starts_with("sha256:"));
+        let info =
+            crate::api::dispatch(&mut target, "auth.inviteInfo", &json!({"token":raw}), None)
+                .unwrap();
+        assert_eq!(info["role"], "member");
+        assert_eq!(info["expiresAt"], expires);
+        let joined = crate::api::dispatch(
+            &mut target,
+            "auth.joinRegister",
+            &json!({
+                "token": raw,
+                "fullName": "Локальный сотрудник",
+                "phone": "+7 999 777-66-55",
+                "password": "OfflineJoin12345"
+            }),
+            None,
+        )
+        .unwrap();
+        assert!(joined["id"].as_i64().is_some());
+        assert_eq!(
+            target
+                .query_row("SELECT COUNT(*) FROM user_workspaces", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+
         drop((source, target));
         for path in [source_path, target_path] {
             let _ = std::fs::remove_file(path);
