@@ -144,7 +144,7 @@ pub fn export_journal(conn: &Connection) -> Value {
     }
     let mut items = Vec::new();
     if let Ok(mut stmt) = conn.prepare(
-        "SELECT id, internal_id, title, category_id, status_id, responsible_user_id, workspace_id, serial_number, qr_code, due_at, guid, calibrated_until, min_quantity, quantitative, quantity, unit, cost, comment, source_system, external_id, metadata_json FROM items",
+        "SELECT id, internal_id, title, category_id, status_id, responsible_user_id, workspace_id, serial_number, qr_code, due_at, guid, calibrated_until, min_quantity, quantitative, quantity, unit, cost, comment, source_system, external_id, metadata_json, organization_node_id FROM items",
     ) {
         for row in stmt.query_map([], |r| {
             let id: i64 = r.get(0)?;
@@ -160,6 +160,7 @@ pub fn export_journal(conn: &Connection) -> Value {
                 "title": r.get::<_, String>(2)?,
                 "workspaceGuid": guid_of(conn, "workspaces", ws),
                 "responsibleGuid": resp.map(|u| guid_of(conn, "users", u)),
+                "organizationNodeGuid": r.get::<_,Option<i64>>(21)?.map(|node| guid_of(conn,"organization_nodes",node)),
                 "serialNumber": r.get::<_, Option<String>>(7)?,
                 "qrCode": r.get::<_, Option<String>>(8)?,
                 "dueAt": r.get::<_, Option<String>>(9)?,
@@ -441,6 +442,10 @@ pub fn import_journal(conn: &Connection, journal: &Value) -> Value {
             };
             let resp_g = it.get("responsibleGuid").and_then(|v| v.as_str());
             let resp = resp_g.and_then(|g| id_by_guid(conn, "users", g));
+            let organization_node = it
+                .get("organizationNodeGuid")
+                .and_then(Value::as_str)
+                .and_then(|g| id_by_guid(conn, "organization_nodes", g));
             let slug = it
                 .get("statusSlug")
                 .and_then(|v| v.as_str())
@@ -491,11 +496,13 @@ pub fn import_journal(conn: &Connection, journal: &Value) -> Value {
                             "UPDATE items SET title=CASE WHEN ?5 THEN COALESCE(?2,title) ELSE title END,
                              due_at=COALESCE(?3,due_at), responsible_user_id=?4,
                              source_system=COALESCE(?6,source_system), external_id=COALESCE(?7,external_id),
-                             metadata_json=COALESCE(?8,metadata_json) WHERE id=?1",
+                             metadata_json=COALESCE(?8,metadata_json),
+                             organization_node_id=COALESCE(?9,organization_node_id) WHERE id=?1",
                             params![local_id, incoming_title, it.get("dueAt").and_then(|v| v.as_str()), resp, title_ok as i64,
                                 it.get("sourceSystem").and_then(|v| v.as_str()),
                                 it.get("externalId").and_then(|v| v.as_str()),
-                                it.get("metadata").filter(|v| v.is_object()).map(Value::to_string)],
+                                it.get("metadata").filter(|v| v.is_object()).map(Value::to_string),
+                                organization_node],
                         );
                     }
                     items_n += 1;
@@ -511,8 +518,8 @@ pub fn import_journal(conn: &Connection, journal: &Value) -> Value {
                 .and_then(|v| v.as_str())
                 .unwrap_or("ВН-0000");
             let _ = conn.execute(
-                "INSERT INTO items (internal_id, title, status_id, responsible_user_id, workspace_id, serial_number, qr_code, due_at, guid, calibrated_until, min_quantity, quantitative, quantity, unit, cost, comment, source_system, external_id, metadata_json, created_at)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
+                "INSERT INTO items (internal_id, title, status_id, responsible_user_id, workspace_id, serial_number, qr_code, due_at, guid, calibrated_until, min_quantity, quantitative, quantity, unit, cost, comment, source_system, external_id, metadata_json, created_at, organization_node_id)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)",
                 params![
                     internal, title, st, resp, ws,
                     it.get("serialNumber").and_then(|v| v.as_str()),
@@ -529,7 +536,8 @@ pub fn import_journal(conn: &Connection, journal: &Value) -> Value {
                     it.get("sourceSystem").and_then(|v| v.as_str()),
                     it.get("externalId").and_then(|v| v.as_str()),
                     it.get("metadata").filter(|v| v.is_object()).map(Value::to_string),
-                    chrono::Utc::now().to_rfc3339()
+                    chrono::Utc::now().to_rfc3339(),
+                    organization_node
                 ],
             );
             items_n += 1;

@@ -218,7 +218,7 @@ def main() -> int:
         ws_id = ws[0]["id"] if isinstance(ws, list) and ws else None
         storages = server.call("admin.storages.list", {"workspaceId": ws_id}, mutation=False)
         st_id = storages[0]["id"] if isinstance(storages, list) and storages else None
-        server.call(
+        server_item = server.call(
             "items.create",
             {
                 "workspaceId": ws_id,
@@ -238,7 +238,7 @@ def main() -> int:
                 "tabLabel": "Цеха",
             },
         )
-        server.call(
+        room = server.call(
             "admin.organizationNodes.create",
             {
                 "workspaceId": ws_id,
@@ -246,6 +246,10 @@ def main() -> int:
                 "kind": "room",
                 "name": "Кабинет 204",
             },
+        )
+        server.call(
+            "items.update",
+            {"id": server_item["id"], "organizationNodeId": room["id"]},
         )
 
         server.call(
@@ -300,6 +304,12 @@ def main() -> int:
             and synced_card.get("externalId") == "2877042"
             and synced_card.get("metadata", {}).get("ownerCompany") == "ООО ФейсКИТ",
             str(synced_card)[:180],
+        )
+        check(
+            "оборудование привязано к разделу после синхронизации",
+            isinstance(synced_card, dict)
+            and synced_card.get("organizationNode", {}).get("name") == "Кабинет 204",
+            str(synced_card.get("organizationNode") if isinstance(synced_card, dict) else synced_card),
         )
 
         print("\n== 5. Узел → сервер ==")

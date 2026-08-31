@@ -128,7 +128,8 @@ pub fn item_json(conn: &Connection, id: i64, with_history: bool) -> Option<Value
             "SELECT id, internal_id, title, category_id, brand_id, status_id, responsible_user_id,
                     building_site_id, storage_id, workspace_id, serial_number, cost, quantitative,
                     quantity, unit, comment, qr_code, notify_date, created_at, due_at,
-                    guid, calibrated_until, min_quantity, source_system, external_id, metadata_json
+                    guid, calibrated_until, min_quantity, source_system, external_id, metadata_json,
+                    organization_node_id
              FROM items WHERE id=?1",
             params![id],
             |r| {
@@ -138,6 +139,7 @@ pub fn item_json(conn: &Connection, id: i64, with_history: bool) -> Option<Value
                 let resp: Option<i64> = r.get(6)?;
                 let site: Option<i64> = r.get(7)?;
                 let storage: Option<i64> = r.get(8)?;
+                let organization_node: Option<i64> = r.get(26)?;
                 Ok(json!({
                     "id": r.get::<_, i64>(0)?,
                     "internalId": r.get::<_, String>(1)?,
@@ -148,6 +150,7 @@ pub fn item_json(conn: &Connection, id: i64, with_history: bool) -> Option<Value
                     "responsibleUserId": resp,
                     "buildingSiteId": site,
                     "storageId": storage,
+                    "organizationNodeId": organization_node,
                     "workspaceId": r.get::<_, i64>(9)?,
                     "serialNumber": r.get::<_, Option<String>>(10)?,
                     "cost": r.get::<_, Option<f64>>(11)?,
@@ -173,6 +176,16 @@ pub fn item_json(conn: &Connection, id: i64, with_history: bool) -> Option<Value
                     "responsible": resp.and_then(|i| user_public(conn, i)).unwrap_or(Value::Null),
                     "buildingSite": named(conn, "building_sites", site),
                     "storage": storage_obj(conn, storage),
+                    "organizationNode": organization_node.and_then(|node_id| conn.query_row(
+                        "SELECT id,guid,kind,name,parent_id,tab_label FROM organization_nodes WHERE id=?1",
+                        [node_id],
+                        |node| Ok(json!({
+                            "id": node.get::<_,i64>(0)?, "guid": node.get::<_,String>(1)?,
+                            "kind": node.get::<_,String>(2)?, "name": node.get::<_,String>(3)?,
+                            "parentId": node.get::<_,Option<i64>>(4)?,
+                            "tabLabel": node.get::<_,Option<String>>(5)?,
+                        })),
+                    ).ok()).unwrap_or(Value::Null),
                     "photos": photos(conn, r.get(0)?),
                 }))
             },

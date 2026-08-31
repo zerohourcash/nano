@@ -361,6 +361,7 @@ fn validate_item_references(conn: &Connection, input: &Value, ws: i64) -> Result
         ("statusId", "statuses"),
         ("storageId", "storages"),
         ("buildingSiteId", "building_sites"),
+        ("organizationNodeId", "organization_nodes"),
     ] {
         if input.get(key).is_some() {
             if let Some(id) = i64v(input, key) {
@@ -665,7 +666,14 @@ fn redact_item_fields(value: &mut Value, hide_photos: bool, hide_location: bool)
                     map.remove("photoUrl");
                 }
                 if hide_location {
-                    for key in ["storage", "storageId", "buildingSite", "buildingSiteId"] {
+                    for key in [
+                        "storage",
+                        "storageId",
+                        "buildingSite",
+                        "buildingSiteId",
+                        "organizationNode",
+                        "organizationNodeId",
+                    ] {
                         map.remove(key);
                     }
                 }
@@ -1444,14 +1452,14 @@ fn items_create_atomic(conn: &Connection, input: &Value, user_id: Option<i64>) -
     let qr = s(input, "qrCode").or(Some(internal.clone()));
     let metadata = item_metadata(input)?;
     conn.execute(
-        "INSERT INTO items (internal_id, title, category_id, brand_id, status_id, responsible_user_id, building_site_id, storage_id, workspace_id, serial_number, cost, quantitative, quantity, unit, comment, qr_code, source_system, external_id, metadata_json, created_at)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
+        "INSERT INTO items (internal_id, title, category_id, brand_id, status_id, responsible_user_id, building_site_id, storage_id, workspace_id, serial_number, cost, quantitative, quantity, unit, comment, qr_code, source_system, external_id, metadata_json, created_at, organization_node_id)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)",
         params![
             internal, title, i64v(input,"categoryId"), i64v(input,"brandId"), i64v(input,"statusId"),
             i64v(input,"responsibleUserId"), i64v(input,"buildingSiteId"), i64v(input,"storageId"), ws,
             s(input,"serialNumber"), f64v(input,"cost"), b(input,"quantitative").unwrap_or(false) as i64,
             f64v(input,"quantity"), s(input,"unit"), s(input,"comment"), qr,
-            s(input,"sourceSystem"), s(input,"externalId"), metadata, now()
+            s(input,"sourceSystem"), s(input,"externalId"), metadata, now(), i64v(input,"organizationNodeId")
         ],
     ).map_err(|e| ApiError::bad(e.to_string()))?;
     let id = conn.last_insert_rowid();
@@ -1525,7 +1533,8 @@ fn items_update_atomic(conn: &Connection, input: &Value, user_id: Option<i64>) -
          min_quantity=CASE WHEN ?25 THEN ?26 ELSE min_quantity END,
          source_system=CASE WHEN ?27 THEN ?28 ELSE source_system END,
          external_id=CASE WHEN ?29 THEN ?30 ELSE external_id END,
-         metadata_json=CASE WHEN ?31 THEN ?32 ELSE metadata_json END
+         metadata_json=CASE WHEN ?31 THEN ?32 ELSE metadata_json END,
+         organization_node_id=CASE WHEN ?33 THEN ?34 ELSE organization_node_id END
          WHERE id=?1",
         params![
             id,
@@ -1559,7 +1568,9 @@ fn items_update_atomic(conn: &Connection, input: &Value, user_id: Option<i64>) -
             input.get("externalId").is_some(),
             s(input, "externalId"),
             input.get("metadata").is_some(),
-            metadata
+            metadata,
+            input.get("organizationNodeId").is_some(),
+            i64v(input, "organizationNodeId")
         ],
     )?;
     // Смена статуса и места хранения не должна выглядеть как безымянная правка:
@@ -1595,6 +1606,28 @@ fn items_update_atomic(conn: &Connection, input: &Value, user_id: Option<i64>) -
         note.push_str(&format!(
             ". Место хранения: {}",
             name.unwrap_or_else(|| "не указано".into())
+        ));
+    }
+    let before_node = before["organizationNodeId"].as_i64();
+    let next_node = if input.get("organizationNodeId").is_some() {
+        i64v(input, "organizationNodeId")
+    } else {
+        before_node
+    };
+    if before_node != next_node {
+        let name: Option<String> = next_node.and_then(|node_id| {
+            conn.query_row(
+                "SELECT name FROM organization_nodes WHERE id=?1",
+                [node_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
+        });
+        note.push_str(&format!(
+            ". Раздел структуры: {}",
+            name.unwrap_or_else(|| "не указан".into())
         ));
     }
     ledger::append(
@@ -5326,6 +5359,47 @@ mod tests {
         )
         .unwrap();
         assert!(visible.as_array().unwrap().is_empty());
+        cleanup(conn, path);
+    }
+
+    #[test]
+    fn item_location_uses_tree_and_rejects_foreign_workspace_node() {
+        let (mut conn, path, users, ws) = test_db();
+        let room = dispatch(
+            &mut conn,
+            "admin.organizationNodes.create",
+            &json!({"workspaceId":ws,"kind":"room","name":"Кабинет 204"}),
+            Some(users[0]),
+        )
+        .unwrap();
+        let item = dispatch(
+            &mut conn,
+            "items.create",
+            &json!({"workspaceId":ws,"title":"Осциллограф","organizationNodeId":room["id"]}),
+            Some(users[0]),
+        )
+        .unwrap();
+        assert_eq!(item["organizationNode"]["name"], "Кабинет 204");
+
+        let other_ws = ws_create(&conn, &json!({"name":"Чужая организация"}), Some(users[0]))
+            .unwrap()["id"]
+            .as_i64()
+            .unwrap();
+        let foreign = organization_node_create_atomic(
+            &conn,
+            &json!({"workspaceId":other_ws,"kind":"warehouse","name":"Чужой склад"}),
+            Some(users[0]),
+        )
+        .unwrap();
+        let error = dispatch(
+            &mut conn,
+            "items.update",
+            &json!({"id":item["id"],"organizationNodeId":foreign["id"]}),
+            Some(users[0]),
+        )
+        .unwrap_err();
+        assert_eq!(error.http, 400);
+        assert!(error.message.contains("другому рабочему пространству"));
         cleanup(conn, path);
     }
 }

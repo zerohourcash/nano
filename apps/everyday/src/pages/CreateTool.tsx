@@ -44,6 +44,7 @@ const schema = z.object({
   unit: z.string(),
   buildingSiteId: z.number().int().positive().nullable().optional(),
   storageId: z.number().int().positive().nullable().optional(),
+  organizationNodeId: z.number().int().positive().nullable().optional(),
   responsibleUserId: z.number().int().positive().nullable().optional(),
   statusId: z.number().int().positive().nullable().optional(),
   comment: z.string().max(500, 'Не более 500 символов').optional(),
@@ -179,6 +180,7 @@ export default function CreateTool() {
   const { data: statuses } = trpc.admin.dictionaries.list.useQuery({ kind: 'statuses' })
   const { data: storages } = trpc.admin.storages.list.useQuery({})
   const { data: sites } = trpc.admin.buildingSites.list.useQuery({})
+  const { data: organizationNodes } = trpc.admin.organizationNodes.list.useQuery({})
   const { data: users } = trpc.admin.users.list.useQuery({})
   const { data: me } = trpc.meta.currentUser.useQuery()
   const { data: workspaces } = trpc.meta.workspaces.useQuery()
@@ -298,6 +300,7 @@ export default function CreateTool() {
         unit: values.quantitative ? values.unit : undefined,
         buildingSiteId: values.buildingSiteId ?? undefined,
         storageId: values.storageId ?? undefined,
+        organizationNodeId: values.organizationNodeId ?? undefined,
         responsibleUserId: values.responsibleUserId ?? undefined,
         statusId: values.statusId ?? undefined,
         comment: values.comment?.trim() || undefined,
@@ -604,6 +607,27 @@ export default function CreateTool() {
           {/* Секция 2. Размещение и ответственность */}
           <SectionCard title="Где находится" delay={0.05}>
             <div className="grid sm:grid-cols-2 gap-4">
+              <div className="sm:col-span-2">
+                <FieldLabel>Раздел структуры</FieldLabel>
+                <Controller
+                  control={control}
+                  name="organizationNodeId"
+                  render={({ field }) => (
+                    <select
+                      value={field.value ?? ''}
+                      onChange={(e) => field.onChange(e.target.value ? Number(e.target.value) : null)}
+                      className={inputCls}
+                    >
+                      <option value="">Не выбран</option>
+                      {(organizationNodes ?? []).map((node) => (
+                        <option key={node.id} value={node.id}>
+                          {node.name} · {node.kind}
+                        </option>
+                      ))}
+                    </select>
+                  )}
+                />
+              </div>
               <div>
                 <FieldLabel>Объект</FieldLabel>
                 <div className="relative">
