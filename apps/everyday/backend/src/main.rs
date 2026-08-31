@@ -1,5 +1,6 @@
 mod api;
 mod auth;
+mod content;
 mod db;
 mod device;
 mod json;
@@ -17,6 +18,7 @@ use axum::{
 };
 use parking_lot::Mutex;
 use rusqlite::Connection;
+use serde::Deserialize;
 use serde_json::{json, Value};
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
 use tower_http::services::ServeDir;
@@ -438,6 +440,94 @@ async fn sync_journal_pull(
     Json(sync::export_journal_since(&db, Some(requested))).into_response()
 }
 
+#[derive(Deserialize)]
+struct BlobQuery {
+    offset: Option<usize>,
+}
+
+async fn sync_blob_get(
+    State(state): State<Arc<AppState>>,
+    Path(hash): Path<String>,
+    Query(query): Query<BlobQuery>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if !sync_authorized(&headers) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error":"sync disabled"})),
+        )
+            .into_response();
+    }
+    let db = state.db.lock();
+    match content::chunk(&db, &hash, query.offset.unwrap_or(0)) {
+        Ok(chunk) => Json(chunk).into_response(),
+        Err(error) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error":error.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+async fn sync_missing_blobs(
+    client: &reqwest::Client,
+    state: &Arc<AppState>,
+    upstream: &str,
+    token: &str,
+    journal: &Value,
+) -> anyhow::Result<()> {
+    let missing = {
+        let db = state.db.lock();
+        content::wanted_missing(&db, journal)
+    };
+    let manifest = journal.get("blobs").unwrap_or(&Value::Null);
+    for hash in missing {
+        let expected = manifest
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|entry| entry.get("hash").and_then(Value::as_str) == Some(hash.as_str()))
+            .ok_or_else(|| anyhow::anyhow!("blob отсутствует в подписанном manifest"))?;
+        let expected_mime = expected.get("mime").and_then(Value::as_str);
+        let expected_size = expected.get("size").and_then(Value::as_u64);
+        for _ in 0..=512 {
+            let offset = {
+                let db = state.db.lock();
+                content::download_offset(&db, &hash)
+            };
+            let response = client
+                .get(format!("{upstream}/sync/blob/{hash}?offset={offset}"))
+                .bearer_auth(token)
+                .send()
+                .await?
+                .error_for_status()?;
+            let response_bytes = response.bytes().await?;
+            let payload: Value = serde_json::from_slice(&response_bytes)?;
+            if payload.get("mime").and_then(Value::as_str) != expected_mime
+                || payload.get("totalSize").and_then(Value::as_u64) != expected_size
+            {
+                anyhow::bail!("chunk не соответствует подписанному manifest");
+            }
+            let complete = {
+                let db = state.db.lock();
+                sync::metric_add(&db, "sync_bytes_received", response_bytes.len() as u64);
+                content::accept_chunk(&db, &payload)?
+            };
+            if complete {
+                break;
+            }
+        }
+        let still_missing = {
+            let db = state.db.lock();
+            content::missing(&db, &json!([{"hash":hash}]))
+        };
+        if !still_missing.is_empty() {
+            anyhow::bail!("blob не завершён после максимального числа chunks");
+        }
+    }
+    Ok(())
+}
+
 /// Локальный узел обменивается изменениями с центральным сервером.
 ///
 /// Работает офлайн-first: если сервер недоступен, узел продолжает работать на
@@ -513,12 +603,11 @@ async fn sync_once(client: &reqwest::Client, state: &Arc<AppState>, upstream: &s
             .send()
             .await;
     }
-    let remote_frontier = match pulled {
+    let (remote_frontier, remote_content) = match pulled {
         Ok(resp) if resp.status().is_success() => match resp.bytes().await {
             Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
                 Ok(journal) => {
-                    let remote_frontier =
-                        journal.get("frontier").cloned().unwrap_or(Value::Null);
+                    let remote_frontier = journal.get("frontier").cloned().unwrap_or(Value::Null);
                     let db = state.db.lock();
                     sync::metric_add(&db, "sync_bytes_received", bytes.len() as u64);
                     let applied = sync::apply_remote_journal(&db, &journal, upstream);
@@ -533,7 +622,13 @@ async fn sync_once(client: &reqwest::Client, state: &Arc<AppState>, upstream: &s
                         );
                         return;
                     }
-                    remote_frontier
+                    (
+                        remote_frontier,
+                        json!({
+                            "blobs": journal.get("blobs").cloned().unwrap_or_else(|| json!([])),
+                            "photos": journal.get("photos").cloned().unwrap_or_else(|| json!([]))
+                        }),
+                    )
                 }
                 Err(e) => {
                     let db = state.db.lock();
@@ -560,6 +655,12 @@ async fn sync_once(client: &reqwest::Client, state: &Arc<AppState>, upstream: &s
         }
     };
 
+    if let Err(error) = sync_missing_blobs(client, state, upstream, token, &remote_content).await {
+        let db = state.db.lock();
+        sync::touch_peer_error(&db, upstream, &format!("ошибка вложения: {error}"));
+        return;
+    }
+
     // 2. Отдаём свои.
     let mine = {
         let db = state.db.lock();
@@ -573,7 +674,11 @@ async fn sync_once(client: &reqwest::Client, state: &Arc<AppState>, upstream: &s
         Ok(value) => value,
         Err(error) => {
             let db = state.db.lock();
-            sync::touch_peer_error(&db, upstream, &format!("не удалось собрать журнал: {error}"));
+            sync::touch_peer_error(
+                &db,
+                upstream,
+                &format!("не удалось собрать журнал: {error}"),
+            );
             return;
         }
     };
@@ -703,6 +808,7 @@ async fn main() {
             get(sync_journal_get).post(sync_journal_post),
         )
         .route("/sync/journal/pull", post(sync_journal_pull))
+        .route("/sync/blob/{hash}", get(sync_blob_get))
         .route("/api/trpc/{*procedures}", any(trpc))
         .fallback_service(static_files)
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))

@@ -167,6 +167,8 @@ export default function OfflineNodesSection() {
               <div>Проверено подписей: <b>{auditQ.data?.ledgerVerified ?? 0}</b></div>
               <div>Глав цепочек: <b>{auditQ.data?.ledgerHeads.length ?? 0}</b></div>
               <div>Потерянных связей: <b>{auditQ.data?.orphanHistory ?? 0}</b></div>
+              <div>CAS-файлов: <b>{auditQ.data?.counts.blobs ?? 0}</b></div>
+              <div>Недокачанных файлов: <b>{auditQ.data?.missingBlobs ?? 0}</b></div>
             </div>
             {(auditQ.data?.ledgerError || auditQ.data?.chatError || auditQ.data?.snapshotError) && (
               <p className="text-sm text-danger break-all">

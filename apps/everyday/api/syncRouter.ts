@@ -38,7 +38,9 @@ export const syncRouter = createRouter({
     lastEventAt: null as string | null,
     orphanHistory: 0,
     missingGuids: 0,
-    counts: { workspaces: 0, users: 0, items: 0, history: 0, messages: 0, organizationNodes: 0 },
+    missingBlobs: 0,
+    pendingDownloads: 0,
+    counts: { workspaces: 0, users: 0, items: 0, history: 0, messages: 0, organizationNodes: 0, blobs: 0 },
     ledgerHeads: [] as Array<{ workspaceGuid: string; publicKey: string; head: string; createdAt: string }>,
   })),
   peers: publicQuery.query(async () => [] as Array<{

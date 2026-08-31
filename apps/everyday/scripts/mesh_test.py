@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import base64
 import urllib.request
 
 from sync_test import (
@@ -116,12 +117,28 @@ def main() -> int:
             ),
         )
 
-        created_c = c.call("items.create", {"workspaceId": ws_c, "title": "Рация с узла C"})
+        mesh_photo = "data:image/webp;base64," + base64.b64encode(bytes([17]) * 90_000).decode()
+        created_c = c.call(
+            "items.create",
+            {
+                "workspaceId": ws_c,
+                "title": "Рация с узла C",
+                "photos": [{"url": mesh_photo, "thumbUrl": mesh_photo}],
+            },
+        )
         check("операция создана на C", isinstance(created_c, dict) and "id" in created_c)
         c.call("sync.pullNow", {})
         check(
             "операция C дошла через B до A",
             wait_for(lambda: item_named(a, 1, "Рация с узла C") is not None),
+        )
+        check(
+            "CAS-фото прошло транзитивно C→B→A без интернета",
+            wait_for(
+                lambda: ((item_named(a, 1, "Рация с узла C") or {}).get("photos") or [{}])[0].get("url")
+                == mesh_photo,
+                timeout=30,
+            ),
         )
 
         taken = c.call(
@@ -143,7 +160,7 @@ def main() -> int:
                 and (item_named(a, 1, "Рация с узла C") or {}).get("status", {}).get("slug")
                 == "in-work"
             ),
-            str(item_named(a, 1, "Рация с узла C")),
+            str(item_named(a, 1, "Рация с узла C"))[:300],
         )
         radio_a = item_named(a, 1, "Рация с узла C") or {}
         returned = a.call("transfers.returnItem", {"itemId": radio_a.get("id")})
@@ -162,7 +179,7 @@ def main() -> int:
                 and (item_named(c, ws_c, "Рация с узла C") or {}).get("status", {}).get("slug")
                 == "in-stock"
             ),
-            str(item_named(c, ws_c, "Рация с узла C")),
+            str(item_named(c, ws_c, "Рация с узла C"))[:300],
         )
 
         # Полная изоляция B: обе соседние ноды недоступны, но локальные

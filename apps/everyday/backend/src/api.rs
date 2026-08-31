@@ -448,7 +448,10 @@ fn required_admin_right(procedure: &str) -> Option<&'static str> {
         Some("manageWorkspaces")
     } else if procedure.starts_with("admin.dictionaries.") {
         Some("manageDictionaries")
-    } else if procedure.starts_with("sync.") || procedure.starts_with("backup.") {
+    } else if procedure.starts_with("sync.")
+        || procedure.starts_with("backup.")
+        || procedure.starts_with("content.")
+    {
         Some("manageWorkspaces")
     } else {
         None
@@ -472,6 +475,8 @@ fn required_right(procedure: &str) -> Option<&'static str> {
             | "items.decideChange"
     ) {
         Some("editItems")
+    } else if matches!(procedure, "items.addDocument") {
+        Some("manageDocuments")
     } else if matches!(procedure, "items.reportFault") {
         Some("reportFaults")
     } else if matches!(procedure, "items.requestChange") {
@@ -742,6 +747,7 @@ fn dispatch_inner(
         "items.update" => items_update(conn, input, user_id),
         "items.remove" => items_remove(conn, input, user_id),
         "items.addPhoto" => items_add_photo(conn, input, user_id),
+        "items.addDocument" => items_add_document(conn, input, user_id),
         "items.addComment" => items_add_comment(conn, input, user_id),
         "items.reportFault" => report_fault(conn, input, user_id),
         "items.faults" => list_faults(conn, input),
@@ -754,6 +760,24 @@ fn dispatch_inner(
         "sync.status" => Ok(crate::sync::status(conn)),
         "sync.audit" => Ok(crate::sync::integrity_audit(conn)),
         "sync.peers" => Ok(crate::sync::list_peers(conn)),
+        "content.status" => Ok(crate::content::status(conn)),
+        "content.setMode" => {
+            let mode = s(input, "mode").ok_or_else(|| ApiError::bad("mode"))?;
+            crate::content::set_mode(conn, &mode)
+                .map_err(|error| ApiError::bad(error.to_string()))?;
+            Ok(crate::content::status(conn))
+        }
+        "content.pin" => {
+            let hash = s(input, "hash").ok_or_else(|| ApiError::bad("hash"))?;
+            crate::content::pin(conn, &hash, "explicit")
+                .map_err(|error| ApiError::bad(error.to_string()))?;
+            Ok(crate::content::status(conn))
+        }
+        "content.unpin" => {
+            let hash = s(input, "hash").ok_or_else(|| ApiError::bad("hash"))?;
+            crate::content::unpin(conn, &hash).map_err(|error| ApiError::bad(error.to_string()))?;
+            Ok(crate::content::status(conn))
+        }
         "sync.addPeer" => {
             let url = s(input, "url").ok_or_else(|| ApiError::bad("Укажите адрес узла"))?;
             crate::validate_peer_url(&url).map_err(ApiError::bad)?;
@@ -763,21 +787,24 @@ fn dispatch_inner(
                 ));
             }
             let normalized = url.trim().trim_end_matches('/');
-            if [crate::sync::local_http_base(), crate::sync::guess_lan_base()]
-                .iter()
-                .any(|local| local == normalized)
+            if [
+                crate::sync::local_http_base(),
+                crate::sync::guess_lan_base(),
+            ]
+            .iter()
+            .any(|local| local == normalized)
             {
-                return Err(ApiError::bad("Нельзя добавить этот узел в peers самого себя"));
+                return Err(ApiError::bad(
+                    "Нельзя добавить этот узел в peers самого себя",
+                ));
             }
-            let added = crate::sync::add_peer(
-                conn,
-                &url,
-                s(input, "name").as_deref(),
-                None,
-            );
+            let added = crate::sync::add_peer(conn, &url, s(input, "name").as_deref(), None);
             if added.get("ok").and_then(Value::as_bool) == Some(false) {
                 return Err(ApiError::bad(
-                    added.get("error").and_then(Value::as_str).unwrap_or("Не удалось добавить peer"),
+                    added
+                        .get("error")
+                        .and_then(Value::as_str)
+                        .unwrap_or("Не удалось добавить peer"),
                 ));
             }
             Ok(added)
@@ -1702,14 +1729,26 @@ fn insert_photo(
     thumb: Option<&str>,
     is_title: bool,
 ) -> Result<i64, ApiError> {
+    let stored_url = crate::content::ingest_data_url(conn, url)
+        .map_err(|error| ApiError::bad(format!("Некорректное фото: {error}")))?
+        .unwrap_or_else(|| url.to_string());
+    let source_thumb = thumb.unwrap_or(url);
+    let stored_thumb = crate::content::ingest_data_url(conn, source_thumb)
+        .map_err(|error| ApiError::bad(format!("Некорректная миниатюра: {error}")))?
+        .unwrap_or_else(|| source_thumb.to_string());
+    let checksum = stored_url
+        .strip_prefix("cas:")
+        .map(str::to_string)
+        .unwrap_or_else(|| photo_checksum(url));
     conn.execute(
-        "INSERT INTO item_photos (item_id, url, thumb_url, sha256, is_title) VALUES (?1,?2,?3,?4,?5)",
+        "INSERT INTO item_photos (item_id, url, thumb_url, sha256, is_title, guid) VALUES (?1,?2,?3,?4,?5,?6)",
         params![
             item_id,
-            url,
-            thumb.unwrap_or(url),
-            photo_checksum(url),
-            is_title as i64
+            stored_url,
+            stored_thumb,
+            checksum,
+            is_title as i64,
+            uuid::Uuid::new_v4().to_string()
         ],
     )?;
     Ok(conn.last_insert_rowid())
@@ -1731,6 +1770,67 @@ fn items_add_photo(conn: &Connection, input: &Value, user_id: Option<i64>) -> Ap
         "thumbUrl": thumb.unwrap_or(url.clone()),
         "sha256": photo_checksum(&url),
         "isTitle": is_title
+    }))
+}
+
+fn items_add_document(conn: &mut Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
+    atomic(conn, |conn| items_add_document_atomic(conn, input, user_id))
+}
+
+fn items_add_document_atomic(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
+    let uid = require_user(conn, user_id)?;
+    let item_id = i64v(input, "itemId").ok_or_else(|| ApiError::bad("itemId"))?;
+    require_item_access(conn, uid, item_id)?;
+    require_can(conn, uid, "manageDocuments")?;
+    let name = s(input, "name").ok_or_else(|| ApiError::bad("Название документа обязательно"))?;
+    if name.chars().count() > 200 {
+        return Err(ApiError::bad("Название документа длиннее 200 символов"));
+    }
+    let source =
+        s(input, "url").ok_or_else(|| ApiError::bad("Содержимое документа обязательно"))?;
+    let access = s(input, "accessLevel").unwrap_or_else(|| "members".into());
+    if !matches!(access.as_str(), "members" | "accounting" | "managers") {
+        return Err(ApiError::bad(
+            "accessLevel: members, accounting или managers",
+        ));
+    }
+    let stored = crate::content::ingest_data_url(conn, &source)
+        .map_err(|error| ApiError::bad(format!("Некорректный документ: {error}")))?
+        .unwrap_or_else(|| source.clone());
+    let checksum = stored
+        .strip_prefix("cas:")
+        .map(str::to_string)
+        .unwrap_or_else(|| photo_checksum(&source));
+    let mime = s(input, "mime").or_else(|| {
+        source
+            .strip_prefix("data:")
+            .and_then(|value| value.split_once(';'))
+            .map(|(mime, _)| mime.to_string())
+    });
+    let guid = Uuid::new_v4().to_string();
+    conn.execute(
+        "INSERT INTO item_documents(item_id,name,url,guid,mime,sha256,author_id,access_level)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+        params![item_id, name, stored, guid, mime, checksum, uid, access],
+    )?;
+    let item = jsn::item_json(conn, item_id, false)
+        .ok_or_else(|| ApiError::not_found("Инструмент не найден"))?;
+    let ws = item["workspaceId"].as_i64().unwrap_or(1);
+    ledger::append(
+        conn,
+        ws,
+        uid,
+        Some(item_id),
+        "document_add",
+        Some(&guid),
+        Some(&checksum),
+        None,
+        Some(&format!("Документ добавлен: {name}; доступ: {access}")),
+    )
+    .map_err(|error| ApiError::internal(format!("Ошибка журнала: {error}")))?;
+    Ok(json!({
+        "id":conn.last_insert_rowid(),"guid":guid,"itemId":item_id,"name":name,
+        "url":source,"mime":mime,"sha256":checksum,"authorId":uid,"accessLevel":access
     }))
 }
 
@@ -4027,7 +4127,11 @@ fn chat_send(conn: &mut Connection, input: &Value, user_id: Option<i64>) -> ApiR
             |row| row.get(0),
         )?;
         if recent >= 20 {
-            return Err(ApiError::new("TOO_MANY_REQUESTS", 429, "Слишком много сообщений: подождите минуту"));
+            return Err(ApiError::new(
+                "TOO_MANY_REQUESTS",
+                429,
+                "Слишком много сообщений: подождите минуту",
+            ));
         }
         let duplicate_since = (chrono::Utc::now() - chrono::Duration::seconds(10)).to_rfc3339();
         let duplicate: bool = conn
@@ -4039,7 +4143,11 @@ fn chat_send(conn: &mut Connection, input: &Value, user_id: Option<i64>) -> ApiR
             .optional()?
             .unwrap_or(false);
         if duplicate {
-            return Err(ApiError::new("CONFLICT", 409, "Такое сообщение уже отправлено"));
+            return Err(ApiError::new(
+                "CONFLICT",
+                409,
+                "Такое сообщение уже отправлено",
+            ));
         }
         let guid = uuid::Uuid::new_v4().to_string();
         let event = ledger::append(
@@ -4077,7 +4185,10 @@ fn backup_export(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiR
     let uid = require_user(conn, user_id)?;
     require_can(conn, uid, "manageWorkspaces")?;
     let password = s(input, "password").ok_or_else(|| ApiError::bad("Пароль архива обязателен"))?;
-    let journal = crate::sync::export_journal(conn);
+    let mut journal = crate::sync::export_journal(conn);
+    journal["blobData"] = crate::content::backup_data(conn);
+    ledger::sign_journal(conn, &mut journal)
+        .map_err(|e| ApiError::internal(format!("Не удалось подписать архив: {e}")))?;
     crate::sync::encrypt_backup(&password, &journal.to_string())
         .map_err(|e| ApiError::bad(e.to_string()))
 }
@@ -4093,8 +4204,11 @@ fn backup_import(conn: &mut Connection, input: &Value, user_id: Option<i64>) -> 
     let plain =
         crate::sync::decrypt_backup(&password, &blob).map_err(|e| ApiError::bad(e.to_string()))?;
     let journal: Value = serde_json::from_str(&plain).map_err(|e| ApiError::bad(e.to_string()))?;
+    conn.execute_batch("SAVEPOINT complete_backup_restore")?;
     let result = crate::sync::apply_remote_journal(conn, &journal, "");
     if result.get("ok").and_then(Value::as_bool) == Some(false) {
+        let _ = conn
+            .execute_batch("ROLLBACK TO complete_backup_restore; RELEASE complete_backup_restore");
         return Err(ApiError::bad(
             result
                 .get("error")
@@ -4102,6 +4216,23 @@ fn backup_import(conn: &mut Connection, input: &Value, user_id: Option<i64>) -> 
                 .unwrap_or("Архив не прошёл криптографическую проверку"),
         ));
     }
+    let restored_blobs = match crate::content::restore_backup_data(
+        conn,
+        journal.get("blobData").unwrap_or(&Value::Null),
+    ) {
+        Ok(count) => count,
+        Err(error) => {
+            let _ = conn.execute_batch(
+                "ROLLBACK TO complete_backup_restore; RELEASE complete_backup_restore",
+            );
+            return Err(ApiError::bad(format!(
+                "Вложение архива повреждено: {error}"
+            )));
+        }
+    };
+    conn.execute_batch("RELEASE complete_backup_restore")?;
+    let mut result = result;
+    result["blobs"] = json!(restored_blobs);
     Ok(result)
 }
 
@@ -5311,8 +5442,8 @@ mod tests {
         assert_eq!(photo["url"].as_str(), Some(full));
         assert_eq!(photo["thumbUrl"].as_str(), Some(thumb));
         // Контрольная сумма считается сервером, а не приходит от клиента.
-        let expected = photo_checksum(full);
-        assert_eq!(photo["sha256"].as_str(), Some(expected.as_str()));
+        let expected = "c4440406fc1aa8365f34bf9d3a2e0cf08ace02c65de7847db1c542e5cce9f2ad";
+        assert_eq!(photo["sha256"].as_str(), Some(expected));
         assert_eq!(expected.len(), 64);
 
         // В списке каталога оригинал не отдаётся — только миниатюра.
@@ -5512,7 +5643,9 @@ mod tests {
         .unwrap();
         assert_eq!(sent["ledgerVerified"], true);
         assert!(sent["guid"].as_str().is_some_and(|value| !value.is_empty()));
-        assert!(sent["ledgerHash"].as_str().is_some_and(|value| !value.is_empty()));
+        assert!(sent["ledgerHash"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty()));
         assert_eq!(ledger::verify_chat_links(&conn).unwrap(), 1);
 
         let duplicate = dispatch(

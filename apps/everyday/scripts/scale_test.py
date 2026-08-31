@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import base64
+import hashlib
 import os
 import socket
 import sqlite3
@@ -71,9 +73,19 @@ def kv_number(node: Node, key: str) -> int:
     try:
         with sqlite3.connect(node.db, timeout=5) as conn:
             row = conn.execute("SELECT v FROM kv WHERE k=?", (key,)).fetchone()
-            return int(row[0]) if row else 0
+        return int(row[0]) if row else 0
     except (sqlite3.Error, ValueError):
         return 0
+
+
+def has_blob(node: Node, blob_hash: str) -> bool:
+    try:
+        with sqlite3.connect(node.db, timeout=5) as conn:
+            return conn.execute(
+                "SELECT COUNT(*) FROM content_blobs WHERE hash=?", (blob_hash,)
+            ).fetchone()[0] == 1
+    except sqlite3.Error:
+        return False
 
 
 def main() -> int:
@@ -138,9 +150,16 @@ def main() -> int:
             "chat.send",
             {"workspaceId": workspace_id, "text": "Сообщение через сеть из 100 узлов"},
         )
+        scale_photo_bytes = bytes([91]) * 70_000
+        scale_photo_hash = hashlib.sha256(scale_photo_bytes).hexdigest()
+        scale_photo = "data:image/webp;base64," + base64.b64encode(scale_photo_bytes).decode()
         item = leaf.call(
             "items.create",
-            {"workspaceId": workspace_id, "title": "Рация масштабного теста"},
+            {
+                "workspaceId": workspace_id,
+                "title": "Рация масштабного теста",
+                "photos": [{"url": scale_photo, "thumbUrl": scale_photo}],
+            },
         )
         taken = leaf.call(
             "transfers.take",
@@ -158,12 +177,14 @@ def main() -> int:
             and any(
                 row.get("title") == "Рация масштабного теста" and row.get("statusSlug") == "in-work"
                 for row in data.get("items", [])
-            ),
+            )
+            and has_blob(root, scale_photo_hash),
             timeout=90,
             label="операции leaf→root",
         )
         propagation_seconds = time.monotonic() - propagated_at
         check("подписанные операции дошли leaf→root", propagated, f"{propagation_seconds:.1f} с")
+        check("CAS-вложение дошло leaf→root и прошло SHA-256", has_blob(root, scale_photo_hash))
 
         failed_indexes = list(range(5, count, 10))
         failed_nodes = [nodes[index] for index in failed_indexes]
@@ -191,6 +212,13 @@ def main() -> int:
             label="восстановленные узлы",
         )
         check(f"{len(failed_nodes)}/{len(failed_nodes)} восстановленных узлов догнали журнал", recovered)
+        recovered_blobs = wait_count(
+            failed_nodes,
+            lambda _data: True,
+            timeout=120,
+            label="CAS восстановленных узлов",
+        ) and all(parallel_map(failed_nodes, lambda node: has_blob(node, scale_photo_hash)))
+        check("восстановленные узлы догнали CAS-вложение", recovered_blobs)
 
         memories = parallel_map(nodes, rss_kib)
         total_rss = sum(memories)

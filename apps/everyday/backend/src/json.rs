@@ -72,13 +72,15 @@ fn photos(conn: &Connection, item_id: i64) -> Vec<Value> {
     stmt.query_map(params![item_id], |r| {
         let url: String = r.get(2)?;
         let thumb: Option<String> = r.get(4)?;
+        let resolved_url = crate::content::resolve_url(conn, &url);
+        let resolved_thumb = crate::content::resolve_url(conn, thumb.as_deref().unwrap_or(&url));
         Ok(json!({
             "id": r.get::<_, i64>(0)?,
             "itemId": r.get::<_, i64>(1)?,
-            "url": url.clone(),
+            "url": resolved_url,
             // Старые снимки миниатюры не имеют — отдаём оригинал,
             // чтобы карточка не осталась без картинки.
-            "thumbUrl": thumb.unwrap_or(url),
+            "thumbUrl": resolved_thumb,
             "sha256": r.get::<_, Option<String>>(5)?,
             "isTitle": r.get::<_, i64>(3)? != 0
         }))
@@ -319,14 +321,20 @@ fn attach_stock_and_holders(conn: &Connection, id: i64, base: &mut Map<String, V
 
 fn item_docs(conn: &Connection, item_id: i64) -> Vec<Value> {
     let mut stmt = conn
-        .prepare("SELECT id, item_id, name, url FROM item_documents WHERE item_id=?1")
+        .prepare("SELECT id,item_id,name,url,guid,mime,sha256,author_id,access_level FROM item_documents WHERE item_id=?1")
         .unwrap();
     stmt.query_map(params![item_id], |r| {
+        let url: String = r.get(3)?;
         Ok(json!({
             "id": r.get::<_, i64>(0)?,
             "itemId": r.get::<_, i64>(1)?,
             "name": r.get::<_, String>(2)?,
-            "url": r.get::<_, String>(3)?,
+            "url": crate::content::resolve_url(conn, &url),
+            "guid": r.get::<_, Option<String>>(4)?,
+            "mime": r.get::<_, Option<String>>(5)?,
+            "sha256": r.get::<_, Option<String>>(6)?,
+            "authorId": r.get::<_, Option<i64>>(7)?,
+            "accessLevel": r.get::<_, String>(8)?,
         }))
     })
     .unwrap()

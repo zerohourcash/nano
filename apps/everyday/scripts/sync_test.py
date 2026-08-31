@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import json
+import base64
 import os
 import socket
 import subprocess
@@ -36,6 +37,8 @@ FALLBACK = ROOT / "dist" / "server" / EXE
 TOKEN = "test-sync-token-of-at-least-32-characters"
 OWNER_PHONE = "+7 900 111-22-33"
 OWNER_PASSWORD = "SuperSecret123"
+PHOTO_BYTES = bytes((index * 31) % 256 for index in range(150_000))
+PHOTO_DATA_URL = "data:image/png;base64," + base64.b64encode(PHOTO_BYTES).decode()
 
 # Консоль Windows по умолчанию не в UTF-8: без этого падает первый же вывод.
 for stream in (sys.stdout, sys.stderr):
@@ -268,6 +271,7 @@ def main() -> int:
                 "sourceSystem": "facekit",
                 "externalId": "2877042",
                 "metadata": {"ownerCompany": "ООО ФейсКИТ", "labels": ["mesh"]},
+                "photos": [{"url": PHOTO_DATA_URL, "thumbUrl": PHOTO_DATA_URL}],
             },
         )
         division = server.call(
@@ -351,6 +355,21 @@ def main() -> int:
             isinstance(synced_card, dict)
             and synced_card.get("organizationNode", {}).get("name") == "Кабинет 204",
             str(synced_card.get("organizationNode") if isinstance(synced_card, dict) else synced_card),
+        )
+        photo_arrived = wait_for(
+            lambda: (item_named(node, node_ws_id or 1, "Перфоратор с сервера") or {})
+            .get("photos", [{}])[0]
+            .get("url")
+            == PHOTO_DATA_URL,
+            timeout=30,
+        )
+        check("многочастное CAS-фото докачалось и прошло SHA-256", photo_arrived)
+        compact_snapshot = journal_from(node)
+        check(
+            "snapshot содержит только CAS-ссылку и manifest, не base64 файла",
+            len(compact_snapshot.get("blobs", [])) == 1
+            and compact_snapshot.get("photos", [{}])[0].get("url", "").startswith("cas:")
+            and PHOTO_DATA_URL not in json.dumps(compact_snapshot),
         )
 
         print("\n== 5. Узел → сервер ==")

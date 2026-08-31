@@ -118,6 +118,36 @@ fn migrate(conn: &Connection) -> Result<()> {
     // ТЗ §5: у вложения есть уменьшенная копия и контрольная сумма.
     let _ = conn.execute("ALTER TABLE item_photos ADD COLUMN thumb_url TEXT", []);
     let _ = conn.execute("ALTER TABLE item_photos ADD COLUMN sha256 TEXT", []);
+    let _ = conn.execute("ALTER TABLE item_photos ADD COLUMN guid TEXT", []);
+    let _ = conn.execute("ALTER TABLE item_documents ADD COLUMN guid TEXT", []);
+    let _ = conn.execute("ALTER TABLE item_documents ADD COLUMN mime TEXT", []);
+    let _ = conn.execute("ALTER TABLE item_documents ADD COLUMN sha256 TEXT", []);
+    let _ = conn.execute(
+        "ALTER TABLE item_documents ADD COLUMN author_id INTEGER",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE item_documents ADD COLUMN access_level TEXT NOT NULL DEFAULT 'members'",
+        [],
+    );
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS content_blobs (
+           hash TEXT PRIMARY KEY, mime TEXT NOT NULL, size INTEGER NOT NULL,
+           data BLOB NOT NULL, created_at TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS blob_downloads (
+           hash TEXT PRIMARY KEY, mime TEXT NOT NULL, total_size INTEGER NOT NULL,
+           data BLOB NOT NULL, updated_at TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS content_pins (
+           hash TEXT PRIMARY KEY, reason TEXT NOT NULL,
+           created_at TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS content_node_config (
+           singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+           mode TEXT NOT NULL CHECK(mode IN ('smart','metadata','full'))
+         );",
+    )?;
     // ТЗ §8: группа может требовать фото-подтверждение при списании.
     let _ = conn.execute(
         "ALTER TABLE workspaces ADD COLUMN require_writeoff_photo INTEGER NOT NULL DEFAULT 0",
@@ -283,9 +313,26 @@ fn migrate(conn: &Connection) -> Result<()> {
         "CREATE UNIQUE INDEX IF NOT EXISTS chat_messages_guid_idx ON chat_messages(guid) WHERE guid IS NOT NULL;
          CREATE UNIQUE INDEX IF NOT EXISTS chat_messages_ledger_idx ON chat_messages(ledger_hash) WHERE ledger_hash IS NOT NULL;",
     )?;
+    let _ = conn.execute(
+        "UPDATE item_photos SET guid=lower(hex(randomblob(16))) WHERE guid IS NULL OR guid=''",
+        [],
+    );
+    let _ = conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS item_photos_guid_uq ON item_photos(guid) WHERE guid IS NOT NULL",
+        [],
+    );
+    let _ = conn.execute(
+        "UPDATE item_documents SET guid=lower(hex(randomblob(16))) WHERE guid IS NULL OR guid=''",
+        [],
+    );
+    let _ = conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS item_documents_guid_uq ON item_documents(guid) WHERE guid IS NOT NULL",
+        [],
+    );
     let mut missing_chat_guids = Vec::new();
     {
-        let mut stmt = conn.prepare("SELECT id FROM chat_messages WHERE guid IS NULL OR guid=''")?;
+        let mut stmt =
+            conn.prepare("SELECT id FROM chat_messages WHERE guid IS NULL OR guid=''")?;
         missing_chat_guids.extend(stmt.query_map([], |row| row.get::<_, i64>(0))?.flatten());
     }
     for id in missing_chat_guids {
@@ -335,6 +382,8 @@ pub fn fill_guids(conn: &Connection) -> Result<()> {
         ("users", "guid"),
         ("items", "guid"),
         ("history_entries", "guid"),
+        ("item_photos", "guid"),
+        ("item_documents", "guid"),
     ] {
         let sql = format!(
             "UPDATE {table} SET {col}=lower(hex(randomblob(16))) WHERE {col} IS NULL OR {col}=''"
@@ -352,7 +401,8 @@ pub fn viewer_rights() -> serde_json::Value {
         "inventory": false, "viewHistory": false, "viewReports": false, "manageUsers": false,
         "manageWorkspaces": false, "manageStorages": false, "manageSites": false, "manageDictionaries": false,
         "reportFaults": false, "requestChanges": false,
-        "viewPhotos": true, "viewLocation": false,
+        "viewPhotos": true, "viewDocuments": false, "manageDocuments": false,
+        "viewAccounting": false, "manageAccounting": false, "viewLocation": false,
         "checkoutPolicy": default_checkout_policy()
     })
 }
@@ -366,7 +416,8 @@ pub fn admin_rights() -> serde_json::Value {
         "inventory": true, "viewHistory": true, "viewReports": true, "manageUsers": false,
         "manageWorkspaces": false, "manageStorages": true, "manageSites": true, "manageDictionaries": true,
         "reportFaults": true, "requestChanges": true,
-        "viewPhotos": true, "viewLocation": true,
+        "viewPhotos": true, "viewDocuments": true, "manageDocuments": true,
+        "viewAccounting": false, "manageAccounting": false, "viewLocation": true,
         "checkoutPolicy": default_checkout_policy()
     })
 }
@@ -590,7 +641,8 @@ pub fn default_rights() -> serde_json::Value {
         "inventory": true, "viewHistory": true, "viewReports": true, "manageUsers": false,
         "manageWorkspaces": false, "manageStorages": false, "manageSites": false, "manageDictionaries": false,
         "reportFaults": true, "requestChanges": true,
-        "viewPhotos": true, "viewLocation": true,
+        "viewPhotos": true, "viewDocuments": true, "manageDocuments": false,
+        "viewAccounting": false, "manageAccounting": false, "viewLocation": true,
         "checkoutPolicy": {
             "allowedCategoryIds": null,
             "maxHours": null,
@@ -607,7 +659,8 @@ pub fn owner_rights() -> serde_json::Value {
         "inventory": true, "viewHistory": true, "viewReports": true, "manageUsers": true,
         "manageWorkspaces": true, "manageStorages": true, "manageSites": true, "manageDictionaries": true,
         "reportFaults": true, "requestChanges": true,
-        "viewPhotos": true, "viewLocation": true,
+        "viewPhotos": true, "viewDocuments": true, "manageDocuments": true,
+        "viewAccounting": true, "manageAccounting": true, "viewLocation": true,
         "checkoutPolicy": {
             "allowedCategoryIds": null,
             "maxHours": null,

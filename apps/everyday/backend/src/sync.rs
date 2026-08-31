@@ -381,6 +381,47 @@ pub fn export_journal_since(conn: &Connection, recipient_frontier: Option<&Value
             messages.push(row);
         }
     }
+    let mut photos = Vec::new();
+    if let Ok(mut statement) = conn.prepare(
+        "SELECT p.guid,p.item_id,p.url,p.thumb_url,p.sha256,p.is_title
+         FROM item_photos p ORDER BY p.id",
+    ) {
+        if let Ok(rows) = statement.query_map([], |row| {
+            let item_id: i64 = row.get(1)?;
+            Ok(json!({
+                "guid": row.get::<_, Option<String>>(0)?,
+                "itemGuid": guid_of(conn,"items",item_id),
+                "url": row.get::<_, String>(2)?,
+                "thumbUrl": row.get::<_, Option<String>>(3)?,
+                "sha256": row.get::<_, Option<String>>(4)?,
+                "isTitle": row.get::<_, i64>(5)? != 0,
+            }))
+        }) {
+            photos.extend(rows.flatten());
+        }
+    }
+    let mut documents = Vec::new();
+    if let Ok(mut statement) = conn.prepare(
+        "SELECT d.guid,d.item_id,d.name,d.url,d.mime,d.sha256,d.author_id,d.access_level
+         FROM item_documents d ORDER BY d.id",
+    ) {
+        if let Ok(rows) = statement.query_map([], |row| {
+            let item_id: i64 = row.get(1)?;
+            let author_id: Option<i64> = row.get(6)?;
+            Ok(json!({
+                "guid": row.get::<_, Option<String>>(0)?,
+                "itemGuid": guid_of(conn,"items",item_id),
+                "name": row.get::<_, String>(2)?,
+                "url": row.get::<_, String>(3)?,
+                "mime": row.get::<_, Option<String>>(4)?,
+                "sha256": row.get::<_, Option<String>>(5)?,
+                "authorGuid": author_id.map(|id| guid_of(conn,"users",id)),
+                "accessLevel": row.get::<_, String>(7)?,
+            }))
+        }) {
+            documents.extend(rows.flatten());
+        }
+    }
     let mut journal = json!({
         "v": 1,
         "nodeId": node_id,
@@ -397,6 +438,9 @@ pub fn export_journal_since(conn: &Connection, recipient_frontier: Option<&Value
         "invites": invites,
         "memberships": memberships,
         "messages": messages,
+        "photos": photos,
+        "documents": documents,
+        "blobs": crate::content::manifests(conn),
     });
     if let Err(error) = ledger::sign_journal(conn, &mut journal) {
         return json!({"ok": false, "error": format!("Не удалось подписать журнал: {error}")});
@@ -607,9 +651,7 @@ pub fn import_journal(conn: &Connection, journal: &Value) -> Value {
                         .and_then(Value::as_array)
                         .into_iter()
                         .flatten()
-                        .filter(|event| {
-                            event.get("itemGuid").and_then(Value::as_str) == Some(guid)
-                        })
+                        .filter(|event| event.get("itemGuid").and_then(Value::as_str) == Some(guid))
                         .filter_map(|event| event.get("createdAt").and_then(Value::as_str))
                         .max();
                     let incoming_is_newer = match (incoming_clock, local_clock.as_deref()) {
@@ -736,6 +778,84 @@ pub fn import_journal(conn: &Connection, journal: &Value) -> Value {
             items_n += 1;
         }
     }
+    if let Some(arr) = journal.get("photos").and_then(Value::as_array) {
+        for photo in arr {
+            let guid = photo.get("guid").and_then(Value::as_str).unwrap_or("");
+            let Some(item_id) = photo
+                .get("itemGuid")
+                .and_then(Value::as_str)
+                .and_then(|guid| id_by_guid(conn, "items", guid))
+            else {
+                skipped += 1;
+                continue;
+            };
+            let url = photo.get("url").and_then(Value::as_str).unwrap_or("");
+            if guid.is_empty() || url.is_empty() {
+                skipped += 1;
+                continue;
+            }
+            let inserted = conn
+                .execute(
+                    "INSERT OR IGNORE INTO item_photos(guid,item_id,url,thumb_url,sha256,is_title)
+                     VALUES(?1,?2,?3,?4,?5,?6)",
+                    params![
+                        guid,
+                        item_id,
+                        url,
+                        photo.get("thumbUrl").and_then(Value::as_str),
+                        photo.get("sha256").and_then(Value::as_str),
+                        photo
+                            .get("isTitle")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false) as i64
+                    ],
+                )
+                .unwrap_or(0);
+            if inserted == 0 {
+                skipped += 1;
+            }
+        }
+    }
+    if let Some(arr) = journal.get("documents").and_then(Value::as_array) {
+        for document in arr {
+            let guid = document.get("guid").and_then(Value::as_str).unwrap_or("");
+            let Some(item_id) = document
+                .get("itemGuid")
+                .and_then(Value::as_str)
+                .and_then(|guid| id_by_guid(conn, "items", guid))
+            else {
+                skipped += 1;
+                continue;
+            };
+            let name = document.get("name").and_then(Value::as_str).unwrap_or("");
+            let url = document.get("url").and_then(Value::as_str).unwrap_or("");
+            let access = document
+                .get("accessLevel")
+                .and_then(Value::as_str)
+                .unwrap_or("members");
+            if guid.is_empty()
+                || name.is_empty()
+                || url.is_empty()
+                || !matches!(access, "members" | "accounting" | "managers")
+            {
+                skipped += 1;
+                continue;
+            }
+            let author_id = document
+                .get("authorGuid")
+                .and_then(Value::as_str)
+                .and_then(|guid| id_by_guid(conn, "users", guid));
+            let inserted = conn.execute(
+                "INSERT OR IGNORE INTO item_documents(guid,item_id,name,url,mime,sha256,author_id,access_level)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+                params![guid,item_id,name,url,document.get("mime").and_then(Value::as_str),
+                    document.get("sha256").and_then(Value::as_str),author_id,access],
+            ).unwrap_or(0);
+            if inserted == 0 {
+                skipped += 1;
+            }
+        }
+    }
     if let Some(arr) = journal.get("history").and_then(|v| v.as_array()) {
         for h in arr {
             // opId — текущее имя поля, hash — совместимость со старыми архивами.
@@ -814,7 +934,11 @@ pub fn import_journal(conn: &Connection, journal: &Value) -> Value {
                 .and_then(Value::as_str)
                 .unwrap_or("");
             let text = message.get("text").and_then(Value::as_str).unwrap_or("");
-            if guid.is_empty() || ledger_hash.is_empty() || text.is_empty() || text.chars().count() > 4000 {
+            if guid.is_empty()
+                || ledger_hash.is_empty()
+                || text.is_empty()
+                || text.chars().count() > 4000
+            {
                 skipped += 1;
                 continue;
             }
@@ -998,7 +1122,9 @@ pub fn remove_peer(conn: &Connection, url: &str) -> Value {
 pub fn add_peer(conn: &Connection, url: &str, name: Option<&str>, node_id: Option<&str>) -> Value {
     let url = url.trim().trim_end_matches('/').to_string();
     let exists: bool = conn
-        .query_row("SELECT 1 FROM peers WHERE url=?1", params![url], |_| Ok(true))
+        .query_row("SELECT 1 FROM peers WHERE url=?1", params![url], |_| {
+            Ok(true)
+        })
         .optional()
         .ok()
         .flatten()
@@ -1278,8 +1404,10 @@ pub fn integrity_audit(conn: &Connection) -> Value {
     let snapshot_result = ledger::verify_journal(&snapshot);
 
     let count = |table: &str| -> i64 {
-        conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row.get(0))
-            .unwrap_or(-1)
+        conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+            row.get(0)
+        })
+        .unwrap_or(-1)
     };
     let orphan_history: i64 = conn
         .query_row(
@@ -1303,8 +1431,20 @@ pub fn integrity_audit(conn: &Connection) -> Value {
             |row| row.get(0),
         )
         .unwrap_or(-1);
+    let missing_blobs: i64 = conn
+        .query_row(
+            "SELECT COUNT(DISTINCT p.url) FROM item_photos p
+             LEFT JOIN content_blobs b ON p.url='cas:' || b.hash
+             WHERE p.url LIKE 'cas:%' AND b.hash IS NULL",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(-1);
+    let pending_downloads = count("blob_downloads");
     let last_event_at: Option<String> = conn
-        .query_row("SELECT MAX(created_at) FROM history_entries", [], |row| row.get(0))
+        .query_row("SELECT MAX(created_at) FROM history_entries", [], |row| {
+            row.get(0)
+        })
         .ok()
         .flatten();
     let mut heads = Vec::new();
@@ -1336,7 +1476,9 @@ pub fn integrity_audit(conn: &Connection) -> Value {
         && chat_result.is_ok()
         && snapshot_result.is_ok()
         && orphan_history == 0
-        && missing_guids == 0;
+        && missing_guids == 0
+        && missing_blobs == 0
+        && pending_downloads == 0;
     json!({
         "healthy": healthy,
         "checkedAt": chrono::Utc::now().to_rfc3339(),
@@ -1350,6 +1492,8 @@ pub fn integrity_audit(conn: &Connection) -> Value {
         "lastEventAt": last_event_at,
         "orphanHistory": orphan_history,
         "missingGuids": missing_guids,
+        "missingBlobs": missing_blobs,
+        "pendingDownloads": pending_downloads,
         "counts": {
             "workspaces": count("workspaces"),
             "users": count("users"),
@@ -1357,6 +1501,7 @@ pub fn integrity_audit(conn: &Connection) -> Value {
             "history": count("history_entries"),
             "messages": count("chat_messages"),
             "organizationNodes": count("organization_nodes"),
+            "blobs": count("content_blobs"),
         },
         "ledgerHeads": heads,
     })

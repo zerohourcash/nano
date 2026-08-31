@@ -185,8 +185,7 @@ pub fn verify_journal(journal: &Value) -> anyhow::Result<()> {
     if digest(&bytes) != hash {
         bail!("sync journal hash mismatch");
     }
-    verify_node_signature(pubkey, signature, &bytes)
-        .context("invalid sync journal signature")
+    verify_node_signature(pubkey, signature, &bytes).context("invalid sync journal signature")
 }
 
 #[allow(clippy::too_many_arguments)]
