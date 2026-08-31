@@ -2,6 +2,7 @@ use crate::{db, json as jsn, ledger};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use std::collections::{HashMap, HashSet};
 
 /// Запрос немедленной синхронизации из UI. Обработчик API не может сам сходить
 /// в сеть (он держит блокировку базы), поэтому просто поднимает флаг, а цикл
@@ -85,12 +86,86 @@ pub fn hello(conn: &Connection) -> Value {
         "ok": true,
         "nodeId": id,
         "name": name,
-        "protocol": "meshkeeper-sync/2",
-        "ledger": "signed-account-chains"
+        "protocol": "meshkeeper-sync/3",
+        "ledger": "signed-account-chains",
+        "features": ["signed-snapshot", "account-frontier", "full-fallback"]
     })
 }
 
-pub fn export_journal(conn: &Connection) -> Value {
+pub fn frontier(conn: &Connection) -> Value {
+    let mut heads = Vec::new();
+    if let Ok(mut statement) = conn.prepare(
+        "SELECT w.guid,h.pubkey,h.hash
+         FROM history_entries h JOIN workspaces w ON w.id=h.workspace_id
+         WHERE h.pubkey IS NOT NULL AND h.id=(
+           SELECT MAX(h2.id) FROM history_entries h2
+           WHERE h2.workspace_id=h.workspace_id AND h2.pubkey=h.pubkey)
+         ORDER BY w.guid,h.pubkey",
+    ) {
+        if let Ok(rows) = statement.query_map([], |row| {
+            Ok(json!({
+                "workspaceGuid": row.get::<_, Option<String>>(0)?,
+                "publicKey": row.get::<_, String>(1)?,
+                "head": row.get::<_, String>(2)?,
+            }))
+        }) {
+            heads.extend(rows.flatten());
+        }
+    }
+    Value::Array(heads)
+}
+
+fn retain_after_frontier(history: &mut Vec<Value>, recipient_frontier: &Value) {
+    let known: HashMap<(String, String), String> = recipient_frontier
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| {
+            Some((
+                (
+                    entry.get("workspaceGuid")?.as_str()?.to_string(),
+                    entry.get("publicKey")?.as_str()?.to_string(),
+                ),
+                entry.get("head")?.as_str()?.to_string(),
+            ))
+        })
+        .collect();
+    // Неизвестная/расходящаяся голова означает полный fallback этой цепочки.
+    let locally_found: HashSet<(String, String)> = history
+        .iter()
+        .filter_map(|event| {
+            let key = (
+                event.get("workspaceGuid")?.as_str()?.to_string(),
+                event.get("pubkey")?.as_str()?.to_string(),
+            );
+            (known.get(&key).map(String::as_str) == event.get("opId").and_then(Value::as_str))
+                .then_some(key)
+        })
+        .collect();
+    let mut reached = HashSet::new();
+    history.retain(|event| {
+        let Some(key) = event
+            .get("workspaceGuid")
+            .and_then(Value::as_str)
+            .zip(event.get("pubkey").and_then(Value::as_str))
+            .map(|(workspace, key)| (workspace.to_string(), key.to_string()))
+        else {
+            return true;
+        };
+        if !locally_found.contains(&key) {
+            return true;
+        }
+        if reached.contains(&key) {
+            return true;
+        }
+        if known.get(&key).map(String::as_str) == event.get("opId").and_then(Value::as_str) {
+            reached.insert(key);
+        }
+        false
+    });
+}
+
+pub fn export_journal_since(conn: &Connection, recipient_frontier: Option<&Value>) -> Value {
     let (node_id, name) = ensure_node(conn);
     let _ = db::fill_guids(conn);
     let mut workspaces = Vec::new();
@@ -233,6 +308,9 @@ pub fn export_journal(conn: &Connection) -> Value {
             history.push(row);
         }
     }
+    if let Some(recipient_frontier) = recipient_frontier {
+        retain_after_frontier(&mut history, recipient_frontier);
+    }
     let mut invites = Vec::new();
     if sync_invites_enabled() {
         if let Ok(mut stmt) = conn.prepare(
@@ -309,6 +387,8 @@ pub fn export_journal(conn: &Connection) -> Value {
         "nodeName": name,
         "nodeUrl": guess_lan_base(),
         "exportedAt": chrono::Utc::now().to_rfc3339(),
+        "historyMode": if recipient_frontier.is_some() { "delta" } else { "full" },
+        "frontier": frontier(conn),
         "workspaces": workspaces,
         "users": users,
         "organizationNodes": organization_nodes,
@@ -322,6 +402,10 @@ pub fn export_journal(conn: &Connection) -> Value {
         return json!({"ok": false, "error": format!("Не удалось подписать журнал: {error}")});
     }
     journal
+}
+
+pub fn export_journal(conn: &Connection) -> Value {
+    export_journal_since(conn, None)
 }
 
 fn upsert_workspace(conn: &Connection, w: &Value) -> i64 {
@@ -1289,6 +1373,37 @@ pub fn touch_peer_error(conn: &Connection, url: &str, err: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn frontier_returns_only_descendants_and_falls_back_for_unknown_heads() {
+        let event = |op: &str, previous: Option<&str>, key: &str| {
+            json!({
+                "workspaceGuid":"ws", "pubkey":key, "opId":op, "prevHash":previous
+            })
+        };
+        let original = vec![
+            event("a1", None, "key-a"),
+            event("b1", None, "key-b"),
+            event("a2", Some("a1"), "key-a"),
+            event("a3", Some("a2"), "key-a"),
+        ];
+        let mut history = original.clone();
+        retain_after_frontier(
+            &mut history,
+            &json!([
+                {"workspaceGuid":"ws","publicKey":"key-a","head":"a2"},
+                {"workspaceGuid":"ws","publicKey":"key-b","head":"b1"}
+            ]),
+        );
+        assert_eq!(history, vec![event("a3", Some("a2"), "key-a")]);
+
+        let mut divergent = original.clone();
+        retain_after_frontier(
+            &mut divergent,
+            &json!([{"workspaceGuid":"ws","publicKey":"key-a","head":"unknown"}]),
+        );
+        assert_eq!(divergent, original);
+    }
 
     #[test]
     fn backup_v2_round_trip() {

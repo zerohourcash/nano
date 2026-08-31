@@ -169,6 +169,25 @@ def item_named(node: Node, workspace_id: int, title: str):
     return next((row for row in rows if row.get("title") == title), None)
 
 
+def pull_delta(node: Node, frontier: list[dict]) -> dict:
+    request = urllib.request.Request(
+        f"{node.base}/sync/journal/pull",
+        data=json.dumps({"frontier": frontier}).encode(),
+        method="POST",
+    )
+    request.add_header("authorization", f"Bearer {TOKEN}")
+    request.add_header("content-type", "application/json")
+    with urllib.request.urlopen(request, timeout=10) as response:
+        return json.loads(response.read().decode())
+
+
+def journal_from(node: Node) -> dict:
+    request = urllib.request.Request(f"{node.base}/sync/journal")
+    request.add_header("authorization", f"Bearer {TOKEN}")
+    with urllib.request.urlopen(request, timeout=10) as response:
+        return json.loads(response.read().decode())
+
+
 def wait_for(predicate, timeout: float = 40.0, step: float = 1.0) -> bool:
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -368,6 +387,45 @@ def main() -> int:
         hist = server.call("history.all", {"workspaceId": ws_id}, mutation=False)
         comments = json.dumps(hist, ensure_ascii=False) if isinstance(hist, list) else ""
         check("операция узла видна в журнале сервера", "Шуруповёрт с узла" in comments, comments[:160])
+
+        print("\n== 8. Frontier / инкрементальный обмен ==")
+        node_snapshot = journal_from(node)
+        empty_delta = pull_delta(server, node_snapshot.get("frontier", []))
+        check(
+            "повторный обмен не пересылает известную историю",
+            empty_delta.get("historyMode") == "delta"
+            and empty_delta.get("history") == [],
+            str(empty_delta.get("history"))[:200],
+        )
+        server.call(
+            "items.update",
+            {"id": server_item["id"], "comment": "Новое изменение после frontier"},
+        )
+        one_delta = pull_delta(server, node_snapshot.get("frontier", []))
+        check(
+            "после frontier передаётся только новое событие",
+            one_delta.get("historyMode") == "delta"
+            and len(one_delta.get("history", [])) == 1
+            and one_delta["history"][0].get("prevHash")
+            in {entry.get("head") for entry in node_snapshot.get("frontier", [])},
+            str(one_delta.get("history"))[:260],
+        )
+        for index in range(80):
+            updated = server.call(
+                "items.update",
+                {"id": server_item["id"], "comment": f"Длинная история #{index:03d}"},
+            )
+            if not isinstance(updated, dict) or "id" not in updated:
+                break
+        long_snapshot = journal_from(server)
+        steady_delta = pull_delta(server, long_snapshot.get("frontier", []))
+        full_bytes = len(json.dumps(long_snapshot, separators=(",", ":")).encode())
+        delta_bytes = len(json.dumps(steady_delta, separators=(",", ":")).encode())
+        check(
+            "steady-state delta существенно меньше длинной полной истории",
+            steady_delta.get("history") == [] and delta_bytes < full_bytes * 0.35,
+            f"full={full_bytes} delta={delta_bytes} ratio={delta_bytes / full_bytes:.3f}",
+        )
     finally:
         node.stop()
         server.stop()

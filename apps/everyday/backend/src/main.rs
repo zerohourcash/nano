@@ -12,7 +12,7 @@ use axum::{
     http::{HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode, Uri},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{any, get},
+    routing::{any, get, post},
     Json, Router,
 };
 use parking_lot::Mutex;
@@ -421,6 +421,23 @@ async fn sync_journal_post(
     Json(sync::apply_remote_journal(&db, &body, from)).into_response()
 }
 
+async fn sync_journal_pull(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> impl IntoResponse {
+    if !sync_authorized(&headers) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error":"sync disabled"})),
+        )
+            .into_response();
+    }
+    let requested = body.get("frontier").unwrap_or(&Value::Null);
+    let db = state.db.lock();
+    Json(sync::export_journal_since(&db, Some(requested))).into_response()
+}
+
 /// Локальный узел обменивается изменениями с центральным сервером.
 ///
 /// Работает офлайн-first: если сервер недоступен, узел продолжает работать на
@@ -476,15 +493,32 @@ async fn sync_once(client: &reqwest::Client, state: &Arc<AppState>, upstream: &s
     }
 
     // 1. Забираем изменения сервера.
-    let pulled = client
-        .get(format!("{upstream}/sync/journal"))
+    let local_frontier = {
+        let db = state.db.lock();
+        sync::frontier(&db)
+    };
+    let mut used_frontier_protocol = true;
+    let mut pulled = client
+        .post(format!("{upstream}/sync/journal/pull"))
         .bearer_auth(token)
+        .json(&json!({"frontier": local_frontier}))
         .send()
         .await;
-    match pulled {
+    // Совместимость при поэтапном обновлении: старый peer не знает pull-route.
+    if matches!(&pulled, Ok(response) if response.status() == StatusCode::NOT_FOUND) {
+        used_frontier_protocol = false;
+        pulled = client
+            .get(format!("{upstream}/sync/journal"))
+            .bearer_auth(token)
+            .send()
+            .await;
+    }
+    let remote_frontier = match pulled {
         Ok(resp) if resp.status().is_success() => match resp.bytes().await {
             Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
                 Ok(journal) => {
+                    let remote_frontier =
+                        journal.get("frontier").cloned().unwrap_or(Value::Null);
                     let db = state.db.lock();
                     sync::metric_add(&db, "sync_bytes_received", bytes.len() as u64);
                     let applied = sync::apply_remote_journal(&db, &journal, upstream);
@@ -499,6 +533,7 @@ async fn sync_once(client: &reqwest::Client, state: &Arc<AppState>, upstream: &s
                         );
                         return;
                     }
+                    remote_frontier
                 }
                 Err(e) => {
                     let db = state.db.lock();
@@ -523,12 +558,16 @@ async fn sync_once(client: &reqwest::Client, state: &Arc<AppState>, upstream: &s
             sync::touch_peer_error(&db, upstream, &short_net_error(&e));
             return;
         }
-    }
+    };
 
     // 2. Отдаём свои.
     let mine = {
         let db = state.db.lock();
-        sync::export_journal(&db)
+        if used_frontier_protocol && remote_frontier.is_array() {
+            sync::export_journal_since(&db, Some(&remote_frontier))
+        } else {
+            sync::export_journal(&db)
+        }
     };
     let mine_bytes = match serde_json::to_vec(&mine) {
         Ok(value) => value,
@@ -663,6 +702,7 @@ async fn main() {
             "/sync/journal",
             get(sync_journal_get).post(sync_journal_post),
         )
+        .route("/sync/journal/pull", post(sync_journal_pull))
         .route("/api/trpc/{*procedures}", any(trpc))
         .fallback_service(static_files)
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
