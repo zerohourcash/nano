@@ -339,7 +339,7 @@ pub fn export_journal_since(conn: &Connection, recipient_frontier: Option<&Value
     }
     let mut memberships = Vec::new();
     if let Ok(mut stmt) =
-        conn.prepare("SELECT user_id, workspace_id, rights_json FROM user_workspaces")
+        conn.prepare("SELECT user_id,workspace_id,rights_json,position,role_name,personnel_number FROM user_workspaces")
     {
         for row in stmt
             .query_map([], |r| {
@@ -347,6 +347,9 @@ pub fn export_journal_since(conn: &Connection, recipient_frontier: Option<&Value
                     "userGuid": guid_of(conn, "users", r.get::<_, i64>(0)?),
                     "workspaceGuid": guid_of(conn, "workspaces", r.get::<_, i64>(1)?),
                     "rights": r.get::<_, Option<String>>(2)?,
+                    "position": r.get::<_, Option<String>>(3)?,
+                    "roleName": r.get::<_, Option<String>>(4)?,
+                    "personnelNumber": r.get::<_, Option<String>>(5)?,
                 }))
             })
             .into_iter()
@@ -443,6 +446,7 @@ pub fn export_journal_since(conn: &Connection, recipient_frontier: Option<&Value
         "blobs": crate::content::manifests(conn),
         "contentCatalog": crate::content::catalog(conn),
         "contentProviders": crate::content::provider_manifest(conn),
+        "accounting": crate::accounting::export(conn),
     });
     if let Err(error) = ledger::sign_journal(conn, &mut journal) {
         return json!({"ok": false, "error": format!("Не удалось подписать журнал: {error}")});
@@ -1049,8 +1053,13 @@ pub fn import_journal(conn: &Connection, journal: &Value) -> Value {
                     .map(|v| v.to_string())
                     .unwrap_or_else(|| crate::db::default_rights().to_string());
                 let _ = conn.execute(
-                    "INSERT INTO user_workspaces (user_id, workspace_id, rights_json) VALUES (?1,?2,?3)",
-                    params![user, ws, rights],
+                    "INSERT INTO user_workspaces (user_id,workspace_id,rights_json,position,role_name,personnel_number) VALUES (?1,?2,?3,?4,?5,?6)",
+                    params![user,ws,rights,m.get("position").and_then(Value::as_str),m.get("roleName").and_then(Value::as_str),m.get("personnelNumber").and_then(Value::as_str)],
+                );
+            } else {
+                let _ = conn.execute(
+                    "UPDATE user_workspaces SET position=COALESCE(?1,position),role_name=COALESCE(?2,role_name),personnel_number=COALESCE(?3,personnel_number) WHERE user_id=?4 AND workspace_id=?5",
+                    params![m.get("position").and_then(Value::as_str),m.get("roleName").and_then(Value::as_str),m.get("personnelNumber").and_then(Value::as_str),user,ws],
                 );
             }
         }
@@ -1241,6 +1250,12 @@ pub fn apply_remote_journal(conn: &Connection, journal: &Value, peer_url: &str) 
         return json!({"ok":false,"error":error.to_string()});
     }
     let result = import_journal(conn, journal);
+    if let Some(accounting) = journal.get("accounting") {
+        if let Err(error) = crate::accounting::import(conn, accounting) {
+            let _ = conn.execute_batch("ROLLBACK TO verified_sync; RELEASE verified_sync");
+            return json!({"ok":false,"error":format!("Бухгалтерская летопись отклонена: {error}")});
+        }
+    }
     if let Err(error) = crate::content::observe_journal(conn, journal, peer_url) {
         let _ = conn.execute_batch("ROLLBACK TO verified_sync; RELEASE verified_sync");
         return json!({"ok":false,"error":format!("CAS-каталог отклонён: {error}")});
@@ -1252,6 +1267,10 @@ pub fn apply_remote_journal(conn: &Connection, journal: &Value, peer_url: &str) 
     if let Err(error) = ledger::verify_chat_links(conn) {
         let _ = conn.execute_batch("ROLLBACK TO verified_sync; RELEASE verified_sync");
         return json!({"ok":false,"error":format!("Криптографическая проверка сообщений: {error}")});
+    }
+    if let Err(error) = crate::accounting::verify(conn) {
+        let _ = conn.execute_batch("ROLLBACK TO verified_sync; RELEASE verified_sync");
+        return json!({"ok":false,"error":format!("Проверка бухгалтерской летописи: {error}")});
     }
     if let Err(error) = conn.execute_batch("RELEASE verified_sync") {
         return json!({"ok":false,"error":error.to_string()});
@@ -1406,6 +1425,7 @@ pub fn integrity_audit(conn: &Connection) -> Value {
         .unwrap_or_else(|error| format!("error: {error}"));
     let ledger_result = ledger::verify_all(conn);
     let chat_result = ledger::verify_chat_links(conn);
+    let accounting_result = crate::accounting::verify(conn);
     let snapshot = export_journal(conn);
     let snapshot_result = ledger::verify_journal(&snapshot);
 
@@ -1437,7 +1457,7 @@ pub fn integrity_audit(conn: &Connection) -> Value {
             |row| row.get(0),
         )
         .unwrap_or(-1);
-    let missing_blobs: i64 = conn
+    let missing_referenced_blobs: i64 = conn
         .query_row(
             "SELECT COUNT(DISTINCT p.url) FROM item_photos p
              LEFT JOIN content_blobs b ON p.url='cas:' || b.hash
@@ -1446,6 +1466,7 @@ pub fn integrity_audit(conn: &Connection) -> Value {
             |row| row.get(0),
         )
         .unwrap_or(-1);
+    let missing_blobs = crate::content::wanted_missing(conn, &snapshot).len() as i64;
     let pending_downloads = count("blob_downloads");
     let last_event_at: Option<String> = conn
         .query_row("SELECT MAX(created_at) FROM history_entries", [], |row| {
@@ -1476,10 +1497,12 @@ pub fn integrity_audit(conn: &Connection) -> Value {
 
     let ledger_error = ledger_result.as_ref().err().map(ToString::to_string);
     let chat_error = chat_result.as_ref().err().map(ToString::to_string);
+    let accounting_error = accounting_result.as_ref().err().map(ToString::to_string);
     let snapshot_error = snapshot_result.as_ref().err().map(ToString::to_string);
     let healthy = database_check == "ok"
         && ledger_result.is_ok()
         && chat_result.is_ok()
+        && accounting_result.is_ok()
         && snapshot_result.is_ok()
         && orphan_history == 0
         && missing_guids == 0
@@ -1493,12 +1516,15 @@ pub fn integrity_audit(conn: &Connection) -> Value {
         "chatVerified": chat_result.unwrap_or(0),
         "ledgerError": ledger_error,
         "chatError": chat_error,
+        "accountingError": accounting_error,
+        "accountingVerified": accounting_result.is_ok(),
         "snapshotError": snapshot_error,
         "snapshotHash": snapshot.get("journalHash"),
         "lastEventAt": last_event_at,
         "orphanHistory": orphan_history,
         "missingGuids": missing_guids,
         "missingBlobs": missing_blobs,
+        "missingReferencedBlobs": missing_referenced_blobs,
         "pendingDownloads": pending_downloads,
         "counts": {
             "workspaces": count("workspaces"),
@@ -1508,6 +1534,8 @@ pub fn integrity_audit(conn: &Connection) -> Value {
             "messages": count("chat_messages"),
             "organizationNodes": count("organization_nodes"),
             "blobs": count("content_blobs"),
+            "accountingTransactions": count("accounting_transactions"),
+            "accountingLines": count("accounting_lines"),
         },
         "ledgerHeads": heads,
     })

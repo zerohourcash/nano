@@ -156,6 +156,25 @@ fn migrate(conn: &Connection) -> Result<()> {
            PRIMARY KEY(hash,url)
          );",
     )?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS accounting_accounts(
+           guid TEXT PRIMARY KEY, workspace_id INTEGER NOT NULL, owner_user_id INTEGER,
+           code TEXT NOT NULL, name TEXT NOT NULL, kind TEXT NOT NULL, currency TEXT NOT NULL,
+           created_at TEXT NOT NULL, UNIQUE(workspace_id,owner_user_id,currency)
+         );
+         CREATE TABLE IF NOT EXISTS accounting_transactions(
+           guid TEXT PRIMARY KEY, workspace_id INTEGER NOT NULL, actor_user_id INTEGER NOT NULL,
+           kind TEXT NOT NULL, memo TEXT, reference TEXT, sender_account_guid TEXT,
+           amount INTEGER NOT NULL, tx_hash TEXT NOT NULL UNIQUE, status TEXT NOT NULL,
+           created_at TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS accounting_lines(
+           transaction_guid TEXT NOT NULL, account_guid TEXT NOT NULL,
+           debit INTEGER NOT NULL DEFAULT 0, credit INTEGER NOT NULL DEFAULT 0,
+           PRIMARY KEY(transaction_guid,account_guid),
+           CHECK(debit>=0 AND credit>=0 AND (debit=0 OR credit=0))
+         );",
+    )?;
     // ТЗ §8: группа может требовать фото-подтверждение при списании.
     let _ = conn.execute(
         "ALTER TABLE workspaces ADD COLUMN require_writeoff_photo INTEGER NOT NULL DEFAULT 0",
@@ -163,6 +182,12 @@ fn migrate(conn: &Connection) -> Result<()> {
     );
     let _ = conn.execute(
         "ALTER TABLE user_workspaces ADD COLUMN rights_json TEXT",
+        [],
+    );
+    let _ = conn.execute("ALTER TABLE user_workspaces ADD COLUMN position TEXT", []);
+    let _ = conn.execute("ALTER TABLE user_workspaces ADD COLUMN role_name TEXT", []);
+    let _ = conn.execute(
+        "ALTER TABLE user_workspaces ADD COLUMN personnel_number TEXT",
         [],
     );
     conn.execute(
@@ -410,7 +435,7 @@ pub fn viewer_rights() -> serde_json::Value {
         "manageWorkspaces": false, "manageStorages": false, "manageSites": false, "manageDictionaries": false,
         "reportFaults": false, "requestChanges": false,
         "viewPhotos": true, "viewDocuments": false, "manageDocuments": false,
-        "viewAccounting": false, "manageAccounting": false, "viewLocation": false,
+        "useBit": false, "viewAccounting": false, "manageAccounting": false, "viewLocation": false,
         "checkoutPolicy": default_checkout_policy()
     })
 }
@@ -425,7 +450,7 @@ pub fn admin_rights() -> serde_json::Value {
         "manageWorkspaces": false, "manageStorages": true, "manageSites": true, "manageDictionaries": true,
         "reportFaults": true, "requestChanges": true,
         "viewPhotos": true, "viewDocuments": true, "manageDocuments": true,
-        "viewAccounting": false, "manageAccounting": false, "viewLocation": true,
+        "useBit": true, "viewAccounting": false, "manageAccounting": false, "viewLocation": true,
         "checkoutPolicy": default_checkout_policy()
     })
 }
@@ -476,7 +501,11 @@ fn init_schema(conn: &Connection) -> Result<()> {
         CREATE TABLE IF NOT EXISTS user_workspaces (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           user_id INTEGER NOT NULL,
-          workspace_id INTEGER NOT NULL
+          workspace_id INTEGER NOT NULL,
+          rights_json TEXT,
+          position TEXT,
+          role_name TEXT,
+          personnel_number TEXT
         );
         CREATE TABLE IF NOT EXISTS storages (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -650,7 +679,7 @@ pub fn default_rights() -> serde_json::Value {
         "manageWorkspaces": false, "manageStorages": false, "manageSites": false, "manageDictionaries": false,
         "reportFaults": true, "requestChanges": true,
         "viewPhotos": true, "viewDocuments": true, "manageDocuments": false,
-        "viewAccounting": false, "manageAccounting": false, "viewLocation": true,
+        "useBit": true, "viewAccounting": false, "manageAccounting": false, "viewLocation": true,
         "checkoutPolicy": {
             "allowedCategoryIds": null,
             "maxHours": null,
@@ -668,7 +697,7 @@ pub fn owner_rights() -> serde_json::Value {
         "manageWorkspaces": true, "manageStorages": true, "manageSites": true, "manageDictionaries": true,
         "reportFaults": true, "requestChanges": true,
         "viewPhotos": true, "viewDocuments": true, "manageDocuments": true,
-        "viewAccounting": true, "manageAccounting": true, "viewLocation": true,
+        "useBit": true, "viewAccounting": true, "manageAccounting": true, "viewLocation": true,
         "checkoutPolicy": {
             "allowedCategoryIds": null,
             "maxHours": null,

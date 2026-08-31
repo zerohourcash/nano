@@ -36,6 +36,9 @@ pub fn requires_signature(procedure: &str) -> bool {
             | "inventory.complete"
             | "chat.send"
             | "items.addDocument"
+            | "bit.transfer"
+            | "bit.sale"
+            | "bit.mint"
     )
 }
 

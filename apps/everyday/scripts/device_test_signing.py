@@ -14,7 +14,7 @@ CRITICAL = {
     "transfers.prepare", "transfers.accept", "transfers.reject",
     "history.writeOff", "history.replenish", "history.move",
     "inventory.checkItem", "inventory.complete",
-    "chat.send", "items.addDocument",
+    "chat.send", "items.addDocument", "bit.transfer", "bit.sale", "bit.mint",
 }
 
 

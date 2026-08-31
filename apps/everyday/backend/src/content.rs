@@ -117,9 +117,9 @@ pub fn provider_manifest(conn: &Connection) -> Value {
 
 pub fn observe_journal(conn: &Connection, journal: &Value, peer_url: &str) -> anyhow::Result<()> {
     let peer_url = peer_url.trim().trim_end_matches('/');
-    if crate::validate_peer_url(peer_url).is_err() {
-        bail!("недопустимый URL CAS-провайдера")
-    }
+    let usable_peer = crate::validate_peer_url(peer_url)
+        .is_ok()
+        .then_some(peer_url);
     let catalog_value = journal
         .get("contentCatalog")
         .or_else(|| journal.get("blobs"));
@@ -150,7 +150,9 @@ pub fn observe_journal(conn: &Connection, journal: &Value, peer_url: &str) -> an
         .flatten()
         .filter_map(|entry| entry.get("hash").and_then(Value::as_str))
     {
-        remember_provider(conn, hash, peer_url)?;
+        if let Some(peer_url) = usable_peer {
+            remember_provider(conn, hash, peer_url)?;
+        }
     }
     let provider_value = journal.get("contentProviders");
     if provider_value

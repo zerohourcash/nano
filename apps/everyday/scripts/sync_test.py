@@ -384,6 +384,12 @@ def main() -> int:
             },
         )
         check("предмет создан на узле", isinstance(created, dict) and "id" in created, str(created)[:140])
+        node_me = node.call("meta.currentUser", None, mutation=False)
+        minted = node.call(
+            "bit.mint",
+            {"workspaceId": node_ws_id, "recipientUserId": node_me["id"], "amount": 100, "memo": "Офлайн-эмиссия"},
+        )
+        check("офлайн-эмиссия Bit записана двойной проводкой", minted.get("status") == "posted", str(minted))
         node.call("sync.pullNow", {})
         back = wait_for(lambda: "Шуруповёрт с узла" in titles(server, ws_id))
         check("предмет с узла доехал до сервера", back, str(titles(server, ws_id))[:160])
@@ -395,6 +401,10 @@ def main() -> int:
             and back_card.get("metadata", {}).get("isKit") is True,
             str(back_card)[:180],
         )
+        bit_synced = wait_for(
+            lambda: server.call("bit.balance", {"workspaceId": ws_id, "userId": owner["id"]}, mutation=False).get("balance") == 100
+        )
+        check("подписанная бухгалтерская проводка Bit дошла до сервера", bit_synced)
 
         print("\n== 6. Статус синхронизации ==")
         status = node.call("sync.status", None, mutation=False)

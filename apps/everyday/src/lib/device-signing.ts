@@ -85,6 +85,9 @@ const CRITICAL = [
   'inventory.complete',
   'chat.send',
   'items.addDocument',
+  'bit.transfer',
+  'bit.sale',
+  'bit.mint',
 ]
 
 export function requiresDeviceSignature(url: string): boolean {

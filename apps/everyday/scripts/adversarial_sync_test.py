@@ -232,6 +232,50 @@ def main() -> int:
             and any(row.get("type") == "conflict_detected" for row in converged_history),
             str(converged_tool)[:240],
         )
+
+        # Двойная трата Bit одним владельцем с двух офлайн-устройств.
+        minted = source.call(
+            "bit.mint",
+            {"workspaceId": ws, "recipientUserId": owner["id"], "amount": 100, "memo": "Тестовый фонд"},
+        )
+        submit(target, journal(source))
+        new_session(target, "conflict-owner-bit-device")
+        target_owner = target.call(
+            "auth.login", {"phone": OWNER_PHONE, "password": OWNER_PASSWORD}
+        )
+        target_people = target.call(
+            "admin.users.list", {"workspaceId": target_ws}, mutation=False
+        )
+        target_member = next(row for row in target_people if row.get("fullName") == "Второй кладовщик")
+        check("100 Bit доступны владельцу на двух изолированных нодах", minted.get("status") == "posted" and target_owner.get("id"))
+        left_bit = source.call(
+            "bit.transfer",
+            {"workspaceId": ws, "recipientUserId": member["id"], "amount": 80, "memo": "Левая офлайн-ветвь"},
+        )
+        right_bit = target.call(
+            "bit.transfer",
+            {"workspaceId": target_ws, "recipientUserId": target_member["id"], "amount": 80, "memo": "Правая офлайн-ветвь"},
+        )
+        check("две конкурирующие траты локально приняты", left_bit.get("status") == "posted" and right_bit.get("status") == "posted")
+        submit(source, journal(target))
+        submit(target, journal(source))
+        submit(source, journal(target))
+        source_txs = source.call("bit.transactions", {"workspaceId": ws}, mutation=False)
+        target_txs = target.call("bit.transactions", {"workspaceId": target_ws}, mutation=False)
+        source_owner_balance = source.call("bit.balance", {"workspaceId": ws}, mutation=False)["balance"]
+        source_member_balance = source.call("bit.balance", {"workspaceId": ws, "userId": member["id"]}, mutation=False)["balance"]
+        target_owner_balance = target.call("bit.balance", {"workspaceId": target_ws}, mutation=False)["balance"]
+        target_member_balance = target.call("bit.balance", {"workspaceId": target_ws, "userId": target_member["id"]}, mutation=False)["balance"]
+        statuses_source = sorted(row["status"] for row in source_txs if row["kind"] == "transfer")
+        statuses_target = sorted(row["status"] for row in target_txs if row["kind"] == "transfer")
+        check(
+            "двойная трата Bit детерминированно разрешена на обеих нодах",
+            statuses_source == ["conflict", "posted"]
+            and statuses_target == statuses_source
+            and (source_owner_balance, source_member_balance) == (20, 80)
+            and (target_owner_balance, target_member_balance) == (20, 80),
+            f"source={statuses_source}/{source_owner_balance}/{source_member_balance} target={statuses_target}/{target_owner_balance}/{target_member_balance}",
+        )
     finally:
         source.stop()
         target.stop()

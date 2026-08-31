@@ -92,6 +92,8 @@ pub fn is_mutation(procedure: &str) -> bool {
             | "sync.audit"
             | "sync.peers"
             | "sync.conflicts"
+            | "bit.balance"
+            | "bit.transactions"
             | "transfers.outgoing"
             | "transfers.incoming"
             | "transfers.byId"
@@ -483,6 +485,12 @@ fn required_right(procedure: &str) -> Option<&'static str> {
         Some("requestChanges")
     } else if procedure.starts_with("items.") {
         Some("viewItems")
+    } else if procedure == "bit.mint" {
+        Some("manageAccounting")
+    } else if matches!(procedure, "bit.transfer" | "bit.sale" | "bit.balance") {
+        Some("useBit")
+    } else if procedure == "bit.transactions" {
+        Some("viewAccounting")
     } else if matches!(
         procedure,
         "transfers.accept" | "transfers.reject" | "transfers.acceptAll"
@@ -648,8 +656,32 @@ pub fn dispatch(
                 .get("viewLocation")
                 .and_then(Value::as_bool)
                 .unwrap_or(true);
-            if hide_photos || hide_location {
-                redact_item_fields(&mut value, hide_photos, hide_location);
+            let hide_documents = !rights
+                .get("viewDocuments")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let hide_accounting_documents = !rights
+                .get("viewAccounting")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let hide_manager_documents = !rights
+                .get("manageDocuments")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            if hide_photos
+                || hide_location
+                || hide_documents
+                || hide_accounting_documents
+                || hide_manager_documents
+            {
+                redact_item_fields(
+                    &mut value,
+                    hide_photos,
+                    hide_location,
+                    hide_documents,
+                    hide_accounting_documents,
+                    hide_manager_documents,
+                );
             }
         }
     }
@@ -657,11 +689,25 @@ pub fn dispatch(
 }
 
 /// Рекурсивно вычищает из ответа поля карточки, закрытые правами.
-fn redact_item_fields(value: &mut Value, hide_photos: bool, hide_location: bool) {
+fn redact_item_fields(
+    value: &mut Value,
+    hide_photos: bool,
+    hide_location: bool,
+    hide_documents: bool,
+    hide_accounting_documents: bool,
+    hide_manager_documents: bool,
+) {
     match value {
         Value::Array(items) => {
             for item in items {
-                redact_item_fields(item, hide_photos, hide_location);
+                redact_item_fields(
+                    item,
+                    hide_photos,
+                    hide_location,
+                    hide_documents,
+                    hide_accounting_documents,
+                    hide_manager_documents,
+                );
             }
         }
         Value::Object(map) => {
@@ -684,9 +730,33 @@ fn redact_item_fields(value: &mut Value, hide_photos: bool, hide_location: bool)
                         map.remove(key);
                     }
                 }
+                if hide_documents {
+                    map.remove("documents");
+                } else if let Some(documents) =
+                    map.get_mut("documents").and_then(Value::as_array_mut)
+                {
+                    documents.retain(|document| {
+                        match document
+                            .get("accessLevel")
+                            .and_then(Value::as_str)
+                            .unwrap_or("members")
+                        {
+                            "accounting" => !hide_accounting_documents,
+                            "managers" => !hide_manager_documents,
+                            _ => true,
+                        }
+                    });
+                }
             }
             for (_, nested) in map.iter_mut() {
-                redact_item_fields(nested, hide_photos, hide_location);
+                redact_item_fields(
+                    nested,
+                    hide_photos,
+                    hide_location,
+                    hide_documents,
+                    hide_accounting_documents,
+                    hide_manager_documents,
+                );
             }
         }
         _ => {}
@@ -778,6 +848,11 @@ fn dispatch_inner(
             crate::content::unpin(conn, &hash).map_err(|error| ApiError::bad(error.to_string()))?;
             Ok(crate::content::status(conn))
         }
+        "bit.balance" => bit_balance(conn, input, user_id),
+        "bit.transactions" => bit_transactions(conn, input),
+        "bit.transfer" => bit_transfer(conn, input, user_id),
+        "bit.sale" => bit_sale(conn, input, user_id),
+        "bit.mint" => bit_mint(conn, input, user_id),
         "sync.addPeer" => {
             let url = s(input, "url").ok_or_else(|| ApiError::bad("Укажите адрес узла"))?;
             crate::validate_peer_url(&url).map_err(ApiError::bad)?;
@@ -3120,6 +3195,151 @@ fn profile_get(conn: &Connection, user_id: Option<i64>) -> ApiResult {
     );
     Ok(u)
 }
+
+fn bit_balance(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
+    let uid = require_user(conn, user_id)?;
+    let ws = i64v(input, "workspaceId").unwrap_or_else(|| ws_fallback(conn));
+    let target = i64v(input, "userId").unwrap_or(uid);
+    if target != uid {
+        require_can_in_workspace(conn, uid, ws, "viewAccounting")?;
+    }
+    let balance = crate::accounting::balance(conn, ws, target)
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    Ok(json!({"workspaceId":ws,"userId":target,"currency":"BIT","minorUnit":1,"balance":balance}))
+}
+
+fn bit_transactions(conn: &Connection, input: &Value) -> ApiResult {
+    let ws = i64v(input, "workspaceId").unwrap_or_else(|| ws_fallback(conn));
+    Ok(crate::accounting::list(conn, ws))
+}
+
+fn bit_transfer(conn: &mut Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
+    atomic(conn, |conn| {
+        let uid = require_user(conn, user_id)?;
+        let ws = i64v(input, "workspaceId").unwrap_or_else(|| ws_fallback(conn));
+        let recipient =
+            i64v(input, "recipientUserId").ok_or_else(|| ApiError::bad("recipientUserId"))?;
+        let amount = i64v(input, "amount")
+            .ok_or_else(|| ApiError::bad("amount должен быть целым числом Bit"))?;
+        let posted = crate::accounting::post(
+            conn,
+            ws,
+            uid,
+            "transfer",
+            Some(uid),
+            recipient,
+            amount,
+            s(input, "memo").as_deref(),
+            s(input, "reference").as_deref(),
+        )
+        .map_err(|e| ApiError::bad(e.to_string()))?;
+        if posted["status"] != "posted" {
+            return Err(ApiError::conflict(
+                "Недостаточно подтверждённых Bit; перевод сохранён не будет",
+            ));
+        }
+        ledger::append(
+            conn,
+            ws,
+            uid,
+            None,
+            "bit_transfer",
+            posted["senderAccountGuid"].as_str(),
+            posted["txHash"].as_str(),
+            Some(amount as f64),
+            s(input, "memo").as_deref(),
+        )
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+        Ok(posted)
+    })
+}
+
+fn bit_mint(conn: &mut Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
+    atomic(conn, |conn| {
+        let uid = require_user(conn, user_id)?;
+        let ws = i64v(input, "workspaceId").unwrap_or_else(|| ws_fallback(conn));
+        require_can_in_workspace(conn, uid, ws, "manageAccounting")?;
+        let recipient =
+            i64v(input, "recipientUserId").ok_or_else(|| ApiError::bad("recipientUserId"))?;
+        let amount = i64v(input, "amount")
+            .ok_or_else(|| ApiError::bad("amount должен быть целым числом Bit"))?;
+        let posted = crate::accounting::post(
+            conn,
+            ws,
+            uid,
+            "mint",
+            None,
+            recipient,
+            amount,
+            s(input, "memo").as_deref(),
+            s(input, "reference").as_deref(),
+        )
+        .map_err(|e| ApiError::bad(e.to_string()))?;
+        ledger::append(
+            conn,
+            ws,
+            uid,
+            None,
+            "bit_mint",
+            Some("BIT-ISSUANCE"),
+            posted["txHash"].as_str(),
+            Some(amount as f64),
+            s(input, "memo").as_deref(),
+        )
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+        Ok(posted)
+    })
+}
+
+fn bit_sale(conn: &mut Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
+    atomic(conn, |conn| {
+        let buyer = require_user(conn, user_id)?;
+        let item_id = i64v(input, "itemId").ok_or_else(|| ApiError::bad("itemId"))?;
+        require_item_access(conn, buyer, item_id)?;
+        db::fill_guids(conn).map_err(|e| ApiError::internal(e.to_string()))?;
+        let item = jsn::item_json(conn, item_id, false)
+            .ok_or_else(|| ApiError::not_found("Товар не найден"))?;
+        let ws = item["workspaceId"]
+            .as_i64()
+            .ok_or_else(|| ApiError::bad("У товара нет организации"))?;
+        let seller = i64v(input, "sellerUserId").ok_or_else(|| ApiError::bad("sellerUserId"))?;
+        let amount = i64v(input, "amount")
+            .ok_or_else(|| ApiError::bad("amount должен быть целым числом Bit"))?;
+        let item_guid = item["guid"]
+            .as_str()
+            .ok_or_else(|| ApiError::bad("У товара нет GUID"))?;
+        let posted = crate::accounting::post(
+            conn,
+            ws,
+            buyer,
+            "sale",
+            Some(buyer),
+            seller,
+            amount,
+            s(input, "memo").as_deref(),
+            Some(item_guid),
+        )
+        .map_err(|e| ApiError::bad(e.to_string()))?;
+        if posted["status"] != "posted" {
+            return Err(ApiError::conflict(
+                "Недостаточно подтверждённых Bit для покупки",
+            ));
+        }
+        ledger::append(
+            conn,
+            ws,
+            buyer,
+            Some(item_id),
+            "bit_sale",
+            Some(item_guid),
+            posted["txHash"].as_str(),
+            Some(amount as f64),
+            s(input, "memo").as_deref(),
+        )
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+        Ok(posted)
+    })
+}
 fn profile_update(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
     let uid = require_user(conn, user_id)?;
     if let Some(phone) = s(input, "phone") {
@@ -3163,16 +3383,32 @@ fn profile_password(conn: &Connection, input: &Value, user_id: Option<i64>) -> A
 
 fn admin_users(conn: &Connection, input: &Value) -> ApiResult {
     let ws = i64v(input, "workspaceId").unwrap_or_else(|| ws_fallback(conn));
-    let mut stmt = conn.prepare("SELECT user_id FROM user_workspaces WHERE workspace_id=?1")?;
-    let ids: Vec<i64> = stmt
-        .query_map(params![ws], |r| r.get(0))?
-        .filter_map(|x| x.ok())
-        .collect();
-    Ok(Value::Array(
-        ids.into_iter()
-            .filter_map(|id| jsn::user_public(conn, id))
-            .collect(),
-    ))
+    let mut stmt = conn.prepare("SELECT user_id,position,role_name,personnel_number,rights_json FROM user_workspaces WHERE workspace_id=?1")?;
+    let rows = stmt.query_map(params![ws], |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, Option<String>>(1)?,
+            r.get::<_, Option<String>>(2)?,
+            r.get::<_, Option<String>>(3)?,
+            r.get::<_, Option<String>>(4)?,
+        ))
+    })?;
+    let mut out = Vec::new();
+    for (id, position, role_name, personnel_number, rights) in rows.flatten() {
+        if let Some(mut user) = jsn::user_public(conn, id) {
+            user["globalPosition"] = user.get("position").cloned().unwrap_or(Value::Null);
+            if position.is_some() {
+                user["position"] = json!(position);
+            }
+            user["organizationRole"] = json!(role_name);
+            user["personnelNumber"] = json!(personnel_number);
+            if let Some(rights) = rights.and_then(|value| serde_json::from_str(&value).ok()) {
+                user["roleRights"] = rights;
+            }
+            out.push(user);
+        }
+    }
+    Ok(Value::Array(out))
 }
 fn admin_user_create(conn: &Connection, input: &Value) -> ApiResult {
     let name = s(input, "fullName").ok_or_else(|| ApiError::bad("fullName"))?;
@@ -3184,8 +3420,8 @@ fn admin_user_create(conn: &Connection, input: &Value) -> ApiResult {
     let uid = conn.last_insert_rowid();
     let ws = i64v(input, "workspaceId").unwrap_or_else(|| ws_fallback(conn));
     conn.execute(
-        "INSERT INTO user_workspaces (user_id, workspace_id, rights_json) VALUES (?1,?2,?3)",
-        params![uid, ws, db::default_rights().to_string()],
+        "INSERT INTO user_workspaces(user_id,workspace_id,rights_json,position,role_name,personnel_number) VALUES (?1,?2,?3,?4,?5,?6)",
+        params![uid,ws,db::default_rights().to_string(),s(input,"position"),s(input,"organizationRole"),s(input,"personnelNumber")],
     )?;
     jsn::user_public(conn, uid).ok_or_else(|| ApiError::bad("ошибка"))
 }
@@ -3205,6 +3441,11 @@ fn admin_user_update(conn: &Connection, input: &Value, actor: Option<i64>) -> Ap
             )?;
         }
     }
+    let ws = i64v(input, "workspaceId").unwrap_or_else(|| ws_fallback(conn));
+    conn.execute(
+        "UPDATE user_workspaces SET position=COALESCE(?1,position),role_name=COALESCE(?2,role_name),personnel_number=COALESCE(?3,personnel_number) WHERE user_id=?4 AND workspace_id=?5",
+        params![s(input,"position"),s(input,"organizationRole"),s(input,"personnelNumber"),id,ws],
+    )?;
     if let Some(cp) = input.get("checkoutPolicy") {
         if !cp.is_null() {
             conn.execute(
@@ -5333,6 +5574,151 @@ mod tests {
         )
         .unwrap();
         assert!(list[0].get("storage").is_none(), "{list}");
+        cleanup(conn, path);
+    }
+
+    #[test]
+    fn document_acl_filters_member_accounting_and_manager_files() {
+        let (mut conn, path, users, ws) = test_db();
+        let item = insert_item(&conn, ws, None, false, None);
+        for (name, access) in [
+            ("Общая инструкция", "members"),
+            ("Счёт", "accounting"),
+            ("Акт руководителя", "managers"),
+        ] {
+            conn.execute("INSERT INTO item_documents(item_id,name,url,guid,access_level) VALUES(?1,?2,?3,?4,?5)",
+                params![item,name,format!("https://example.invalid/{access}"),Uuid::new_v4().to_string(),access]).unwrap();
+        }
+        let owner = dispatch(&mut conn, "items.byId", &json!({"id":item}), Some(users[0])).unwrap();
+        assert_eq!(owner["documents"].as_array().unwrap().len(), 3);
+
+        let member = json!({"viewItems":true,"viewDocuments":true,"viewAccounting":false,"manageDocuments":false});
+        conn.execute(
+            "UPDATE user_workspaces SET rights_json=?1 WHERE user_id=?2 AND workspace_id=?3",
+            params![member.to_string(), users[1], ws],
+        )
+        .unwrap();
+        let visible =
+            dispatch(&mut conn, "items.byId", &json!({"id":item}), Some(users[1])).unwrap();
+        let docs = visible["documents"].as_array().unwrap();
+        assert_eq!(docs.len(), 1, "{visible}");
+        assert_eq!(docs[0]["accessLevel"], "members");
+
+        let denied = json!({"viewItems":true,"viewDocuments":false});
+        conn.execute(
+            "UPDATE user_workspaces SET rights_json=?1 WHERE user_id=?2 AND workspace_id=?3",
+            params![denied.to_string(), users[1], ws],
+        )
+        .unwrap();
+        let hidden =
+            dispatch(&mut conn, "items.byId", &json!({"id":item}), Some(users[1])).unwrap();
+        assert!(hidden.get("documents").is_none(), "{hidden}");
+        cleanup(conn, path);
+    }
+
+    #[test]
+    fn one_person_has_distinct_positions_in_multiple_organizations() {
+        let (conn, path, users, first_ws) = test_db();
+        conn.execute("INSERT INTO workspaces(name,internal_id_prefix,created_at) VALUES('Вторая организация','B-',?1)",[now()]).unwrap();
+        let second_ws = conn.last_insert_rowid();
+        conn.execute("UPDATE user_workspaces SET position='Кладовщик',role_name='Материально ответственное лицо',personnel_number='A-17' WHERE user_id=?1 AND workspace_id=?2",params![users[1],first_ws]).unwrap();
+        conn.execute("INSERT INTO user_workspaces(user_id,workspace_id,rights_json,position,role_name,personnel_number) VALUES(?1,?2,?3,'Аудитор','Наблюдатель','B-04')",params![users[1],second_ws,db::default_rights().to_string()]).unwrap();
+        let first = admin_users(&conn, &json!({"workspaceId":first_ws})).unwrap();
+        let second = admin_users(&conn, &json!({"workspaceId":second_ws})).unwrap();
+        let a = first
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|u| u["id"] == users[1])
+            .unwrap();
+        let b = second
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|u| u["id"] == users[1])
+            .unwrap();
+        assert_eq!(a["position"], "Кладовщик");
+        assert_eq!(a["personnelNumber"], "A-17");
+        assert_eq!(b["position"], "Аудитор");
+        assert_eq!(b["organizationRole"], "Наблюдатель");
+        cleanup(conn, path);
+    }
+
+    #[test]
+    fn bit_transfer_is_atomic_balanced_and_permission_checked() {
+        let (mut conn, path, users, ws) = test_db();
+        let minted=dispatch(&mut conn,"bit.mint",&json!({"workspaceId":ws,"recipientUserId":users[0],"amount":100,"memo":"Начальная эмиссия"}),Some(users[0])).unwrap();
+        assert_eq!(minted["status"], "posted");
+        let sent = dispatch(
+            &mut conn,
+            "bit.transfer",
+            &json!({"workspaceId":ws,"recipientUserId":users[1],"amount":40,"memo":"Работа"}),
+            Some(users[0]),
+        )
+        .unwrap();
+        assert_eq!(sent["status"], "posted");
+        assert_eq!(
+            bit_balance(&conn, &json!({"workspaceId":ws}), Some(users[0])).unwrap()["balance"],
+            60
+        );
+        assert_eq!(
+            bit_balance(&conn, &json!({"workspaceId":ws}), Some(users[1])).unwrap()["balance"],
+            40
+        );
+        let item = insert_item(&conn, ws, None, false, None);
+        let sale = dispatch(
+            &mut conn,
+            "bit.sale",
+            &json!({"itemId":item,"sellerUserId":users[1],"amount":10,"memo":"Покупка расходника"}),
+            Some(users[0]),
+        )
+        .unwrap();
+        assert_eq!(sale["kind"], "sale");
+        assert_eq!(
+            bit_balance(&conn, &json!({"workspaceId":ws}), Some(users[0])).unwrap()["balance"],
+            50
+        );
+        assert_eq!(
+            bit_balance(&conn, &json!({"workspaceId":ws}), Some(users[1])).unwrap()["balance"],
+            50
+        );
+        let before: i64 = conn
+            .query_row("SELECT count(*) FROM accounting_transactions", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let rejected = dispatch(
+            &mut conn,
+            "bit.transfer",
+            &json!({"workspaceId":ws,"recipientUserId":users[1],"amount":1000}),
+            Some(users[0]),
+        )
+        .unwrap_err();
+        assert_eq!(rejected.http, 409);
+        let after: i64 = conn
+            .query_row("SELECT count(*) FROM accounting_transactions", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            before, after,
+            "отклонённый перевод не должен оставлять полупроводку"
+        );
+        crate::accounting::verify(&conn).unwrap();
+
+        conn.execute(
+            "UPDATE user_workspaces SET rights_json=?1 WHERE user_id=?2 AND workspace_id=?3",
+            params![db::viewer_rights().to_string(), users[1], ws],
+        )
+        .unwrap();
+        let denied = dispatch(
+            &mut conn,
+            "bit.transfer",
+            &json!({"workspaceId":ws,"recipientUserId":users[0],"amount":1}),
+            Some(users[1]),
+        )
+        .unwrap_err();
+        assert_eq!(denied.http, 403);
         cleanup(conn, path);
     }
 

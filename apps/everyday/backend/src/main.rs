@@ -1,3 +1,4 @@
+mod accounting;
 mod api;
 mod auth;
 mod content;
@@ -740,13 +741,27 @@ async fn sync_once(client: &reqwest::Client, state: &Arc<AppState>, upstream: &s
         .await
     {
         Ok(resp) if resp.status().is_success() => {
-            let db = state.db.lock();
-            sync::metric_add(&db, "sync_bytes_sent", mine_bytes.len() as u64);
-            sync::metric_add(&db, "sync_successes", 1);
-            let _ = db.execute(
-                "UPDATE peers SET last_sync=?1, last_error=NULL WHERE url=?2",
-                rusqlite::params![chrono::Utc::now().to_rfc3339(), upstream],
+            let answer = resp.json::<Value>().await.unwrap_or_else(
+                |error| json!({"ok":false,"error":format!("некорректный ответ peer: {error}")}),
             );
+            let db = state.db.lock();
+            if answer.get("ok").and_then(Value::as_bool) == Some(false) {
+                sync::touch_peer_error(
+                    &db,
+                    upstream,
+                    answer
+                        .get("error")
+                        .and_then(Value::as_str)
+                        .unwrap_or("peer отклонил журнал"),
+                );
+            } else {
+                sync::metric_add(&db, "sync_bytes_sent", mine_bytes.len() as u64);
+                sync::metric_add(&db, "sync_successes", 1);
+                let _ = db.execute(
+                    "UPDATE peers SET last_sync=?1, last_error=NULL WHERE url=?2",
+                    rusqlite::params![chrono::Utc::now().to_rfc3339(), upstream],
+                );
+            }
         }
         Ok(resp) => {
             let status = resp.status();
