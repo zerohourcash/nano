@@ -27,7 +27,8 @@
     "import:facekit": "node scripts/import-facekit-snapshot.mjs",
     "pwa:icons": "python3 scripts/generate-pwa-icons.py",
     "pwa:check": "node scripts/check-pwa.mjs",
-    "verify": "npm run check && npm run lint && npm test && cargo test --manifest-path backend/Cargo.toml"
+    "docs:check": "python3 scripts/check_docs.py",
+    "verify": "npm run check && npm run lint && npm test && npm run docs:check && cargo test --manifest-path backend/Cargo.toml"
   },
   "dependencies": {
     "@gsap/react": "^2.1.2",
