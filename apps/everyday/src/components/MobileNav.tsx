@@ -14,6 +14,7 @@ import {
   BarChart3,
   Settings2,
   MessageCircle,
+  BookOpen,
   UserRound,
   X,
 } from 'lucide-react'
@@ -26,6 +27,7 @@ const moreItems = [
   { to: '/notifications', label: 'Сроки и уведомления', icon: Bell },
   { to: '/history', label: 'История', icon: History },
   { to: '/chat', label: 'Чат группы', icon: MessageCircle },
+  { to: '/knowledge', label: 'База знаний', icon: BookOpen },
   { to: '/inventory', label: 'Инвентаризация', icon: ClipboardCheck },
   { to: '/reports', label: 'Отчёты', icon: BarChart3 },
   { to: '/admin', label: 'Панель управления', icon: Settings2 },

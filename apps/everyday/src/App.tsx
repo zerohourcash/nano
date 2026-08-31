@@ -3,6 +3,7 @@ import { lazy, Suspense } from 'react'
 import { StoreProvider } from '@/lib/store'
 import Layout from '@/components/Layout'
 import PwaStatus from '@/components/PwaStatus'
+import { Toaster } from 'sonner'
 
 const Catalog = lazy(() => import('@/pages/Catalog'))
 const MyTools = lazy(() => import('@/pages/MyTools'))
@@ -20,6 +21,7 @@ const Scan = lazy(() => import('@/pages/Scan'))
 const Join = lazy(() => import('@/pages/Join'))
 const Chat = lazy(() => import('@/pages/Chat'))
 const Invite = lazy(() => import('@/pages/Invite'))
+const Knowledge = lazy(() => import('@/pages/Knowledge'))
 
 function PageFallback() {
   return (
@@ -33,6 +35,7 @@ export default function App() {
   return (
     <StoreProvider>
       <PwaStatus />
+      <Toaster position="bottom-center" richColors />
       <Suspense fallback={<PageFallback />}>
         <Routes>
           <Route path="/login" element={<Auth />} />
@@ -48,6 +51,7 @@ export default function App() {
             <Route path="inventory" element={<Inventory />} />
             <Route path="notifications" element={<Notifications />} />
             <Route path="chat" element={<Chat />} />
+            <Route path="knowledge" element={<Knowledge />} />
             <Route path="invite" element={<Invite />} />
             <Route path="reports" element={<Reports />} />
             <Route path="admin" element={<Admin />} />

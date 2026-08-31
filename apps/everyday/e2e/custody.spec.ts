@@ -69,6 +69,26 @@ test('browser signs a real custody transaction and ledger retains its proof', as
   expect(event?.requestNonce).toBeTruthy()
   expect(event?.requestHash).toMatch(/^[a-f0-9]{64}$/)
 
+  await page.goto('/knowledge')
+  await expect(page.getByRole('heading', { name: 'База знаний' })).toBeVisible()
+  await page.getByRole('button', { name: 'Новая страница' }).click()
+  await page.getByLabel('Название').fill('Безопасность E2E')
+  await expect(page.getByLabel('Адрес страницы')).toHaveValue('безопасность-e2e')
+  await page.getByLabel('Текст').fill('# Проверка\n\nРаботает локально и подписывается устройством.')
+  await page.locator('input[type="file"]').setInputFiles({
+    name: 'checklist.txt',
+    mimeType: 'text/plain',
+    buffer: Buffer.from('offline checklist'),
+  })
+  await page.getByRole('button', { name: 'Подписать ревизию' }).click()
+  await expect(page.getByTestId('knowledge-viewer')).toContainText('Работает локально')
+  await expect(page.getByRole('link', { name: /checklist.txt/ })).toBeVisible()
+  const knowledge = await trpc<{
+    current: { revisionHash: string; attachments: Array<{ url: string }> }
+  }>(page, 'knowledge.bySlug', { workspaceId: workspaces[0].id, slug: 'безопасность-e2e' }, false)
+  expect(knowledge.current.revisionHash).toMatch(/^[a-f0-9]{64}$/)
+  expect(knowledge.current.attachments[0]?.url).toMatch(/^data:text\/plain;base64,/)
+
   await page.goto('/admin')
   await page.getByRole('button', { name: 'Офлайн-узлы' }).first().click()
   await expect(page.getByRole('heading', { name: 'Целостность локальной копии' })).toBeVisible()
@@ -76,6 +96,8 @@ test('browser signs a real custody transaction and ledger retains its proof', as
     page.getByText('Локальная история и текущее состояние криптографически согласованы'),
   ).toBeVisible({ timeout: 10_000 })
   await expect(page.getByText(/Проверено подписей:/)).toBeVisible()
+  await expect(page.getByText('Страниц знаний:')).toContainText('1')
+  await expect(page.getByText('Ревизий знаний:')).toContainText('1')
   await expect(page.getByText(/Snapshot:/)).toContainText(/[a-f0-9]{64}/)
   await expect(page.getByRole('heading', { name: 'Ключи mesh-нод' })).toBeVisible()
   await expect(page.getByRole('heading', { name: 'Этот узел' })).toBeVisible()
