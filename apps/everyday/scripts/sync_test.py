@@ -72,7 +72,7 @@ class Node:
         )
         self.signer = DeviceSigner(name)
         self.device_registered = False
-        env = {
+        self.env = {
             **os.environ,
             "MESHKEEPER_DB": str(self.db),
             "MESHKEEPER_BIND": f"127.0.0.1:{port}",
@@ -80,13 +80,18 @@ class Node:
             "MESHKEEPER_DEMO_LOGIN": "0",
             **env_extra,
         }
-        self.proc = subprocess.Popen(
-            [str(binary())],
-            cwd=str(ROOT),
-            env=env,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+        self.proc = self._spawn()
+
+    def _spawn(self):
+        return subprocess.Popen(
+            [str(binary())], cwd=str(ROOT), env=self.env,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
+
+    def restart(self) -> None:
+        if self.proc.poll() is None:
+            raise RuntimeError(f"{self.name} ещё работает")
+        self.proc = self._spawn()
 
     def wait_ready(self, timeout: float = 25.0) -> bool:
         deadline = time.time() + timeout
@@ -136,14 +141,16 @@ class Node:
             return {"__err": data["error"]["json"].get("message")}
         return data["result"]["data"]["json"]
 
-    def stop(self) -> None:
-        self.proc.terminate()
-        try:
-            self.proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            self.proc.kill()
-        for suffix in ("", "-wal", "-shm"):
-            Path(str(self.db) + suffix).unlink(missing_ok=True)
+    def stop(self, cleanup: bool = True) -> None:
+        if self.proc.poll() is None:
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+        if cleanup:
+            for suffix in ("", "-wal", "-shm"):
+                Path(str(self.db) + suffix).unlink(missing_ok=True)
 
 
 def binary() -> Path:

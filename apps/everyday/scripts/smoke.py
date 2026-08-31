@@ -257,9 +257,27 @@ rep = owner.call("reports.allItems", {"workspaceId": ws_id}, mutation=False)
 check("reports.allItems works", isinstance(rep, list), str(rep)[:120])
 
 print("\n== 15. Чат ==")
-owner.call("chat.send", {"workspaceId": ws_id, "text": "Привет, команда"})
+unsigned_chat = owner.call(
+    "chat.send",
+    {"workspaceId": ws_id, "text": "Неподписанное сообщение"},
+    signed=False,
+)
+check(
+    "unsigned chat rejected",
+    unsigned_chat.get("__http") == 403
+    and "DEVICE_SIGNATURE_REQUIRED" in unsigned_chat.get("__body", ""),
+    str(unsigned_chat)[:160],
+)
+sent_chat = owner.call("chat.send", {"workspaceId": ws_id, "text": "Привет, команда"})
 cl = owner.call("chat.list", {"workspaceId": ws_id}, mutation=False)
-check("chat works", isinstance(cl, list) and len(cl) >= 1, str(cl)[:150])
+check(
+    "signed chat works",
+    isinstance(cl, list)
+    and len(cl) >= 1
+    and sent_chat.get("ledgerVerified") is True
+    and cl[-1].get("ledgerHash") == sent_chat.get("ledgerHash"),
+    str(cl)[:180],
+)
 
 print("\n== 18. SPA-маршруты и bootstrap ==")
 def status(path):

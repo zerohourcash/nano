@@ -99,6 +99,10 @@ export default function OfflineNodesSection() {
           <div>Имя: <b>{st?.name || '…'}</b></div>
           <div className="font-mono-num break-all">ID: {st?.nodeId || '…'}</div>
           <div className="sm:col-span-2 font-mono-num break-all">URL: {st?.url}</div>
+          <div>Успешных обменов: <b>{st?.syncSuccesses ?? 0}</b></div>
+          <div>
+            Трафик: <b>{Math.round(((st?.bytesSent ?? 0) + (st?.bytesReceived ?? 0)) / 1024)} КБ</b>
+          </div>
         </div>
 
         {st?.upstream && (

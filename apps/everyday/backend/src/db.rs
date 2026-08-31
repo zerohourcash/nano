@@ -21,6 +21,7 @@ pub fn open(path: &Path) -> Result<Connection> {
         seed_if_empty(&conn)?;
     }
     ledger::verify_all(&conn).context("проверка криптографического журнала")?;
+    ledger::verify_chat_links(&conn).context("проверка подписей сообщений")?;
     Ok(conn)
 }
 
@@ -161,9 +162,11 @@ fn migrate(conn: &Connection) -> Result<()> {
         );
         CREATE TABLE IF NOT EXISTS chat_messages (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
+          guid TEXT NOT NULL UNIQUE,
           workspace_id INTEGER NOT NULL,
           user_id INTEGER NOT NULL,
           text TEXT NOT NULL,
+          ledger_hash TEXT UNIQUE,
           created_at TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS organization_nodes (
@@ -274,6 +277,23 @@ fn migrate(conn: &Connection) -> Result<()> {
           WHERE source_system IS NOT NULL AND external_id IS NOT NULL;
         "#,
     )?;
+    let _ = conn.execute("ALTER TABLE chat_messages ADD COLUMN guid TEXT", []);
+    let _ = conn.execute("ALTER TABLE chat_messages ADD COLUMN ledger_hash TEXT", []);
+    conn.execute_batch(
+        "CREATE UNIQUE INDEX IF NOT EXISTS chat_messages_guid_idx ON chat_messages(guid) WHERE guid IS NOT NULL;
+         CREATE UNIQUE INDEX IF NOT EXISTS chat_messages_ledger_idx ON chat_messages(ledger_hash) WHERE ledger_hash IS NOT NULL;",
+    )?;
+    let mut missing_chat_guids = Vec::new();
+    {
+        let mut stmt = conn.prepare("SELECT id FROM chat_messages WHERE guid IS NULL OR guid=''")?;
+        missing_chat_guids.extend(stmt.query_map([], |row| row.get::<_, i64>(0))?.flatten());
+    }
+    for id in missing_chat_guids {
+        conn.execute(
+            "UPDATE chat_messages SET guid=?1 WHERE id=?2",
+            params![uuid::Uuid::new_v4().to_string(), id],
+        )?;
+    }
     fill_guids(conn)?;
     let _ = conn.execute_batch(
         r#"

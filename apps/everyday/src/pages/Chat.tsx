@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import type { FormEvent } from 'react'
-import { Loader2, MessageCircle, Send } from 'lucide-react'
+import { Loader2, MessageCircle, Send, ShieldCheck } from 'lucide-react'
 import { format } from 'date-fns'
 import { ru } from 'date-fns/locale'
 import { trpc } from '@/providers/trpc'
@@ -77,6 +77,13 @@ export default function Chat() {
                   <div className={cn('text-[12px] text-ink-500 mb-0.5', mine && 'text-right')}>
                     {m.user?.fullName ?? 'Участник'} ·{' '}
                     {format(new Date(m.createdAt), 'dd.MM HH:mm', { locale: ru })}
+                    {m.ledgerVerified && (
+                      <ShieldCheck
+                        size={12}
+                        className="ml-1 inline text-teal-dark"
+                        aria-label="Подпись сообщения проверена"
+                      />
+                    )}
                   </div>
                   <div
                     className={cn(
@@ -114,6 +121,11 @@ export default function Chat() {
             Отправить
           </button>
         </form>
+        {send.error && (
+          <p className="px-3 pb-3 text-xs text-danger" role="alert">
+            {send.error.message}
+          </p>
+        )}
       </section>
     </div>
   )

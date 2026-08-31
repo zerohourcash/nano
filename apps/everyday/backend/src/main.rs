@@ -482,11 +482,30 @@ async fn sync_once(client: &reqwest::Client, state: &Arc<AppState>, upstream: &s
         .send()
         .await;
     match pulled {
-        Ok(resp) if resp.status().is_success() => match resp.json::<Value>().await {
-            Ok(journal) => {
-                let db = state.db.lock();
-                sync::apply_remote_journal(&db, &journal, upstream);
-            }
+        Ok(resp) if resp.status().is_success() => match resp.bytes().await {
+            Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
+                Ok(journal) => {
+                    let db = state.db.lock();
+                    sync::metric_add(&db, "sync_bytes_received", bytes.len() as u64);
+                    let applied = sync::apply_remote_journal(&db, &journal, upstream);
+                    if applied.get("ok").and_then(Value::as_bool) == Some(false) {
+                        sync::touch_peer_error(
+                            &db,
+                            upstream,
+                            applied
+                                .get("error")
+                                .and_then(Value::as_str)
+                                .unwrap_or("журнал peer отклонён"),
+                        );
+                        return;
+                    }
+                }
+                Err(e) => {
+                    let db = state.db.lock();
+                    sync::touch_peer_error(&db, upstream, &format!("некорректный JSON: {e}"));
+                    return;
+                }
+            },
             Err(e) => {
                 let db = state.db.lock();
                 sync::touch_peer_error(&db, upstream, &format!("некорректный ответ: {e}"));
@@ -511,15 +530,26 @@ async fn sync_once(client: &reqwest::Client, state: &Arc<AppState>, upstream: &s
         let db = state.db.lock();
         sync::export_journal(&db)
     };
+    let mine_bytes = match serde_json::to_vec(&mine) {
+        Ok(value) => value,
+        Err(error) => {
+            let db = state.db.lock();
+            sync::touch_peer_error(&db, upstream, &format!("не удалось собрать журнал: {error}"));
+            return;
+        }
+    };
     match client
         .post(format!("{upstream}/sync/journal"))
         .bearer_auth(token)
-        .json(&mine)
+        .header("content-type", "application/json")
+        .body(mine_bytes.clone())
         .send()
         .await
     {
         Ok(resp) if resp.status().is_success() => {
             let db = state.db.lock();
+            sync::metric_add(&db, "sync_bytes_sent", mine_bytes.len() as u64);
+            sync::metric_add(&db, "sync_successes", 1);
             let _ = db.execute(
                 "UPDATE peers SET last_sync=?1, last_error=NULL WHERE url=?2",
                 rusqlite::params![chrono::Utc::now().to_rfc3339(), upstream],
@@ -551,7 +581,7 @@ fn short_net_error(e: &reqwest::Error) -> String {
     }
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() {
     let dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let db_path = std::env::var("MESHKEEPER_DB")
@@ -574,6 +604,25 @@ async fn main() {
             sync::kv_get(&conn, "node_name").unwrap_or_default(),
             sync::guess_lan_base()
         );
+    }
+    let bootstrap_peers: Vec<String> = std::env::var("MESHKEEPER_PEERS")
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect();
+    if !bootstrap_peers.is_empty() && sync_token().is_none() {
+        panic!("MESHKEEPER_PEERS требует MESHKEEPER_SYNC_TOKEN не короче 32 символов");
+    }
+    for peer in bootstrap_peers {
+        if let Err(message) = validate_peer_url(&peer) {
+            panic!("MESHKEEPER_PEERS: {message}");
+        }
+        let result = sync::add_peer(&conn, &peer, Some("bootstrap"), None);
+        if result.get("ok").and_then(Value::as_bool) == Some(false) {
+            panic!("MESHKEEPER_PEERS: {}", result["error"]);
+        }
     }
     let state = Arc::new(AppState {
         db: Mutex::new(conn),

@@ -21,6 +21,9 @@ export const syncRouter = createRouter({
       lastError: string | null;
     }>,
     openConflicts: 0,
+    bytesSent: 0,
+    bytesReceived: 0,
+    syncSuccesses: 0,
   })),
   peers: publicQuery.query(async () => [] as Array<{
     id: number;

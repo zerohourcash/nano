@@ -350,6 +350,40 @@ pub fn verify_all(conn: &Connection) -> anyhow::Result<usize> {
     Ok(verified)
 }
 
+pub fn verify_chat_links(conn: &Connection) -> anyhow::Result<usize> {
+    let mut stmt = conn.prepare(
+        "SELECT m.guid,m.workspace_id,m.user_id,m.text,m.ledger_hash,
+                h.workspace_id,h.actor_user_id,h.type,h.from_label,h.comment
+         FROM chat_messages m
+         LEFT JOIN history_entries h ON h.hash=m.ledger_hash
+         WHERE m.ledger_hash IS NOT NULL",
+    )?;
+    let mut rows = stmt.query([])?;
+    let mut verified = 0;
+    while let Some(row) = rows.next()? {
+        let guid: String = row.get(0)?;
+        let message_workspace: i64 = row.get(1)?;
+        let message_user: i64 = row.get(2)?;
+        let text: String = row.get(3)?;
+        let ledger_hash: String = row.get(4)?;
+        let event_workspace: Option<i64> = row.get(5)?;
+        let event_user: Option<i64> = row.get(6)?;
+        let event_type: Option<String> = row.get(7)?;
+        let event_guid: Option<String> = row.get(8)?;
+        let event_text: Option<String> = row.get(9)?;
+        if event_workspace != Some(message_workspace)
+            || event_user != Some(message_user)
+            || event_type.as_deref() != Some("chat_message")
+            || event_guid.as_deref() != Some(guid.as_str())
+            || event_text.as_deref() != Some(text.as_str())
+        {
+            bail!("chat message {guid} is not bound to ledger event {ledger_hash}");
+        }
+        verified += 1;
+    }
+    Ok(verified)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

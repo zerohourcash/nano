@@ -7,6 +7,7 @@ use sha2::{Digest, Sha256};
 /// в сеть (он держит блокировку базы), поэтому просто поднимает флаг, а цикл
 /// обмена подхватывает его в течение секунды.
 static SYNC_NOW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub const MAX_PEERS: i64 = 32;
 
 fn sync_invites_enabled() -> bool {
     std::env::var("MESHKEEPER_SYNC_INVITES").as_deref() == Ok("1")
@@ -32,6 +33,19 @@ pub fn kv_set(conn: &Connection, k: &str, v: &str) {
         "INSERT INTO kv(k,v) VALUES(?1,?2) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
         params![k, v],
     );
+}
+
+pub fn metric_add(conn: &Connection, key: &str, amount: u64) {
+    let current = kv_get(conn, key)
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0);
+    kv_set(conn, key, &current.saturating_add(amount).to_string());
+}
+
+fn metric(conn: &Connection, key: &str) -> u64 {
+    kv_get(conn, key)
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0)
 }
 
 pub fn ensure_node(conn: &Connection) -> (String, String) {
@@ -264,6 +278,31 @@ pub fn export_journal(conn: &Connection) -> Value {
             memberships.push(row);
         }
     }
+    let mut messages = Vec::new();
+    if let Ok(mut stmt) = conn.prepare(
+        "SELECT guid,workspace_id,user_id,text,ledger_hash,created_at
+         FROM chat_messages WHERE ledger_hash IS NOT NULL ORDER BY created_at,guid",
+    ) {
+        for row in stmt
+            .query_map([], |row| {
+                let workspace: i64 = row.get(1)?;
+                let user: i64 = row.get(2)?;
+                Ok(json!({
+                    "guid": row.get::<_, String>(0)?,
+                    "workspaceGuid": guid_of(conn, "workspaces", workspace),
+                    "userGuid": guid_of(conn, "users", user),
+                    "text": row.get::<_, String>(3)?,
+                    "ledgerHash": row.get::<_, String>(4)?,
+                    "createdAt": row.get::<_, String>(5)?,
+                }))
+            })
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            messages.push(row);
+        }
+    }
     json!({
         "v": 1,
         "nodeId": node_id,
@@ -277,6 +316,7 @@ pub fn export_journal(conn: &Connection) -> Value {
         "history": history,
         "invites": invites,
         "memberships": memberships,
+        "messages": messages,
     })
 }
 
@@ -394,6 +434,7 @@ pub fn import_journal(conn: &Connection, journal: &Value) -> Value {
     let mut ops = 0u32;
     let mut skipped = 0u32;
     let mut conflicts = 0u32;
+    let mut messages = 0u32;
 
     if let Some(arr) = journal.get("workspaces").and_then(|v| v.as_array()) {
         for w in arr {
@@ -656,6 +697,54 @@ pub fn import_journal(conn: &Connection, journal: &Value) -> Value {
             ops += 1;
         }
     }
+    if let Some(arr) = journal.get("messages").and_then(Value::as_array) {
+        for message in arr {
+            let guid = message.get("guid").and_then(Value::as_str).unwrap_or("");
+            let ledger_hash = message
+                .get("ledgerHash")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let text = message.get("text").and_then(Value::as_str).unwrap_or("");
+            if guid.is_empty() || ledger_hash.is_empty() || text.is_empty() || text.chars().count() > 4000 {
+                skipped += 1;
+                continue;
+            }
+            let Some(workspace) = message
+                .get("workspaceGuid")
+                .and_then(Value::as_str)
+                .and_then(|value| id_by_guid(conn, "workspaces", value))
+            else {
+                skipped += 1;
+                continue;
+            };
+            let Some(user) = message
+                .get("userGuid")
+                .and_then(Value::as_str)
+                .and_then(|value| id_by_guid(conn, "users", value))
+            else {
+                skipped += 1;
+                continue;
+            };
+            let inserted = conn
+                .execute(
+                    "INSERT OR IGNORE INTO chat_messages(guid,workspace_id,user_id,text,ledger_hash,created_at)
+                     VALUES(?1,?2,?3,?4,?5,?6)",
+                    params![
+                        guid,
+                        workspace,
+                        user,
+                        text,
+                        ledger_hash,
+                        message.get("createdAt").and_then(Value::as_str).unwrap_or("")
+                    ],
+                )
+                .unwrap_or(0);
+            messages += inserted as u32;
+            if inserted == 0 {
+                skipped += 1;
+            }
+        }
+    }
     if sync_invites_enabled() {
         if let Some(arr) = journal.get("invites").and_then(|v| v.as_array()) {
             for inv in arr {
@@ -739,6 +828,7 @@ pub fn import_journal(conn: &Connection, journal: &Value) -> Value {
         "ops": ops,
         "skipped": skipped,
         "conflicts": conflicts
+        ,"messages": messages
     })
 }
 
@@ -798,6 +888,18 @@ pub fn remove_peer(conn: &Connection, url: &str) -> Value {
 
 pub fn add_peer(conn: &Connection, url: &str, name: Option<&str>, node_id: Option<&str>) -> Value {
     let url = url.trim().trim_end_matches('/').to_string();
+    let exists: bool = conn
+        .query_row("SELECT 1 FROM peers WHERE url=?1", params![url], |_| Ok(true))
+        .optional()
+        .ok()
+        .flatten()
+        .unwrap_or(false);
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM peers", [], |row| row.get(0))
+        .unwrap_or(0);
+    if !exists && count >= MAX_PEERS {
+        return json!({"ok": false, "error": format!("Достигнут лимит {MAX_PEERS} прямых peers")});
+    }
     let _ = conn.execute(
         "INSERT INTO peers (url, name, node_id, last_seen) VALUES (?1,?2,?3,?4)
          ON CONFLICT(url) DO UPDATE SET name=COALESCE(excluded.name, peers.name), node_id=COALESCE(excluded.node_id, peers.node_id), last_seen=excluded.last_seen",
@@ -902,6 +1004,10 @@ pub fn apply_remote_journal(conn: &Connection, journal: &Value, peer_url: &str) 
     if let Err(error) = ledger::verify_all(conn) {
         let _ = conn.execute_batch("ROLLBACK TO verified_sync; RELEASE verified_sync");
         return json!({"ok":false,"error":format!("Криптографическая проверка входящего журнала: {error}")});
+    }
+    if let Err(error) = ledger::verify_chat_links(conn) {
+        let _ = conn.execute_batch("ROLLBACK TO verified_sync; RELEASE verified_sync");
+        return json!({"ok":false,"error":format!("Криптографическая проверка сообщений: {error}")});
     }
     if let Err(error) = conn.execute_batch("RELEASE verified_sync") {
         return json!({"ok":false,"error":error.to_string()});
@@ -1041,6 +1147,9 @@ pub fn status(conn: &Connection) -> Value {
         "localUrl": local_http_base(),
         "peers": peers,
         "openConflicts": conflicts
+        ,"bytesSent": metric(conn, "sync_bytes_sent")
+        ,"bytesReceived": metric(conn, "sync_bytes_received")
+        ,"syncSuccesses": metric(conn, "sync_successes")
     })
 }
 

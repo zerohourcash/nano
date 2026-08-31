@@ -92,6 +92,30 @@ def main() -> int:
         check("владелец входит на C офлайн", isinstance(login_c, dict) and "id" in login_c)
 
         ws_c = c.call("meta.workspaces", None, mutation=False)[0]["id"]
+        message = c.call(
+            "chat.send",
+            {"workspaceId": ws_c, "text": "Сообщение C через локальную mesh"},
+        )
+        check(
+            "сообщение C подписано устройством и ledger",
+            message.get("ledgerVerified") is True and bool(message.get("ledgerHash")),
+            str(message)[:200],
+        )
+        c.call("sync.pullNow", {})
+        check(
+            "чат C доставлен через B на A ровно один раз",
+            wait_for(
+                lambda: len(
+                    [
+                        row
+                        for row in a.call("chat.list", {"workspaceId": 1}, mutation=False)
+                        if row.get("guid") == message.get("guid") and row.get("ledgerVerified") is True
+                    ]
+                )
+                == 1
+            ),
+        )
+
         created_c = c.call("items.create", {"workspaceId": ws_c, "title": "Рация с узла C"})
         check("операция создана на C", isinstance(created_c, dict) and "id" in created_c)
         c.call("sync.pullNow", {})
@@ -141,14 +165,76 @@ def main() -> int:
             str(item_named(c, ws_c, "Рация с узла C")),
         )
 
-        a.stop()
+        # Полная изоляция B: обе соседние ноды недоступны, но локальные
+        # транзакции должны приниматься и пережить несколько неудачных тиков.
+        a.stop(cleanup=False)
+        c.stop(cleanup=False)
         ws_b = b.call("meta.workspaces", None, mutation=False)[0]["id"]
         created_b = b.call("items.create", {"workspaceId": ws_b, "title": "Фонарь после отключения A"})
-        check("B принимает операции при потере A", isinstance(created_b, dict) and "id" in created_b)
-        b.call("sync.pullNow", {})
+        check("B принимает операции при полной потере сети", isinstance(created_b, dict) and "id" in created_b)
+        delayed_take = b.call(
+            "transfers.take",
+            {"itemId": created_b["id"], "dueAt": "2026-10-31T12:00:00.000Z"},
+        )
         check(
-            "B и C продолжают сходиться без A",
-            wait_for(lambda: item_named(c, ws_c, "Фонарь после отключения A") is not None),
+            "отложенная выдача подписана и сохранена локально",
+            delayed_take.get("status", {}).get("slug") == "in-work",
+            str(delayed_take)[:240],
+        )
+        delayed_message = b.call(
+            "chat.send",
+            {"workspaceId": ws_b, "text": "Отложенное сообщение из полной изоляции"},
+        )
+        check(
+            "отложенное сообщение подписано и сохранено локально",
+            delayed_message.get("ledgerVerified") is True,
+            str(delayed_message)[:240],
+        )
+        check(
+            "неудачные доставки сохраняются для повтора",
+            wait_for(
+                lambda: bool((peer(b, a.base) or {}).get("lastError"))
+                and bool((peer(b, dead_c_url) or {}).get("lastError")),
+                timeout=15,
+            ),
+        )
+
+        # Возвращаем обе ноды с прежними БД. Никакого pullNow: фоновый цикл
+        # обязан сам повторить store-and-forward доставку.
+        a.restart()
+        c.restart()
+        check("A и C восстановлены с прежней историей", a.wait_ready() and c.wait_ready())
+        check(
+            "отложенная выдача автоматически доставлена A и C",
+            wait_for(
+                lambda: (item_named(a, 1, "Фонарь после отключения A") or {}).get("dueAt")
+                == "2026-10-31T12:00:00.000Z"
+                and (item_named(c, ws_c, "Фонарь после отключения A") or {}).get("dueAt")
+                == "2026-10-31T12:00:00.000Z",
+                timeout=30,
+            ),
+        )
+        check(
+            "отложенный чат доставлен ровно один раз на каждую ноду",
+            wait_for(
+                lambda: len(
+                    [
+                        row
+                        for row in a.call("chat.list", {"workspaceId": 1}, mutation=False)
+                        if row.get("guid") == delayed_message.get("guid")
+                    ]
+                )
+                == 1
+                and len(
+                    [
+                        row
+                        for row in c.call("chat.list", {"workspaceId": ws_c}, mutation=False)
+                        if row.get("guid") == delayed_message.get("guid")
+                    ]
+                )
+                == 1,
+                timeout=30,
+            ),
         )
     finally:
         if a.proc.poll() is None:

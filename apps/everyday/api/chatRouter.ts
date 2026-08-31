@@ -14,10 +14,13 @@ export const chatRouter = createRouter({
     .input(z.object({ workspaceId: z.number().int().positive().optional() }).optional())
     .query(async () => [] as Array<{
       id: number;
+      guid: string;
       workspaceId: number;
       userId: number;
       text: string;
       createdAt: string;
+      ledgerHash: string | null;
+      ledgerVerified: boolean;
       user: { id: number; fullName: string; avatarUrl: string | null } | null;
     }>),
 
@@ -30,10 +33,13 @@ export const chatRouter = createRouter({
     )
     .mutation(async ({ input }) => ({
       id: 0,
+      guid: "",
       workspaceId: 1,
       userId: 0,
       text: input.text,
       createdAt: new Date().toISOString(),
+      ledgerHash: "",
+      ledgerVerified: true,
       user: null as { id: number; fullName: string; avatarUrl: string | null } | null,
     })),
 });

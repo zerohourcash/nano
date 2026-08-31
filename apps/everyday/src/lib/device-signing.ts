@@ -83,6 +83,7 @@ const CRITICAL = [
   'history.move',
   'inventory.checkItem',
   'inventory.complete',
+  'chat.send',
 ]
 
 export function requiresDeviceSignature(url: string): boolean {

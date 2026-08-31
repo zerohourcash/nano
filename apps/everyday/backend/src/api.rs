@@ -767,12 +767,18 @@ fn dispatch_inner(
             {
                 return Err(ApiError::bad("Нельзя добавить этот узел в peers самого себя"));
             }
-            Ok(crate::sync::add_peer(
+            let added = crate::sync::add_peer(
                 conn,
                 &url,
                 s(input, "name").as_deref(),
                 None,
-            ))
+            );
+            if added.get("ok").and_then(Value::as_bool) == Some(false) {
+                return Err(ApiError::bad(
+                    added.get("error").and_then(Value::as_str).unwrap_or("Не удалось добавить peer"),
+                ));
+            }
+            Ok(added)
         }
         "sync.removePeer" => {
             let url = s(input, "url").ok_or_else(|| ApiError::bad("Укажите адрес узла"))?;
@@ -3975,16 +3981,20 @@ fn decide_change_atomic(conn: &Connection, input: &Value, user_id: Option<i64>) 
 }
 
 fn chat_list(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
-    let _ = require_user(conn, user_id)?;
+    let uid = require_user(conn, user_id)?;
     let ws = i64v(input, "workspaceId").unwrap_or_else(|| ws_fallback(conn));
-    let mut stmt = conn.prepare("SELECT id, workspace_id, user_id, text, created_at FROM chat_messages WHERE workspace_id=?1 ORDER BY id DESC LIMIT 200")?;
+    require_member(conn, uid, ws)?;
+    let mut stmt = conn.prepare("SELECT id,guid,workspace_id,user_id,text,created_at,ledger_hash FROM chat_messages WHERE workspace_id=?1 ORDER BY created_at DESC,guid DESC LIMIT 200")?;
     let mut rows: Vec<Value> = stmt
         .query_map(params![ws], |r| {
-            let uid: i64 = r.get(2)?;
+            let author: i64 = r.get(3)?;
             Ok(json!({
-                "id": r.get::<_, i64>(0)?, "workspaceId": r.get::<_, i64>(1)?, "userId": uid,
-                "text": r.get::<_, String>(3)?, "createdAt": r.get::<_, String>(4)?,
-                "user": jsn::user_public(conn, uid)
+                "id": r.get::<_, i64>(0)?, "guid": r.get::<_, String>(1)?,
+                "workspaceId": r.get::<_, i64>(2)?, "userId": author,
+                "text": r.get::<_, String>(4)?, "createdAt": r.get::<_, String>(5)?,
+                "ledgerHash": r.get::<_, Option<String>>(6)?,
+                "ledgerVerified": r.get::<_, Option<String>>(6)?.is_some(),
+                "user": jsn::user_public(conn, author)
             }))
         })?
         .filter_map(|x| x.ok())
@@ -3993,22 +4003,72 @@ fn chat_list(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiResul
     Ok(Value::Array(rows))
 }
 
-fn chat_send(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
+fn chat_send(conn: &mut Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
     let uid = require_user(conn, user_id)?;
-    let text = s(input, "text").ok_or_else(|| ApiError::bad("Пустое сообщение"))?;
+    let text = s(input, "text")
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| ApiError::bad("Пустое сообщение"))?;
+    if text.chars().count() > 4000 {
+        return Err(ApiError::bad("Сообщение длиннее 4000 символов"));
+    }
+    if text.contains('\0') {
+        return Err(ApiError::bad("Сообщение содержит недопустимый символ"));
+    }
     let ws = i64v(input, "workspaceId").unwrap_or_else(|| ws_fallback(conn));
-    conn.execute(
-        "INSERT INTO chat_messages (workspace_id, user_id, text, created_at) VALUES (?1,?2,?3,?4)",
-        params![ws, uid, text, now()],
-    )?;
-    Ok(json!({
-        "id": conn.last_insert_rowid(),
-        "workspaceId": ws,
-        "userId": uid,
-        "text": text,
-        "createdAt": now(),
-        "user": jsn::user_public(conn, uid)
-    }))
+    require_member(conn, uid, ws)?;
+    let result = atomic(conn, |conn| {
+        let minute_ago = (chrono::Utc::now() - chrono::Duration::minutes(1)).to_rfc3339();
+        let recent: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM chat_messages WHERE workspace_id=?1 AND user_id=?2 AND created_at>=?3",
+            params![ws, uid, minute_ago],
+            |row| row.get(0),
+        )?;
+        if recent >= 20 {
+            return Err(ApiError::new("TOO_MANY_REQUESTS", 429, "Слишком много сообщений: подождите минуту"));
+        }
+        let duplicate_since = (chrono::Utc::now() - chrono::Duration::seconds(10)).to_rfc3339();
+        let duplicate: bool = conn
+            .query_row(
+                "SELECT 1 FROM chat_messages WHERE workspace_id=?1 AND user_id=?2 AND text=?3 AND created_at>=?4 LIMIT 1",
+                params![ws, uid, text, duplicate_since],
+                |_| Ok(true),
+            )
+            .optional()?
+            .unwrap_or(false);
+        if duplicate {
+            return Err(ApiError::new("CONFLICT", 409, "Такое сообщение уже отправлено"));
+        }
+        let guid = uuid::Uuid::new_v4().to_string();
+        let event = ledger::append(
+            conn,
+            ws,
+            uid,
+            None,
+            "chat_message",
+            Some(&guid),
+            None,
+            None,
+            Some(&text),
+        )
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+        let hash = event.get("opId").and_then(Value::as_str).unwrap_or("");
+        let created_at = event.get("createdAt").and_then(Value::as_str).unwrap_or("");
+        conn.execute(
+            "INSERT INTO chat_messages (guid,workspace_id,user_id,text,ledger_hash,created_at) VALUES (?1,?2,?3,?4,?5,?6)",
+            params![guid, ws, uid, text, hash, created_at],
+        )?;
+        Ok(json!({
+            "id": conn.last_insert_rowid(), "guid": guid,
+            "workspaceId": ws, "userId": uid, "text": text,
+            "createdAt": created_at, "ledgerHash": hash, "ledgerVerified": true,
+            "user": jsn::user_public(conn, uid)
+        }))
+    });
+    if result.is_ok() {
+        crate::sync::request_sync_now();
+    }
+    result
 }
 
 fn backup_export(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
@@ -4020,7 +4080,7 @@ fn backup_export(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiR
         .map_err(|e| ApiError::bad(e.to_string()))
 }
 
-fn backup_import(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
+fn backup_import(conn: &mut Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
     let uid = require_user(conn, user_id)?;
     require_can(conn, uid, "manageWorkspaces")?;
     let password = s(input, "password").ok_or_else(|| ApiError::bad("Пароль архива обязателен"))?;
@@ -4031,7 +4091,16 @@ fn backup_import(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiR
     let plain =
         crate::sync::decrypt_backup(&password, &blob).map_err(|e| ApiError::bad(e.to_string()))?;
     let journal: Value = serde_json::from_str(&plain).map_err(|e| ApiError::bad(e.to_string()))?;
-    Ok(crate::sync::import_journal(conn, &journal))
+    let result = crate::sync::apply_remote_journal(conn, &journal, "");
+    if result.get("ok").and_then(Value::as_bool) == Some(false) {
+        return Err(ApiError::bad(
+            result
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("Архив не прошёл криптографическую проверку"),
+        ));
+    }
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -5426,6 +5495,55 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.http, 400);
         assert!(error.message.contains("другому рабочему пространству"));
+        cleanup(conn, path);
+    }
+
+    #[test]
+    fn chat_message_is_ledger_bound_and_duplicate_is_rejected() {
+        let (mut conn, path, users, ws) = test_db();
+        let sent = dispatch(
+            &mut conn,
+            "chat.send",
+            &json!({"workspaceId":ws,"text":"Проверка связи"}),
+            Some(users[0]),
+        )
+        .unwrap();
+        assert_eq!(sent["ledgerVerified"], true);
+        assert!(sent["guid"].as_str().is_some_and(|value| !value.is_empty()));
+        assert!(sent["ledgerHash"].as_str().is_some_and(|value| !value.is_empty()));
+        assert_eq!(ledger::verify_chat_links(&conn).unwrap(), 1);
+
+        let duplicate = dispatch(
+            &mut conn,
+            "chat.send",
+            &json!({"workspaceId":ws,"text":"Проверка связи"}),
+            Some(users[0]),
+        )
+        .unwrap_err();
+        assert_eq!(duplicate.http, 409);
+        conn.execute("UPDATE chat_messages SET text='подмена'", [])
+            .unwrap();
+        assert!(ledger::verify_chat_links(&conn).is_err());
+        cleanup(conn, path);
+    }
+
+    #[test]
+    fn chat_rejects_foreign_workspace() {
+        let (mut conn, path, users, _ws) = test_db();
+        conn.execute(
+            "INSERT INTO workspaces(name,timezone,internal_id_prefix,created_at) VALUES('Чужая','UTC','X-',?1)",
+            params![now()],
+        )
+        .unwrap();
+        let foreign = conn.last_insert_rowid();
+        let error = dispatch(
+            &mut conn,
+            "chat.list",
+            &json!({"workspaceId":foreign}),
+            Some(users[0]),
+        )
+        .unwrap_err();
+        assert_eq!(error.http, 403);
         cleanup(conn, path);
     }
 }
