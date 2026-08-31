@@ -202,6 +202,22 @@ fn migrate(conn: &Connection) -> Result<()> {
         );
         CREATE INDEX IF NOT EXISTS sessions_user_active_idx
           ON sessions(user_id, expires_at) WHERE revoked_at IS NULL;
+        CREATE TABLE IF NOT EXISTS user_devices (
+          device_id TEXT PRIMARY KEY,
+          user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          name TEXT NOT NULL,
+          public_key TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          last_seen_at TEXT,
+          revoked_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS user_devices_owner_idx ON user_devices(user_id,revoked_at);
+        CREATE TABLE IF NOT EXISTS device_nonces (
+          device_id TEXT NOT NULL,
+          nonce TEXT NOT NULL,
+          used_at TEXT NOT NULL,
+          PRIMARY KEY(device_id,nonce)
+        );
         CREATE UNIQUE INDEX IF NOT EXISTS user_workspaces_pair_uq
           ON user_workspaces(user_id, workspace_id);
         CREATE UNIQUE INDEX IF NOT EXISTS inventory_result_pair_uq

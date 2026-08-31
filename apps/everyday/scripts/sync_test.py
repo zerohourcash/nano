@@ -26,6 +26,7 @@ import urllib.request
 import uuid
 from http.cookiejar import CookieJar
 from pathlib import Path
+from device_test_signing import CRITICAL, DeviceSigner
 
 ROOT = Path(__file__).resolve().parent.parent
 EXE = "meshkeeper-node.exe" if os.name == "nt" else "meshkeeper-node"
@@ -69,6 +70,8 @@ class Node:
         self.opener = urllib.request.build_opener(
             urllib.request.HTTPCookieProcessor(self.cj)
         )
+        self.signer = DeviceSigner(name)
+        self.device_registered = False
         env = {
             **os.environ,
             "MESHKEEPER_DB": str(self.db),
@@ -104,6 +107,18 @@ class Node:
                 method="POST",
             )
             req.add_header("content-type", "application/json")
+            if proc in CRITICAL:
+                if not self.device_registered:
+                    enrolled = self.call("auth.registerDevice", {
+                        "deviceId": self.signer.device_id,
+                        "name": self.name,
+                        "publicKey": self.signer.public_key,
+                    })
+                    if not isinstance(enrolled, dict) or enrolled.get("deviceId") != self.signer.device_id:
+                        return {"__err": "device enrollment failed", "__detail": enrolled}
+                    self.device_registered = True
+                for key, value in self.signer.headers(f"/api/trpc/{proc}", body.encode()).items():
+                    req.add_header(key, value)
         else:
             query = urllib.parse.quote(body)
             req = urllib.request.Request(

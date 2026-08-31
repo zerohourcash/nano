@@ -1,6 +1,7 @@
 mod api;
 mod auth;
 mod db;
+mod device;
 mod json;
 mod ledger;
 mod sync;
@@ -187,6 +188,32 @@ async fn trpc(
     let batched = calls.len() > 1 || q.get("batch").map(|s| s.as_str()) == Some("1");
     let mut conn = state.db.lock();
     let uid = auth::resolve_session(&conn, token.as_deref());
+    if calls
+        .iter()
+        .any(|(procedure, _)| device::requires_signature(procedure))
+    {
+        let verified = uid.ok_or("Войдите в систему").and_then(|user_id| {
+            device::verify_request(
+                &conn,
+                user_id,
+                &format!("/api/trpc/{procedures}"),
+                &body,
+                &headers,
+            )
+            .map_err(|_| "Требуется действительная подпись устройства")
+        });
+        if let Err(message) = verified {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(err_payload(&api::ApiError::new(
+                    "DEVICE_SIGNATURE_REQUIRED",
+                    403,
+                    message,
+                ))),
+            )
+                .into_response();
+        }
+    }
     let mut out = Vec::new();
     let mut set_session: Option<Option<String>> = None;
     for (proc, input) in &calls {

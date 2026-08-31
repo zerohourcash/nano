@@ -1,6 +1,7 @@
 """Сценарии ТЗ через HTTP-API узла. Запускать через scripts/smoke_runner.py."""
 
 import json, os, urllib.error, urllib.parse, urllib.request, http.cookiejar
+from device_test_signing import CRITICAL, DeviceSigner
 
 BASE = os.environ.get("MK_BASE", "http://127.0.0.1:8098")
 ORIGIN = BASE
@@ -10,13 +11,27 @@ class Client:
         self.name = name
         self.cj = http.cookiejar.CookieJar()
         self.op = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(self.cj))
+        self.signer = DeviceSigner(name)
+        self.device_registered = False
 
-    def call(self, proc, inp=None, mutation=True, raw=False):
+    def call(self, proc, inp=None, mutation=True, raw=False, signed=True):
         url = f"{BASE}/api/trpc/{proc}?batch=1"
         body = json.dumps({"0": {"json": inp}}).encode()
         req = urllib.request.Request(url, data=body if mutation else None, method="POST" if mutation else "GET")
         req.add_header("content-type", "application/json")
         req.add_header("origin", ORIGIN)
+        if mutation and proc in CRITICAL and signed:
+            if not self.device_registered:
+                enrolled = self.call("auth.registerDevice", {
+                    "deviceId": self.signer.device_id,
+                    "name": self.name,
+                    "publicKey": self.signer.public_key,
+                })
+                if not isinstance(enrolled, dict) or enrolled.get("deviceId") != self.signer.device_id:
+                    return {"__err": "device enrollment failed", "__detail": enrolled}
+                self.device_registered = True
+            for key, value in self.signer.headers(f"/api/trpc/{proc}", body).items():
+                req.add_header(key, value)
         if not mutation:
             url = f"{BASE}/api/trpc/{proc}?batch=1&input=" + urllib.parse.quote(json.dumps({"0": {"json": inp}}))
             req = urllib.request.Request(url, method="GET")
@@ -115,6 +130,17 @@ bc = owner.call("items.byCode", {"code": code}, mutation=False)
 check("items.byCode finds item", isinstance(bc, dict) and bc.get("id") == item_id, str(bc)[:150])
 
 print("\n== 6. Взять / вернуть ==")
+unsigned_take = owner.call(
+    "transfers.take",
+    {"itemId": item_id, "dueAt": "2026-09-30T12:00:00.000Z"},
+    signed=False,
+)
+check(
+    "unsigned QR operation rejected",
+    unsigned_take.get("__http") == 403
+    and "DEVICE_SIGNATURE_REQUIRED" in unsigned_take.get("__body", ""),
+    str(unsigned_take)[:160],
+)
 take = owner.call("transfers.take", {"itemId": item_id, "dueAt": "2026-09-30T12:00:00.000Z", "purpose": "монтаж"})
 show("take", take)
 check("take succeeds", "__err" not in take)

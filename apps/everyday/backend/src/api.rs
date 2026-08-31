@@ -43,7 +43,7 @@ impl From<rusqlite::Error> for ApiError {
 }
 
 impl ApiError {
-    fn new(code: &'static str, http: u16, message: impl Into<String>) -> Self {
+    pub fn new(code: &'static str, http: u16, message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
             code,
@@ -76,6 +76,7 @@ pub fn is_mutation(procedure: &str) -> bool {
             | "auth.directory"
             | "auth.options"
             | "auth.me"
+            | "auth.devices"
             | "auth.inviteInfo"
             | "meta.currentUser"
             | "meta.transferCounts"
@@ -709,6 +710,22 @@ fn dispatch_inner(
         "auth.logout" => Ok(json!({"ok": true})),
         "auth.me" => {
             Ok(jsn::user_public(conn, require_user(conn, user_id)?).unwrap_or(Value::Null))
+        }
+        "auth.registerDevice" => {
+            let uid = require_user(conn, user_id)?;
+            crate::device::register(conn, uid, input)
+                .map_err(|e| ApiError::bad(format!("Не удалось зарегистрировать устройство: {e}")))
+        }
+        "auth.devices" => {
+            let uid = require_user(conn, user_id)?;
+            crate::device::list(conn, uid).map_err(|e| ApiError::internal(e.to_string()))
+        }
+        "auth.revokeDevice" => {
+            let uid = require_user(conn, user_id)?;
+            let device_id = s(input, "deviceId").ok_or_else(|| ApiError::bad("deviceId"))?;
+            let revoked = crate::device::revoke(conn, uid, &device_id)
+                .map_err(|e| ApiError::internal(e.to_string()))?;
+            Ok(json!({"ok":revoked}))
         }
         "auth.inviteInfo" => invite_info(conn, input),
         "meta.currentUser" => {

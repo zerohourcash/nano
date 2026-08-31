@@ -5,6 +5,7 @@ import superjson from "superjson";
 import type { AppRouter } from "../../api/router";
 import type { ReactNode } from "react";
 import { trpcUrl } from "@/lib/app-mode";
+import { requiresDeviceSignature, signedDeviceHeaders } from "@/lib/device-signing";
 
 export const trpc = createTRPCReact<AppRouter>();
 
@@ -14,9 +15,14 @@ const trpcClient = trpc.createClient({
     httpBatchLink({
       url: trpcUrl(),
       transformer: superjson,
-      fetch(input, init) {
+      async fetch(input, init) {
+        const url = typeof input === "string" ? input : input.toString();
+        const deviceHeaders = requiresDeviceSignature(url)
+          ? await signedDeviceHeaders(url, init?.body)
+          : {};
         return globalThis.fetch(input, {
           ...(init ?? {}),
+          headers: { ...(init?.headers ?? {}), ...deviceHeaders },
           credentials: "include",
         });
       },

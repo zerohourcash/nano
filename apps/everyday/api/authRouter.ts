@@ -154,6 +154,27 @@ export const authRouter = createRouter({
     }
   }),
 
+  registerDevice: publicQuery
+    .input(z.object({
+      deviceId: z.string().min(16).max(100),
+      name: z.string().min(1).max(100),
+      publicKey: z.string().min(40).max(100),
+    }))
+    .mutation(({ input }) => ({ ...input, revoked: false })),
+
+  devices: publicQuery.query(async () => [] as Array<{
+    deviceId: string
+    name: string
+    publicKey: string
+    createdAt: string
+    lastSeenAt: string | null
+    revoked: boolean
+  }>),
+
+  revokeDevice: publicQuery
+    .input(z.object({ deviceId: z.string().min(16).max(100) }))
+    .mutation(() => ({ ok: true })),
+
   options: publicQuery.query(async () => ({
     registrationOpen: false,
     bootstrap: false,
