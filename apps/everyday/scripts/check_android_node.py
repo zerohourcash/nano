@@ -7,6 +7,7 @@ android = ROOT / "android" / "app"
 lib = (ROOT / "backend" / "src" / "lib.rs").read_text(encoding="utf-8")
 service = (android / "src/main/java/ru/meshkeeper/app/NodeService.java").read_text(encoding="utf-8")
 activity = (android / "src/main/java/ru/meshkeeper/app/MainActivity.java").read_text(encoding="utf-8")
+secrets = (android / "src/main/java/ru/meshkeeper/app/SecretStore.java").read_text(encoding="utf-8")
 gradle = (android / "build.gradle").read_text(encoding="utf-8")
 
 required = {
@@ -17,6 +18,12 @@ required = {
     "localhost WebView": "RustNode.localOrigin()" in activity,
     "cargo-ndk build": "buildRustNode" in gradle and "--lib" in gradle,
     "two supported ABIs": "arm64-v8a" in gradle and "x86_64" in gradle,
+    "Android Keystore": 'KEYSTORE = "AndroidKeyStore"' in secrets,
+    "authenticated token encryption": 'AES/GCM/NoPadding' in secrets and "updateAAD" in secrets,
+    "legacy plaintext migration": ".remove(LEGACY_TOKEN)" in secrets,
+    "service decrypts token": "SecretStore.loadSyncToken(this)" in service,
+    "token absent from service Intent": "EXTRA_TOKEN" not in service and "EXTRA_TOKEN" not in activity,
+    "token not restored into UI": "syncToken.setText(SecretStore.loadSyncToken" not in activity,
 }
 missing = [name for name, present in required.items() if not present]
 if missing:
@@ -26,4 +33,4 @@ legacy = android / "src/main/java/ru/meshkeeper/app/node"
 if legacy.exists() and any(legacy.glob("*.java")):
     raise SystemExit("Обнаружена запрещённая дублирующая Java-реализация backend")
 
-print("Android node check passed: JNI, isolated listeners, cargo-ndk and no Java backend duplicate.")
+print("Android node check passed: JNI, isolated listeners, Keystore, cargo-ndk and no Java backend duplicate.")

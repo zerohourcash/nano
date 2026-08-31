@@ -43,13 +43,13 @@ import com.journeyapps.barcodescanner.ScanOptions;
 public class MainActivity extends AppCompatActivity {
     private static final String PREFS = "meshkeeper";
     private static final String KEY_RELAY = "relay";
-    private static final String KEY_TOKEN = "sync_token";
 
     private WebView web;
     private View setup;
     private EditText serverUrl;
     private EditText syncToken;
     private TextView lanHint;
+    private boolean hasStoredToken;
     private String pendingMode = "join";
     /** Адрес сервера, с которого открыт интерфейс. Пустой — интерфейс не загружен. */
     private String serverOrigin = "";
@@ -93,7 +93,15 @@ public class MainActivity extends AppCompatActivity {
 
         SharedPreferences prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
         serverUrl.setText(prefs.getString(KEY_RELAY, ""));
-        syncToken.setText(prefs.getString(KEY_TOKEN, ""));
+        try {
+            hasStoredToken = !SecretStore.loadSyncToken(this).isEmpty();
+            syncToken.setHint(hasStoredToken
+                    ? "mesh-токен защищён на устройстве"
+                    : "общий mesh-токен (пусто = создать)");
+        } catch (Exception error) {
+            hasStoredToken = false;
+            Toast.makeText(this, "Не удалось открыть защищённый mesh-токен", Toast.LENGTH_LONG).show();
+        }
 
         WebSettings s = web.getSettings();
         s.setJavaScriptEnabled(true);
@@ -244,19 +252,31 @@ public class MainActivity extends AppCompatActivity {
             return;
         }
         String token = syncToken.getText().toString().trim();
+        if (token.isEmpty() && hasStoredToken) {
+            try {
+                token = SecretStore.loadSyncToken(this);
+            } catch (Exception error) {
+                Toast.makeText(this, "Не удалось открыть защищённый mesh-токен", Toast.LENGTH_LONG).show();
+                return;
+            }
+        }
         if (token.isEmpty()) token = randomToken();
         if (token.length() < 32) {
             Toast.makeText(this, "Mesh-токен должен содержать не менее 32 символов", Toast.LENGTH_LONG).show();
             return;
         }
-        getSharedPreferences(PREFS, MODE_PRIVATE).edit()
-                .putString(KEY_RELAY, relay)
-                .putString(KEY_TOKEN, token)
-                .apply();
-        syncToken.setText(token);
+        try {
+            SecretStore.saveSyncToken(this, token);
+        } catch (Exception error) {
+            Toast.makeText(this, "Не удалось защитить mesh-токен в Android Keystore", Toast.LENGTH_LONG).show();
+            return;
+        }
+        hasStoredToken = true;
+        getSharedPreferences(PREFS, MODE_PRIVATE).edit().putString(KEY_RELAY, relay).apply();
+        syncToken.setText("");
+        syncToken.setHint("mesh-токен защищён на устройстве");
         Intent service = new Intent(this, NodeService.class)
-                .putExtra(NodeService.EXTRA_RELAY, relay)
-                .putExtra(NodeService.EXTRA_TOKEN, token);
+                .putExtra(NodeService.EXTRA_RELAY, relay);
         ContextCompat.startForegroundService(this, service);
         serverOrigin = RustNode.localOrigin();
         setup.setVisibility(View.GONE);

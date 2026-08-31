@@ -20,21 +20,26 @@ import java.util.Collections;
 
 public class NodeService extends Service {
     public static final String EXTRA_RELAY = "relay";
-    public static final String EXTRA_TOKEN = "token";
     private static final String TAG = "MeshKeeperRustNode";
     private Thread nodeThread;
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
-        String relay = intent == null ? null : intent.getStringExtra(EXTRA_RELAY);
-        String token = intent == null ? null : intent.getStringExtra(EXTRA_TOKEN);
-        if (relay == null) relay = getSharedPreferences("meshkeeper", MODE_PRIVATE).getString("relay", "");
-        if (token == null) token = getSharedPreferences("meshkeeper", MODE_PRIVATE).getString("sync_token", "");
         Notification n = notification();
         if (Build.VERSION.SDK_INT >= 34) {
             startForeground(7, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC);
         } else {
             startForeground(7, n);
+        }
+        String relay = intent == null ? null : intent.getStringExtra(EXTRA_RELAY);
+        if (relay == null) relay = getSharedPreferences("meshkeeper", MODE_PRIVATE).getString("relay", "");
+        String token;
+        try {
+            token = SecretStore.loadSyncToken(this);
+        } catch (Exception error) {
+            Log.e(TAG, "Не удалось расшифровать mesh-токен", error);
+            stopSelf();
+            return START_NOT_STICKY;
         }
         if (nodeThread == null || !nodeThread.isAlive()) {
             final String upstream = relay == null ? "" : relay;
