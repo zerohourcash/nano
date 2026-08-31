@@ -9,6 +9,17 @@ use sha2::{Digest, Sha256};
 const DOMAIN: &str = "everyday/device-request/v1";
 const MAX_CLOCK_SKEW_SECONDS: i64 = 24 * 60 * 60;
 
+#[derive(Clone, Debug)]
+pub struct Proof {
+    pub device_id: String,
+    pub public_key: String,
+    pub nonce: String,
+    pub signature: String,
+    pub request_hash: String,
+    pub timestamp: String,
+    pub path: String,
+}
+
 pub fn requires_signature(procedure: &str) -> bool {
     matches!(
         procedure,
@@ -105,7 +116,7 @@ pub fn verify_request(
     path: &str,
     body: &[u8],
     headers: &HeaderMap,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Proof> {
     let device_id = header(headers, "x-everyday-device")?;
     let nonce = header(headers, "x-everyday-nonce")?;
     let timestamp = header(headers, "x-everyday-timestamp")?;
@@ -123,7 +134,7 @@ pub fn verify_request(
     )?;
     let body_hash = hex::encode(Sha256::digest(body));
     let message = format!("{DOMAIN}\nPOST\n{path}\n{timestamp}\n{nonce}\n{body_hash}");
-    let pk_raw = URL_SAFE_NO_PAD.decode(public_key)?;
+    let pk_raw = URL_SAFE_NO_PAD.decode(&public_key)?;
     let key =
         VerifyingKey::from_bytes(&pk_raw.try_into().map_err(|_| anyhow::anyhow!("bad key"))?)?;
     let sig = Signature::from_slice(&URL_SAFE_NO_PAD.decode(signature)?)?;
@@ -136,7 +147,34 @@ pub fn verify_request(
         "UPDATE user_devices SET last_seen_at=?1 WHERE device_id=?2",
         params![Utc::now().to_rfc3339(), device_id],
     )?;
+    Ok(Proof {
+        device_id: device_id.to_owned(),
+        public_key,
+        nonce: nonce.to_owned(),
+        signature: signature.to_owned(),
+        request_hash: body_hash,
+        timestamp: timestamp.to_owned(),
+        path: path.to_owned(),
+    })
+}
+
+pub fn set_pending(conn: &Connection, user_id: i64, proof: &Proof) -> anyhow::Result<()> {
+    conn.execute(
+        "INSERT INTO pending_device_proofs(user_id,device_id,public_key,nonce,signature,request_hash,request_timestamp,request_path)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8)
+         ON CONFLICT(user_id) DO UPDATE SET device_id=excluded.device_id,public_key=excluded.public_key,nonce=excluded.nonce,signature=excluded.signature,request_hash=excluded.request_hash,request_timestamp=excluded.request_timestamp,request_path=excluded.request_path",
+        params![user_id,proof.device_id,proof.public_key,proof.nonce,proof.signature,proof.request_hash,proof.timestamp,proof.path],
+    )?;
     Ok(())
+}
+
+pub fn clear_pending(conn: &Connection, user_id: Option<i64>) {
+    if let Some(user_id) = user_id {
+        let _ = conn.execute(
+            "DELETE FROM pending_device_proofs WHERE user_id=?1",
+            [user_id],
+        );
+    }
 }
 
 #[cfg(test)]

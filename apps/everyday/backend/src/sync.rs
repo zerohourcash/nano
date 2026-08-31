@@ -185,7 +185,7 @@ pub fn export_journal(conn: &Connection) -> Value {
     }
     let mut history = Vec::new();
     if let Ok(mut stmt) = conn.prepare(
-        "SELECT id, workspace_id, item_id, type, actor_user_id, from_label, to_label, quantity_delta, comment, hash, created_at, guid, prev_hash, signature, pubkey FROM history_entries ORDER BY id",
+        "SELECT id, workspace_id, item_id, type, actor_user_id, from_label, to_label, quantity_delta, comment, hash, created_at, guid, prev_hash, signature, pubkey,event_version,request_device_id,request_public_key,request_nonce,request_signature,request_hash,request_timestamp,request_path FROM history_entries ORDER BY id",
     ) {
         for row in stmt.query_map([], |r| {
             let ws: i64 = r.get(1)?;
@@ -206,6 +206,14 @@ pub fn export_journal(conn: &Connection) -> Value {
                 "prevHash": r.get::<_, Option<String>>(12)?,
                 "signature": r.get::<_, Option<String>>(13)?,
                 "pubkey": r.get::<_, Option<String>>(14)?,
+                "eventVersion": r.get::<_, i64>(15)?,
+                "requestDeviceId": r.get::<_, Option<String>>(16)?,
+                "requestPublicKey": r.get::<_, Option<String>>(17)?,
+                "requestNonce": r.get::<_, Option<String>>(18)?,
+                "requestSignature": r.get::<_, Option<String>>(19)?,
+                "requestHash": r.get::<_, Option<String>>(20)?,
+                "requestTimestamp": r.get::<_, Option<String>>(21)?,
+                "requestPath": r.get::<_, Option<String>>(22)?,
             }))
         }).into_iter().flatten().flatten() {
             history.push(row);
@@ -584,8 +592,8 @@ pub fn import_journal(conn: &Connection, journal: &Value) -> Value {
                 .and_then(|g| id_by_guid(conn, "users", g))
                 .unwrap_or(1);
             let _ = conn.execute(
-                "INSERT OR IGNORE INTO history_entries (workspace_id, item_id, type, actor_user_id, from_label, to_label, quantity_delta, comment, hash, created_at, guid, prev_hash, signature, pubkey)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+                "INSERT OR IGNORE INTO history_entries (workspace_id,item_id,type,actor_user_id,from_label,to_label,quantity_delta,comment,hash,created_at,guid,prev_hash,signature,pubkey,event_version,request_device_id,request_public_key,request_nonce,request_signature,request_hash,request_timestamp,request_path)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22)",
                 params![
                     ws, item,
                     h.get("type").and_then(|v| v.as_str()).unwrap_or("update"),
@@ -599,7 +607,15 @@ pub fn import_journal(conn: &Connection, journal: &Value) -> Value {
                     h.get("guid").and_then(|v| v.as_str()),
                     h.get("prevHash").and_then(|v| v.as_str()),
                     h.get("signature").and_then(|v| v.as_str()),
-                    h.get("pubkey").and_then(|v| v.as_str())
+                    h.get("pubkey").and_then(|v| v.as_str()),
+                    h.get("eventVersion").and_then(Value::as_i64).unwrap_or(1),
+                    h.get("requestDeviceId").and_then(Value::as_str),
+                    h.get("requestPublicKey").and_then(Value::as_str),
+                    h.get("requestNonce").and_then(Value::as_str),
+                    h.get("requestSignature").and_then(Value::as_str),
+                    h.get("requestHash").and_then(Value::as_str),
+                    h.get("requestTimestamp").and_then(Value::as_str),
+                    h.get("requestPath").and_then(Value::as_str)
                 ],
             );
             ops += 1;
@@ -821,7 +837,17 @@ pub fn guess_lan_base() -> String {
 }
 
 pub fn apply_remote_journal(conn: &Connection, journal: &Value, peer_url: &str) -> Value {
+    if let Err(error) = conn.execute_batch("SAVEPOINT verified_sync") {
+        return json!({"ok":false,"error":error.to_string()});
+    }
     let result = import_journal(conn, journal);
+    if let Err(error) = ledger::verify_all(conn) {
+        let _ = conn.execute_batch("ROLLBACK TO verified_sync; RELEASE verified_sync");
+        return json!({"ok":false,"error":format!("Криптографическая проверка входящего журнала: {error}")});
+    }
+    if let Err(error) = conn.execute_batch("RELEASE verified_sync") {
+        return json!({"ok":false,"error":error.to_string()});
+    }
     let name = journal.get("nodeName").and_then(|v| v.as_str());
     let nid = journal.get("nodeId").and_then(|v| v.as_str());
     add_peer(conn, peer_url, name, nid);

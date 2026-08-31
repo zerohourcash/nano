@@ -1,0 +1,76 @@
+import { expect, test, type Page } from '@playwright/test'
+
+async function trpc<T>(page: Page, procedure: string, input: unknown, mutation = true): Promise<T> {
+  return page.evaluate(
+    async ({ procedure, input, mutation }) => {
+      const envelope = JSON.stringify({ 0: { json: input } })
+      const suffix = mutation ? '?batch=1' : `?batch=1&input=${encodeURIComponent(envelope)}`
+      const response = await fetch(`/api/trpc/${procedure}${suffix}`, {
+        method: mutation ? 'POST' : 'GET',
+        headers: mutation ? { 'content-type': 'application/json' } : undefined,
+        body: mutation ? envelope : undefined,
+      })
+      if (!response.ok) throw new Error(`${procedure}: HTTP ${response.status} ${await response.text()}`)
+      const payload = (await response.json()) as Array<{
+        result?: { data?: { json?: unknown } }
+        error?: { json?: { message?: string } }
+      }>
+      if (payload[0]?.error) throw new Error(payload[0].error.json?.message ?? `${procedure} failed`)
+      return payload[0]?.result?.data?.json as T
+    },
+    { procedure, input, mutation },
+  )
+}
+
+test('browser signs a real custody transaction and ledger retains its proof', async ({ page }) => {
+  await page.goto('/')
+  await expect(page.getByRole('heading', { name: 'Новая организация' })).toBeVisible()
+
+  await page.getByPlaceholder('Алексей Кузнецов').fill('Елена Владелец')
+  await page.getByPlaceholder('+7 (921) 555-01-42').fill('79001112233')
+  await page.getByPlaceholder('Придумайте пароль').fill('StrongPassword123!')
+  await page.getByPlaceholder('ООО «СтройМонтаж»').fill('E2E Объект')
+  await page.getByText('Соглашаюсь с').click()
+  await page.getByRole('button', { name: 'Создать организацию' }).click()
+  await expect(page).toHaveURL(/\/$/, { timeout: 10_000 })
+
+  const workspaces = await trpc<Array<{ id: number }>>(page, 'meta.workspaces', null, false)
+  const category = await trpc<{ id: number }>(page, 'admin.dictionaries.create', {
+    workspaceId: workspaces[0].id,
+    kind: 'categories',
+    name: 'Электроинструмент',
+  })
+
+  const storages = await trpc<Array<{ id: number }>>(page, 'admin.storages.list', {
+    workspaceId: workspaces[0].id,
+  }, false)
+  const item = await trpc<{ id: number }>(page, 'items.create', {
+    workspaceId: workspaces[0].id,
+    title: 'Перфоратор E2E',
+    internalId: 'E2E-0001',
+    categoryId: category.id,
+    storageId: storages[0].id,
+  })
+  const itemId = item.id
+  await page.goto(`/tool/${itemId}`)
+  await page.getByRole('button', { name: 'Взять', exact: true }).first().click()
+  await expect(page.getByText('Взять: Перфоратор E2E')).toBeVisible()
+  await page.getByRole('checkbox').last().check()
+  await page.getByRole('button', { name: 'Взять', exact: true }).last().click()
+  await expect(page.getByText('Инструмент теперь у вас')).toBeVisible({ timeout: 10_000 })
+
+  const itemAfterTake = await trpc<{
+    history: Array<{
+      type: string
+      eventVersion?: number
+      requestDeviceId?: string
+      requestNonce?: string
+      requestHash?: string
+    }>
+  }>(page, 'items.byId', { id: itemId }, false)
+  const event = itemAfterTake.history.find((entry) => entry.type === 'transfer_receive')
+  expect(event).toMatchObject({ eventVersion: 2 })
+  expect(event?.requestDeviceId).toBeTruthy()
+  expect(event?.requestNonce).toBeTruthy()
+  expect(event?.requestHash).toMatch(/^[a-f0-9]{64}$/)
+})

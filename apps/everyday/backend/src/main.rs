@@ -193,14 +193,16 @@ async fn trpc(
         .any(|(procedure, _)| device::requires_signature(procedure))
     {
         let verified = uid.ok_or("Войдите в систему").and_then(|user_id| {
-            device::verify_request(
+            let proof = device::verify_request(
                 &conn,
                 user_id,
                 &format!("/api/trpc/{procedures}"),
                 &body,
                 &headers,
             )
-            .map_err(|_| "Требуется действительная подпись устройства")
+            .map_err(|_| "Требуется действительная подпись устройства")?;
+            device::set_pending(&conn, user_id, &proof)
+                .map_err(|_| "Не удалось привязать подпись к операции")
         });
         if let Err(message) = verified {
             return (
@@ -241,6 +243,7 @@ async fn trpc(
             Err(e) => out.push(err_payload(&e)),
         }
     }
+    device::clear_pending(&conn, uid);
     let body = if batched || out.len() != 1 {
         Value::Array(out)
     } else {

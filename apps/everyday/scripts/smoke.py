@@ -146,6 +146,18 @@ show("take", take)
 check("take succeeds", "__err" not in take)
 after = owner.call("items.byId", {"id": item_id}, mutation=False)
 show("item after take", {k: after.get(k) for k in ("id", "statusName", "status", "responsibleUserId", "dueAt")} if isinstance(after, dict) else after)
+take_event = next(
+    (entry for entry in after.get("history", []) if entry.get("type") == "transfer_receive"),
+    {},
+)
+check(
+    "device proof embedded into V2 ledger event",
+    take_event.get("eventVersion") == 2
+    and take_event.get("requestDeviceId") == owner.signer.device_id
+    and bool(take_event.get("requestNonce"))
+    and bool(take_event.get("requestHash")),
+    str(take_event)[:220],
+)
 ret = owner.call("transfers.returnItem", {"itemId": item_id})
 show("return", ret)
 check("return succeeds", "__err" not in ret)

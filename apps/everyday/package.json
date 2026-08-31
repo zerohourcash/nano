@@ -18,6 +18,7 @@
     "check": "tsc -b",
     "format": "prettier --write .",
     "test": "vitest run",
+    "test:e2e": "npm run build && playwright test",
     "smoke": "python3 scripts/smoke_runner.py",
     "sync:test": "python3 scripts/sync_test.py",
     "import:facekit": "node scripts/import-facekit-snapshot.mjs",
@@ -92,6 +93,7 @@
   "devDependencies": {
     "@eslint/js": "^9.39.1",
     "@hono/vite-dev-server": "^0.19.0",
+    "@playwright/test": "^1.62.1",
     "@types/better-sqlite3": "^9.6.0",
     "@types/node": "^24.10.1",
     "@types/react": "^19.2.5",

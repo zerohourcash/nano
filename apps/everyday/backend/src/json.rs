@@ -358,7 +358,7 @@ fn item_comments(conn: &Connection, item_id: i64) -> Vec<Value> {
 pub fn item_history(conn: &Connection, item_id: i64) -> Vec<Value> {
     let mut stmt = conn
         .prepare(
-            "SELECT id, workspace_id, item_id, type, actor_user_id, from_label, to_label, quantity_delta, comment, hash, created_at, photo_url
+            "SELECT id, workspace_id, item_id, type, actor_user_id, from_label, to_label, quantity_delta, comment, hash, created_at, photo_url,event_version,request_device_id,request_nonce,request_hash
              FROM history_entries WHERE item_id=?1 ORDER BY id DESC LIMIT 500",
         )
         .unwrap();
@@ -378,6 +378,10 @@ pub fn item_history(conn: &Connection, item_id: i64) -> Vec<Value> {
             "opId": r.get::<_, String>(9)?,
             "createdAt": r.get::<_, String>(10)?,
             "photoUrl": r.get::<_, Option<String>>(11)?,
+            "eventVersion": r.get::<_, i64>(12)?,
+            "requestDeviceId": r.get::<_, Option<String>>(13)?,
+            "requestNonce": r.get::<_, Option<String>>(14)?,
+            "requestHash": r.get::<_, Option<String>>(15)?,
             "actor": user_public(conn, actor).unwrap_or(Value::Null),
             "item": item_id.and_then(|i| item_json(conn, i, false)).unwrap_or(Value::Null)
         }))

@@ -13,6 +13,10 @@ pub fn open(path: &Path) -> Result<Connection> {
     conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
     init_schema(&conn)?;
     migrate(&conn)?;
+    // Request proofs are an in-process hand-off between HTTP verification and
+    // ledger append. They must never survive a crash/restart and be reused by
+    // an unrelated operation.
+    conn.execute("DELETE FROM pending_device_proofs", [])?;
     if std::env::var("MESHKEEPER_DEMO_DATA").as_deref() == Ok("1") {
         seed_if_empty(&conn)?;
     }
@@ -72,6 +76,38 @@ fn migrate(conn: &Connection) -> Result<()> {
     let _ = conn.execute("ALTER TABLE workspaces ADD COLUMN guid TEXT", []);
     let _ = conn.execute("ALTER TABLE workspaces ADD COLUMN sync_url TEXT", []);
     let _ = conn.execute("ALTER TABLE history_entries ADD COLUMN guid TEXT", []);
+    let _ = conn.execute(
+        "ALTER TABLE history_entries ADD COLUMN event_version INTEGER NOT NULL DEFAULT 1",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE history_entries ADD COLUMN request_device_id TEXT",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE history_entries ADD COLUMN request_public_key TEXT",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE history_entries ADD COLUMN request_nonce TEXT",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE history_entries ADD COLUMN request_signature TEXT",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE history_entries ADD COLUMN request_hash TEXT",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE history_entries ADD COLUMN request_timestamp TEXT",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE history_entries ADD COLUMN request_path TEXT",
+        [],
+    );
     let _ = conn.execute(
         "ALTER TABLE transfers ADD COLUMN needs_admin INTEGER NOT NULL DEFAULT 0",
         [],
@@ -217,6 +253,16 @@ fn migrate(conn: &Connection) -> Result<()> {
           nonce TEXT NOT NULL,
           used_at TEXT NOT NULL,
           PRIMARY KEY(device_id,nonce)
+        );
+        CREATE TABLE IF NOT EXISTS pending_device_proofs (
+          user_id INTEGER PRIMARY KEY,
+          device_id TEXT NOT NULL,
+          public_key TEXT NOT NULL,
+          nonce TEXT NOT NULL,
+          signature TEXT NOT NULL,
+          request_hash TEXT NOT NULL,
+          request_timestamp TEXT NOT NULL,
+          request_path TEXT NOT NULL
         );
         CREATE UNIQUE INDEX IF NOT EXISTS user_workspaces_pair_uq
           ON user_workspaces(user_id, workspace_id);
@@ -445,6 +491,14 @@ fn init_schema(conn: &Connection) -> Result<()> {
           hash TEXT NOT NULL,
           signature TEXT,
           pubkey TEXT,
+          event_version INTEGER NOT NULL DEFAULT 1,
+          request_device_id TEXT,
+          request_public_key TEXT,
+          request_nonce TEXT,
+          request_signature TEXT,
+          request_hash TEXT,
+          request_timestamp TEXT,
+          request_path TEXT,
           created_at TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS inventory_sessions (
