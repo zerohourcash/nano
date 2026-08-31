@@ -1295,12 +1295,11 @@ pub fn apply_remote_journal(conn: &Connection, journal: &Value, peer_url: &str) 
 }
 
 fn enforce_node_trust(conn: &Connection, journal: &Value, peer_url: &str) -> anyhow::Result<()> {
-    enforce_node_trust_mode(
-        conn,
-        journal,
-        peer_url,
-        std::env::var("MESHKEEPER_STRICT_NODE_TRUST").as_deref() == Ok("1"),
-    )
+    enforce_node_trust_mode(conn, journal, peer_url, strict_node_trust())
+}
+
+fn strict_node_trust() -> bool {
+    std::env::var("MESHKEEPER_STRICT_NODE_TRUST").as_deref() != Ok("0")
 }
 
 fn enforce_node_trust_mode(
@@ -1346,7 +1345,7 @@ pub fn node_keys(conn: &Connection) -> Value {
     if let Ok(mut s)=conn.prepare("SELECT public_key,label,approved_by,source,created_at FROM trusted_node_keys ORDER BY created_at") {if let Ok(rows)=s.query_map([],|r|Ok(json!({"publicKey":r.get::<_,String>(0)?,"label":r.get::<_,Option<String>>(1)?,"approvedBy":r.get::<_,Option<i64>>(2)?,"source":r.get::<_,String>(3)?,"createdAt":r.get::<_,String>(4)?}))){trusted.extend(rows.flatten())}}
     let mut pending = Vec::new();
     if let Ok(mut s)=conn.prepare("SELECT public_key,peer_url,node_name,first_seen,last_seen FROM pending_node_keys ORDER BY last_seen DESC") {if let Ok(rows)=s.query_map([],|r|Ok(json!({"publicKey":r.get::<_,String>(0)?,"peerUrl":r.get::<_,Option<String>>(1)?,"nodeName":r.get::<_,Option<String>>(2)?,"firstSeen":r.get::<_,String>(3)?,"lastSeen":r.get::<_,String>(4)?}))){pending.extend(rows.flatten())}}
-    json!({"strict":std::env::var("MESHKEEPER_STRICT_NODE_TRUST").as_deref()==Ok("1"),"trusted":trusted,"pending":pending})
+    json!({"strict":strict_node_trust(),"trusted":trusted,"pending":pending})
 }
 
 pub fn approve_node_key(

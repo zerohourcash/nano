@@ -81,6 +81,7 @@ class Node:
             "MESHKEEPER_BIND": f"127.0.0.1:{port}",
             "MESHKEEPER_DEMO_DATA": "0",
             "MESHKEEPER_DEMO_LOGIN": "0",
+            "MESHKEEPER_STRICT_NODE_TRUST": "0",
             **env_extra,
         }
         self.proc = self._spawn()
