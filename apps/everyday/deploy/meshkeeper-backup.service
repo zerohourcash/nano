@@ -1,0 +1,9 @@
+[Unit]
+Description=Резервная копия базы MeshKeeper
+After=meshkeeper.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/meshkeeper/meshkeeper.env
+Environment=MESHKEEPER_DB=/var/lib/meshkeeper/meshkeeper.db
+ExecStart=/usr/local/sbin/meshkeeper-backup

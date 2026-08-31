@@ -1,0 +1,915 @@
+use crate::{db, json as jsn, ledger};
+use rusqlite::{params, Connection, OptionalExtension};
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+
+/// Запрос немедленной синхронизации из UI. Обработчик API не может сам сходить
+/// в сеть (он держит блокировку базы), поэтому просто поднимает флаг, а цикл
+/// обмена подхватывает его в течение секунды.
+static SYNC_NOW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn sync_invites_enabled() -> bool {
+    std::env::var("MESHKEEPER_SYNC_INVITES").as_deref() == Ok("1")
+}
+
+pub fn request_sync_now() {
+    SYNC_NOW.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn take_sync_request() -> bool {
+    SYNC_NOW.swap(false, std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn kv_get(conn: &Connection, k: &str) -> Option<String> {
+    conn.query_row("SELECT v FROM kv WHERE k=?1", params![k], |r| r.get(0))
+        .optional()
+        .ok()
+        .flatten()
+}
+
+pub fn kv_set(conn: &Connection, k: &str, v: &str) {
+    let _ = conn.execute(
+        "INSERT INTO kv(k,v) VALUES(?1,?2) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+        params![k, v],
+    );
+}
+
+pub fn ensure_node(conn: &Connection) -> (String, String) {
+    if let (Some(id), Some(name)) = (kv_get(conn, "node_id"), kv_get(conn, "node_name")) {
+        return (id, name);
+    }
+    let id = uuid::Uuid::new_v4().to_string().replace('-', "");
+    let name = std::env::var("MESHKEEPER_NAME").unwrap_or_else(|_| {
+        std::env::var("COMPUTERNAME")
+            .or_else(|_| std::env::var("HOSTNAME"))
+            .unwrap_or_else(|_| "MeshKeeper".into())
+    });
+    kv_set(conn, "node_id", &id);
+    kv_set(conn, "node_name", &name);
+    (id, name)
+}
+
+fn guid_of(conn: &Connection, table: &str, id: i64) -> String {
+    let sql = format!("SELECT guid FROM {table} WHERE id=?1");
+    conn.query_row(&sql, params![id], |r| r.get::<_, Option<String>>(0))
+        .ok()
+        .flatten()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| {
+            let g = uuid::Uuid::new_v4().to_string().replace('-', "");
+            let _ = conn.execute(
+                &format!("UPDATE {table} SET guid=?1 WHERE id=?2"),
+                params![g, id],
+            );
+            g
+        })
+}
+
+pub fn hello(conn: &Connection) -> Value {
+    let (id, name) = ensure_node(conn);
+    json!({
+        "ok": true,
+        "nodeId": id,
+        "name": name,
+        "protocol": "meshkeeper-sync/2",
+        "ledger": "audit-log"
+    })
+}
+
+pub fn export_journal(conn: &Connection) -> Value {
+    let (node_id, name) = ensure_node(conn);
+    let _ = db::fill_guids(conn);
+    let mut workspaces = Vec::new();
+    if let Ok(mut stmt) =
+        conn.prepare("SELECT id, name, timezone, internal_id_prefix, comment, guid FROM workspaces")
+    {
+        for row in stmt
+            .query_map([], |r| {
+                Ok(json!({
+                    "id": r.get::<_, i64>(0)?,
+                    "name": r.get::<_, String>(1)?,
+                    "timezone": r.get::<_, String>(2)?,
+                    "internalIdPrefix": r.get::<_, String>(3)?,
+                    "comment": r.get::<_, Option<String>>(4)?,
+                    "guid": r.get::<_, Option<String>>(5)?,
+                }))
+            })
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            workspaces.push(row);
+        }
+    }
+    let mut users = Vec::new();
+    if let Ok(mut stmt) = conn.prepare("SELECT id, full_name, position, phone, status, role_rights, checkout_policy, guid, password_hash FROM users") {
+        for row in stmt.query_map([], |r| {
+            Ok(json!({
+                "id": r.get::<_, i64>(0)?,
+                "fullName": r.get::<_, String>(1)?,
+                "position": r.get::<_, Option<String>>(2)?,
+                "phone": r.get::<_, String>(3)?,
+                "status": r.get::<_, String>(4)?,
+                "roleRights": r.get::<_, Option<String>>(5)?,
+                "checkoutPolicy": r.get::<_, Option<String>>(6)?,
+                "guid": r.get::<_, Option<String>>(7)?,
+                "passwordHash": r.get::<_, Option<String>>(8)?,
+            }))
+        }).into_iter().flatten().flatten() {
+            users.push(row);
+        }
+    }
+    let mut items = Vec::new();
+    if let Ok(mut stmt) = conn.prepare(
+        "SELECT id, internal_id, title, category_id, status_id, responsible_user_id, workspace_id, serial_number, qr_code, due_at, guid, calibrated_until, min_quantity, quantitative, quantity, unit, cost, comment, source_system, external_id, metadata_json FROM items",
+    ) {
+        for row in stmt.query_map([], |r| {
+            let id: i64 = r.get(0)?;
+            let resp: Option<i64> = r.get(5)?;
+            let ws: i64 = r.get(6)?;
+            let st: Option<i64> = r.get(4)?;
+            let slug: Option<String> = st.and_then(|sid| {
+                conn.query_row("SELECT slug FROM statuses WHERE id=?1", params![sid], |x| x.get(0)).ok()
+            });
+            Ok(json!({
+                "guid": r.get::<_, Option<String>>(10)?,
+                "internalId": r.get::<_, String>(1)?,
+                "title": r.get::<_, String>(2)?,
+                "workspaceGuid": guid_of(conn, "workspaces", ws),
+                "responsibleGuid": resp.map(|u| guid_of(conn, "users", u)),
+                "serialNumber": r.get::<_, Option<String>>(7)?,
+                "qrCode": r.get::<_, Option<String>>(8)?,
+                "dueAt": r.get::<_, Option<String>>(9)?,
+                "calibratedUntil": r.get::<_, Option<String>>(11)?,
+                "minQuantity": r.get::<_, Option<f64>>(12)?,
+                "quantitative": r.get::<_, i64>(13)? != 0,
+                "quantity": r.get::<_, Option<f64>>(14)?,
+                "unit": r.get::<_, Option<String>>(15)?,
+                "cost": r.get::<_, Option<f64>>(16)?,
+                "comment": r.get::<_, Option<String>>(17)?,
+                "sourceSystem": r.get::<_, Option<String>>(18)?,
+                "externalId": r.get::<_, Option<String>>(19)?,
+                "metadata": r.get::<_, Option<String>>(20)?
+                    .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+                    .unwrap_or_else(|| json!({})),
+                "statusSlug": slug,
+                "localId": id,
+            }))
+        }).into_iter().flatten().flatten() {
+            items.push(row);
+        }
+    }
+    let mut history = Vec::new();
+    if let Ok(mut stmt) = conn.prepare(
+        "SELECT id, workspace_id, item_id, type, actor_user_id, from_label, to_label, quantity_delta, comment, hash, created_at, guid FROM history_entries ORDER BY id",
+    ) {
+        for row in stmt.query_map([], |r| {
+            let ws: i64 = r.get(1)?;
+            let item: Option<i64> = r.get(2)?;
+            let actor: i64 = r.get(4)?;
+            Ok(json!({
+                "workspaceGuid": guid_of(conn, "workspaces", ws),
+                "itemGuid": item.map(|i| guid_of(conn, "items", i)),
+                "type": r.get::<_, String>(3)?,
+                "actorGuid": guid_of(conn, "users", actor),
+                "fromLabel": r.get::<_, Option<String>>(5)?,
+                "toLabel": r.get::<_, Option<String>>(6)?,
+                "quantityDelta": r.get::<_, Option<f64>>(7)?,
+                "comment": r.get::<_, Option<String>>(8)?,
+                "opId": r.get::<_, String>(9)?,
+                "createdAt": r.get::<_, String>(10)?,
+                "guid": r.get::<_, Option<String>>(11)?,
+            }))
+        }).into_iter().flatten().flatten() {
+            history.push(row);
+        }
+    }
+    let mut invites = Vec::new();
+    if sync_invites_enabled() {
+        if let Ok(mut stmt) = conn.prepare(
+            "SELECT token, workspace_id, role, max_uses, used_count, revoked, created_at FROM invites",
+        ) {
+            for row in stmt
+                .query_map([], |r| {
+                    let ws: i64 = r.get(1)?;
+                    Ok(json!({
+                        "token": r.get::<_, String>(0)?,
+                        "workspaceGuid": guid_of(conn, "workspaces", ws),
+                        "role": r.get::<_, String>(2)?,
+                        "maxUses": r.get::<_, i64>(3)?,
+                        "usedCount": r.get::<_, i64>(4)?,
+                        "revoked": r.get::<_, i64>(5)? != 0,
+                        "createdAt": r.get::<_, String>(6)?,
+                    }))
+                })
+                .into_iter()
+                .flatten()
+                .flatten()
+            {
+                invites.push(row);
+            }
+        }
+    }
+    let mut memberships = Vec::new();
+    if let Ok(mut stmt) =
+        conn.prepare("SELECT user_id, workspace_id, rights_json FROM user_workspaces")
+    {
+        for row in stmt
+            .query_map([], |r| {
+                Ok(json!({
+                    "userGuid": guid_of(conn, "users", r.get::<_, i64>(0)?),
+                    "workspaceGuid": guid_of(conn, "workspaces", r.get::<_, i64>(1)?),
+                    "rights": r.get::<_, Option<String>>(2)?,
+                }))
+            })
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            memberships.push(row);
+        }
+    }
+    json!({
+        "v": 1,
+        "nodeId": node_id,
+        "nodeName": name,
+        "exportedAt": chrono::Utc::now().to_rfc3339(),
+        "workspaces": workspaces,
+        "users": users,
+        "items": items,
+        "history": history,
+        "invites": invites,
+        "memberships": memberships,
+    })
+}
+
+fn upsert_workspace(conn: &Connection, w: &Value) -> i64 {
+    let guid = w.get("guid").and_then(|v| v.as_str()).unwrap_or("");
+    if !guid.is_empty() {
+        if let Ok(id) = conn.query_row(
+            "SELECT id FROM workspaces WHERE guid=?1",
+            params![guid],
+            |r| r.get::<_, i64>(0),
+        ) {
+            return id;
+        }
+    }
+    let name = w.get("name").and_then(|v| v.as_str()).unwrap_or("Группа");
+    let _ = conn.execute(
+        "INSERT INTO workspaces (name, timezone, internal_id_prefix, comment, created_at, guid) VALUES (?1,?2,?3,?4,?5,?6)",
+        params![
+            name,
+            w.get("timezone").and_then(|v| v.as_str()).unwrap_or("Europe/Moscow"),
+            w.get("internalIdPrefix").and_then(|v| v.as_str()).unwrap_or("ВН-"),
+            w.get("comment").and_then(|v| v.as_str()),
+            chrono::Utc::now().to_rfc3339(),
+            if guid.is_empty() { uuid::Uuid::new_v4().to_string().replace('-', "") } else { guid.to_string() }
+        ],
+    );
+    conn.last_insert_rowid()
+}
+
+fn upsert_user(conn: &Connection, u: &Value) -> i64 {
+    let guid = u.get("guid").and_then(|v| v.as_str()).unwrap_or("");
+    let phone = u.get("phone").and_then(|v| v.as_str()).unwrap_or("");
+    let password_hash = u.get("passwordHash").and_then(|v| v.as_str());
+    if !guid.is_empty() {
+        if let Ok(id) = conn.query_row("SELECT id FROM users WHERE guid=?1", params![guid], |r| {
+            r.get::<_, i64>(0)
+        }) {
+            fill_missing_password(conn, id, password_hash);
+            return id;
+        }
+    }
+    if !phone.is_empty() {
+        let want = db::digits_only(phone);
+        if let Ok(mut stmt) = conn.prepare("SELECT id, phone FROM users") {
+            if let Ok(rows) =
+                stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
+            {
+                let found: Vec<(i64, String)> = rows.filter_map(|x| x.ok()).collect();
+                if let Some((id, _)) = found.into_iter().find(|(_, p)| db::digits_only(p) == want) {
+                    fill_missing_password(conn, id, password_hash);
+                    return id;
+                }
+            }
+        }
+    }
+    let name = u
+        .get("fullName")
+        .and_then(|v| v.as_str())
+        .unwrap_or("Участник");
+    let _ = conn.execute(
+        "INSERT INTO users (full_name, position, phone, status, role_rights, checkout_policy, guid, password_hash, created_at)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+        params![
+            name,
+            u.get("position").and_then(|v| v.as_str()),
+            if phone.is_empty() { format!("sync-{}", &guid[..8.min(guid.len())]) } else { phone.to_string() },
+            u.get("status").and_then(|v| v.as_str()).unwrap_or("active"),
+            u.get("roleRights").and_then(|v| v.as_str()).unwrap_or(""),
+            u.get("checkoutPolicy").and_then(|v| v.as_str()),
+            if guid.is_empty() { uuid::Uuid::new_v4().to_string().replace('-', "") } else { guid.to_string() },
+            password_hash,
+            chrono::Utc::now().to_rfc3339()
+        ],
+    );
+    conn.last_insert_rowid()
+}
+
+/// Проставляет хеш пароля, если локально его ещё нет. Существующий хеш
+/// не трогаем: входящая копия может быть старее локальной.
+fn fill_missing_password(conn: &Connection, user_id: i64, incoming: Option<&str>) {
+    let Some(hash) = incoming.filter(|h| !h.is_empty()) else {
+        return;
+    };
+    let _ = conn.execute(
+        "UPDATE users SET password_hash=?1
+         WHERE id=?2 AND (password_hash IS NULL OR password_hash='')",
+        params![hash, user_id],
+    );
+}
+
+fn id_by_guid(conn: &Connection, table: &str, guid: &str) -> Option<i64> {
+    if guid.is_empty() {
+        return None;
+    }
+    let sql = format!("SELECT id FROM {table} WHERE guid=?1");
+    conn.query_row(&sql, params![guid], |r| r.get(0)).ok()
+}
+
+fn status_id(conn: &Connection, ws: i64, slug: &str) -> Option<i64> {
+    conn.query_row(
+        "SELECT id FROM statuses WHERE workspace_id=?1 AND slug=?2",
+        params![ws, slug],
+        |r| r.get(0),
+    )
+    .ok()
+}
+
+pub fn import_journal(conn: &Connection, journal: &Value) -> Value {
+    let mut workspaces = 0u32;
+    let mut users = 0u32;
+    let mut items_n = 0u32;
+    let mut ops = 0u32;
+    let mut skipped = 0u32;
+    let mut conflicts = 0u32;
+
+    if let Some(arr) = journal.get("workspaces").and_then(|v| v.as_array()) {
+        for w in arr {
+            upsert_workspace(conn, w);
+            workspaces += 1;
+        }
+    }
+    if let Some(arr) = journal.get("users").and_then(|v| v.as_array()) {
+        for u in arr {
+            upsert_user(conn, u);
+            users += 1;
+        }
+    }
+    if let Some(arr) = journal.get("items").and_then(|v| v.as_array()) {
+        for it in arr {
+            let guid = it.get("guid").and_then(|v| v.as_str()).unwrap_or("");
+            let ws_g = it
+                .get("workspaceGuid")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let Some(ws) = id_by_guid(conn, "workspaces", ws_g) else {
+                continue;
+            };
+            let resp_g = it.get("responsibleGuid").and_then(|v| v.as_str());
+            let resp = resp_g.and_then(|g| id_by_guid(conn, "users", g));
+            let slug = it
+                .get("statusSlug")
+                .and_then(|v| v.as_str())
+                .unwrap_or("in-stock");
+            let st = status_id(conn, ws, slug);
+            if !guid.is_empty() {
+                if let Some(local_id) = id_by_guid(conn, "items", guid) {
+                    let local_resp: Option<i64> = conn
+                        .query_row(
+                            "SELECT responsible_user_id FROM items WHERE id=?1",
+                            params![local_id],
+                            |r| r.get(0),
+                        )
+                        .ok()
+                        .flatten();
+                    if local_resp.is_some() && resp.is_some() && local_resp != resp {
+                        let desc = format!(
+                            "Двое взяли один предмет офлайн: локально {:?} / входящий {:?}",
+                            local_resp, resp
+                        );
+                        let _ = conn.execute(
+                            "INSERT INTO conflicts (workspace_id, item_id, item_guid, description, left_label, right_label, created_at)
+                             VALUES (?1,?2,?3,?4,?5,?6,?7)",
+                            params![
+                                ws,
+                                local_id,
+                                guid,
+                                desc,
+                                format!("user:{:?}", local_resp),
+                                format!("user:{:?}", resp),
+                                chrono::Utc::now().to_rfc3339()
+                            ],
+                        );
+                        if let Some(st_id) = status_id(conn, ws, "needs-check") {
+                            let _ = conn.execute(
+                                "UPDATE items SET responsible_user_id=NULL, status_id=?1 WHERE id=?2",
+                                params![st_id, local_id],
+                            );
+                        }
+                        notify_conflict(conn, ws, local_id, &desc);
+                        conflicts += 1;
+                    } else {
+                        let incoming_title = it.get("title").and_then(|v| v.as_str()).unwrap_or("");
+                        let title_ok = !incoming_title.is_empty()
+                            && !incoming_title.contains('Ã')
+                            && !incoming_title.contains('\u{FFFD}');
+                        let _ = conn.execute(
+                            "UPDATE items SET title=CASE WHEN ?5 THEN COALESCE(?2,title) ELSE title END,
+                             due_at=COALESCE(?3,due_at), responsible_user_id=?4,
+                             source_system=COALESCE(?6,source_system), external_id=COALESCE(?7,external_id),
+                             metadata_json=COALESCE(?8,metadata_json) WHERE id=?1",
+                            params![local_id, incoming_title, it.get("dueAt").and_then(|v| v.as_str()), resp, title_ok as i64,
+                                it.get("sourceSystem").and_then(|v| v.as_str()),
+                                it.get("externalId").and_then(|v| v.as_str()),
+                                it.get("metadata").filter(|v| v.is_object()).map(Value::to_string)],
+                        );
+                    }
+                    items_n += 1;
+                    continue;
+                }
+            }
+            let title = it
+                .get("title")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Инструмент");
+            let internal = it
+                .get("internalId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("ВН-0000");
+            let _ = conn.execute(
+                "INSERT INTO items (internal_id, title, status_id, responsible_user_id, workspace_id, serial_number, qr_code, due_at, guid, calibrated_until, min_quantity, quantitative, quantity, unit, cost, comment, source_system, external_id, metadata_json, created_at)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
+                params![
+                    internal, title, st, resp, ws,
+                    it.get("serialNumber").and_then(|v| v.as_str()),
+                    it.get("qrCode").and_then(|v| v.as_str()),
+                    it.get("dueAt").and_then(|v| v.as_str()),
+                    if guid.is_empty() { uuid::Uuid::new_v4().to_string().replace('-', "") } else { guid.to_string() },
+                    it.get("calibratedUntil").and_then(|v| v.as_str()),
+                    it.get("minQuantity").and_then(|v| v.as_f64()),
+                    it.get("quantitative").and_then(|v| v.as_bool()).unwrap_or(false) as i64,
+                    it.get("quantity").and_then(|v| v.as_f64()),
+                    it.get("unit").and_then(|v| v.as_str()),
+                    it.get("cost").and_then(|v| v.as_f64()),
+                    it.get("comment").and_then(|v| v.as_str()),
+                    it.get("sourceSystem").and_then(|v| v.as_str()),
+                    it.get("externalId").and_then(|v| v.as_str()),
+                    it.get("metadata").filter(|v| v.is_object()).map(Value::to_string),
+                    chrono::Utc::now().to_rfc3339()
+                ],
+            );
+            items_n += 1;
+        }
+    }
+    if let Some(arr) = journal.get("history").and_then(|v| v.as_array()) {
+        for h in arr {
+            // opId — текущее имя поля, hash — совместимость со старыми архивами.
+            let hash = h
+                .get("opId")
+                .or_else(|| h.get("hash"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if hash.is_empty() {
+                skipped += 1;
+                continue;
+            }
+            let exists: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM history_entries WHERE hash=?1",
+                    params![hash],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+            if exists > 0 {
+                skipped += 1;
+                continue;
+            }
+            let ws_g = h
+                .get("workspaceGuid")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let Some(ws) = id_by_guid(conn, "workspaces", ws_g) else {
+                skipped += 1;
+                continue;
+            };
+            let item = h
+                .get("itemGuid")
+                .and_then(|v| v.as_str())
+                .and_then(|g| id_by_guid(conn, "items", g));
+            let actor = h
+                .get("actorGuid")
+                .and_then(|v| v.as_str())
+                .and_then(|g| id_by_guid(conn, "users", g))
+                .unwrap_or(1);
+            let _ = conn.execute(
+                "INSERT OR IGNORE INTO history_entries (workspace_id, item_id, type, actor_user_id, from_label, to_label, quantity_delta, comment, hash, created_at, guid)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+                params![
+                    ws, item,
+                    h.get("type").and_then(|v| v.as_str()).unwrap_or("update"),
+                    actor,
+                    h.get("fromLabel").and_then(|v| v.as_str()),
+                    h.get("toLabel").and_then(|v| v.as_str()),
+                    h.get("quantityDelta").and_then(|v| v.as_f64()),
+                    h.get("comment").and_then(|v| v.as_str()),
+                    hash,
+                    h.get("createdAt").and_then(|v| v.as_str()).unwrap_or(""),
+                    h.get("guid").and_then(|v| v.as_str())
+                ],
+            );
+            ops += 1;
+        }
+    }
+    if sync_invites_enabled() {
+        if let Some(arr) = journal.get("invites").and_then(|v| v.as_array()) {
+            for inv in arr {
+                let token = inv.get("token").and_then(|v| v.as_str()).unwrap_or("");
+                let ws_g = inv
+                    .get("workspaceGuid")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let Some(ws) = id_by_guid(conn, "workspaces", ws_g) else {
+                    continue;
+                };
+                if token.is_empty() {
+                    continue;
+                }
+                let exists: i64 = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM invites WHERE token=?1",
+                        params![token],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or(0);
+                if exists == 0 {
+                    let _ = conn.execute(
+                    "INSERT INTO invites (workspace_id, token, role, max_uses, used_count, revoked, created_at) VALUES (?1,?2,?3,?4,?5,?6,?7)",
+                    params![
+                        ws,
+                        token,
+                        inv.get("role").and_then(|v| v.as_str()).unwrap_or("member"),
+                        inv.get("maxUses").and_then(|v| v.as_i64()).unwrap_or(20),
+                        inv.get("usedCount").and_then(|v| v.as_i64()).unwrap_or(0),
+                        if inv.get("revoked").and_then(|v| v.as_bool()).unwrap_or(false) { 1 } else { 0 },
+                        inv.get("createdAt").and_then(|v| v.as_str()).unwrap_or("")
+                    ],
+                );
+                }
+            }
+        }
+    }
+    if let Some(arr) = journal.get("memberships").and_then(|v| v.as_array()) {
+        for m in arr {
+            let Some(user) = m
+                .get("userGuid")
+                .and_then(|v| v.as_str())
+                .and_then(|g| id_by_guid(conn, "users", g))
+            else {
+                continue;
+            };
+            let Some(ws) = m
+                .get("workspaceGuid")
+                .and_then(|v| v.as_str())
+                .and_then(|g| id_by_guid(conn, "workspaces", g))
+            else {
+                continue;
+            };
+            let exists: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM user_workspaces WHERE user_id=?1 AND workspace_id=?2",
+                    params![user, ws],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+            if exists == 0 {
+                let rights = m
+                    .get("rights")
+                    .and_then(|v| v.as_str())
+                    .filter(|v| !v.is_empty())
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| crate::db::default_rights().to_string());
+                let _ = conn.execute(
+                    "INSERT INTO user_workspaces (user_id, workspace_id, rights_json) VALUES (?1,?2,?3)",
+                    params![user, ws, rights],
+                );
+            }
+        }
+    }
+    json!({
+        "ok": true,
+        "workspaces": workspaces,
+        "users": users,
+        "items": items_n,
+        "ops": ops,
+        "skipped": skipped,
+        "conflicts": conflicts
+    })
+}
+
+fn notify_conflict(conn: &Connection, ws: i64, item_id: i64, text: &str) {
+    if let Ok(mut stmt) = conn.prepare("SELECT user_id FROM user_workspaces WHERE workspace_id=?1")
+    {
+        let ids: Vec<i64> = stmt
+            .query_map(params![ws], |r| r.get(0))
+            .ok()
+            .map(|r| r.filter_map(|x| x.ok()).collect())
+            .unwrap_or_default();
+        for uid in ids {
+            let _ = conn.execute(
+                "INSERT INTO notifications (user_id, item_id, type, title, text, created_at) VALUES (?1,?2,'system','Конфликт выдачи',?3,?4)",
+                params![uid, item_id, text, chrono::Utc::now().to_rfc3339()],
+            );
+        }
+    }
+}
+
+pub fn list_peers(conn: &Connection) -> Value {
+    let mut out = Vec::new();
+    if let Ok(mut stmt) = conn.prepare("SELECT id, node_id, url, name, last_seen, last_sync, last_error FROM peers ORDER BY id DESC") {
+        for row in stmt.query_map([], |r| {
+            Ok(json!({
+                "id": r.get::<_, i64>(0)?,
+                "nodeId": r.get::<_, Option<String>>(1)?,
+                "url": r.get::<_, String>(2)?,
+                "name": r.get::<_, Option<String>>(3)?,
+                "lastSeen": r.get::<_, Option<String>>(4)?,
+                "lastSync": r.get::<_, Option<String>>(5)?,
+                "lastError": r.get::<_, Option<String>>(6)?,
+            }))
+        }).into_iter().flatten().flatten() {
+            out.push(row);
+        }
+    }
+    Value::Array(out)
+}
+
+pub fn add_peer(conn: &Connection, url: &str, name: Option<&str>, node_id: Option<&str>) -> Value {
+    let url = url.trim().trim_end_matches('/').to_string();
+    let _ = conn.execute(
+        "INSERT INTO peers (url, name, node_id, last_seen) VALUES (?1,?2,?3,?4)
+         ON CONFLICT(url) DO UPDATE SET name=COALESCE(excluded.name, peers.name), node_id=COALESCE(excluded.node_id, peers.node_id), last_seen=excluded.last_seen",
+        params![url, name, node_id, chrono::Utc::now().to_rfc3339()],
+    );
+    json!({"ok": true, "url": url})
+}
+
+pub fn list_conflicts(conn: &Connection) -> Value {
+    let mut out = Vec::new();
+    if let Ok(mut stmt) = conn.prepare("SELECT id, workspace_id, item_id, item_guid, status, description, left_label, right_label, created_at FROM conflicts ORDER BY id DESC LIMIT 200") {
+        for row in stmt.query_map([], |r| {
+            let item_id: Option<i64> = r.get(2)?;
+            Ok(json!({
+                "id": r.get::<_, i64>(0)?,
+                "workspaceId": r.get::<_, Option<i64>>(1)?,
+                "itemId": item_id,
+                "itemGuid": r.get::<_, Option<String>>(3)?,
+                "status": r.get::<_, String>(4)?,
+                "description": r.get::<_, String>(5)?,
+                "leftLabel": r.get::<_, Option<String>>(6)?,
+                "rightLabel": r.get::<_, Option<String>>(7)?,
+                "createdAt": r.get::<_, String>(8)?,
+                "item": item_id.and_then(|i| jsn::item_json(conn, i, false)),
+            }))
+        }).into_iter().flatten().flatten() {
+            out.push(row);
+        }
+    }
+    Value::Array(out)
+}
+
+pub fn resolve_conflict(
+    conn: &Connection,
+    id: i64,
+    responsible: Option<i64>,
+    uid: i64,
+) -> anyhow::Result<Value> {
+    let (item_id, ws): (i64, i64) = conn.query_row(
+        "SELECT item_id, workspace_id FROM conflicts WHERE id=?1",
+        params![id],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    conn.execute(
+        "UPDATE conflicts SET status='resolved', resolved_at=?1, resolver_id=?2 WHERE id=?3",
+        params![chrono::Utc::now().to_rfc3339(), uid, id],
+    )?;
+    let slug = if responsible.is_some() {
+        "in-work"
+    } else {
+        "in-stock"
+    };
+    if let Some(st) = status_id(conn, ws, slug) {
+        conn.execute(
+            "UPDATE items SET responsible_user_id=?1, status_id=?2 WHERE id=?3",
+            params![responsible, st, item_id],
+        )?;
+    }
+    let _ = ledger::append(
+        conn,
+        ws,
+        uid,
+        Some(item_id),
+        "update",
+        None,
+        None,
+        None,
+        Some("Конфликт выдачи разрешён администратором"),
+    );
+    Ok(json!({"ok": true}))
+}
+
+pub fn local_http_base() -> String {
+    let bind = std::env::var("MESHKEEPER_BIND").unwrap_or_else(|_| "0.0.0.0:8080".into());
+    let port = bind.rsplit(':').next().unwrap_or("8080");
+    format!("http://127.0.0.1:{port}")
+}
+
+pub fn guess_lan_base() -> String {
+    let bind = std::env::var("MESHKEEPER_BIND").unwrap_or_else(|_| "0.0.0.0:8080".into());
+    let port = bind.rsplit(':').next().unwrap_or("8080");
+    if let Ok(sock) = std::net::UdpSocket::bind("0.0.0.0:0") {
+        let _ = sock.connect("8.8.8.8:80");
+        if let Ok(addr) = sock.local_addr() {
+            return format!("http://{}:{port}", addr.ip());
+        }
+    }
+    format!("http://127.0.0.1:{port}")
+}
+
+pub fn apply_remote_journal(conn: &Connection, journal: &Value, peer_url: &str) -> Value {
+    let result = import_journal(conn, journal);
+    let name = journal.get("nodeName").and_then(|v| v.as_str());
+    let nid = journal.get("nodeId").and_then(|v| v.as_str());
+    add_peer(conn, peer_url, name, nid);
+    let _ = conn.execute(
+        "UPDATE peers SET last_sync=?1, last_error=NULL WHERE url=?2",
+        params![
+            chrono::Utc::now().to_rfc3339(),
+            peer_url.trim().trim_end_matches('/')
+        ],
+    );
+    result
+}
+
+pub fn encrypt_backup(password: &str, plain: &str) -> anyhow::Result<Value> {
+    use argon2::Argon2;
+    use chacha20poly1305::aead::{Aead, KeyInit};
+    use chacha20poly1305::{ChaCha20Poly1305, Nonce};
+    if password.chars().count() < 12 || password.chars().count() > 128 {
+        anyhow::bail!("пароль архива должен содержать от 12 до 128 символов");
+    }
+    let salt: [u8; 16] = rand::random();
+    let mut key = [0_u8; 32];
+    Argon2::default()
+        .hash_password_into(password.as_bytes(), &salt, &mut key)
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let cipher = ChaCha20Poly1305::new_from_slice(&key)?;
+    let nonce_bytes: [u8; 12] = rand::random();
+    let nonce = Nonce::from_slice(&nonce_bytes);
+    let ct = cipher
+        .encrypt(nonce, plain.as_bytes())
+        .map_err(|e| anyhow::anyhow!(e))?;
+    Ok(json!({
+        "v": 2,
+        "alg": "argon2id+chacha20poly1305",
+        "salt": hex::encode(salt),
+        "nonce": hex::encode(nonce_bytes),
+        "ciphertext": hex::encode(ct),
+        "sha256": hex::encode(Sha256::digest(plain.as_bytes())),
+    }))
+}
+
+pub fn decrypt_backup(password: &str, blob: &Value) -> anyhow::Result<String> {
+    use argon2::Argon2;
+    use chacha20poly1305::aead::{Aead, KeyInit};
+    use chacha20poly1305::{ChaCha20Poly1305, Nonce};
+    let version = blob.get("v").and_then(|v| v.as_i64()).unwrap_or(1);
+    let mut key = [0_u8; 32];
+    if version == 1 {
+        key.copy_from_slice(&Sha256::digest(password.as_bytes()));
+    } else if version == 2 {
+        let salt_hex = blob
+            .get("salt")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("нет salt"))?;
+        let salt = hex::decode(salt_hex)?;
+        if salt.len() != 16 {
+            anyhow::bail!("некорректная длина salt");
+        }
+        Argon2::default()
+            .hash_password_into(password.as_bytes(), &salt, &mut key)
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    } else {
+        anyhow::bail!("неподдерживаемая версия архива");
+    }
+    let cipher = ChaCha20Poly1305::new_from_slice(&key)?;
+    let nonce_hex = blob
+        .get("nonce")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("нет nonce"))?;
+    let ct_hex = blob
+        .get("ciphertext")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("нет ciphertext"))?;
+    let nonce_raw = hex::decode(nonce_hex)?;
+    let ct = hex::decode(ct_hex)?;
+    if nonce_raw.len() != 12 {
+        anyhow::bail!("некорректная длина nonce");
+    }
+    if ct.len() > 100 * 1024 * 1024 {
+        anyhow::bail!("архив слишком большой");
+    }
+    let nonce = Nonce::from_slice(&nonce_raw);
+    let pt = cipher
+        .decrypt(nonce, ct.as_ref())
+        .map_err(|_| anyhow::anyhow!("Неверный пароль или повреждённый архив"))?;
+    Ok(String::from_utf8(pt)?)
+}
+
+pub fn status(conn: &Connection) -> Value {
+    let (id, name) = ensure_node(conn);
+    let peers = list_peers(conn);
+    let conflicts: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM conflicts WHERE status='open'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    let upstream = std::env::var("MESHKEEPER_UPSTREAM")
+        .ok()
+        .map(|u| u.trim().trim_end_matches('/').to_string())
+        .filter(|u| !u.is_empty());
+    let (last_sync, last_error): (Option<String>, Option<String>) = upstream
+        .as_deref()
+        .and_then(|u| {
+            conn.query_row(
+                "SELECT last_sync, last_error FROM peers WHERE url=?1",
+                params![u],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .ok()
+            .flatten()
+        })
+        .unwrap_or((None, None));
+    json!({
+        "nodeId": id,
+        "name": name,
+        "role": if upstream.is_some() { "node" } else { "server" },
+        "upstream": upstream,
+        "lastSync": last_sync,
+        "lastError": last_error,
+        "url": guess_lan_base(),
+        "localUrl": local_http_base(),
+        "peers": peers,
+        "openConflicts": conflicts
+    })
+}
+
+/// Used from api.rs without making find_user_phone public — thin wrapper filled in api.
+pub fn touch_peer_error(conn: &Connection, url: &str, err: &str) {
+    let _ = conn.execute(
+        "UPDATE peers SET last_error=?1 WHERE url=?2",
+        params![err, url.trim().trim_end_matches('/')],
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backup_v2_round_trip() {
+        let blob = encrypt_backup("correct horse battery staple", "important data").unwrap();
+        assert_eq!(blob["v"], 2);
+        assert_eq!(
+            decrypt_backup("correct horse battery staple", &blob).unwrap(),
+            "important data"
+        );
+        assert!(decrypt_backup("wrong password", &blob).is_err());
+    }
+
+    #[test]
+    fn malformed_backup_nonce_is_an_error_not_a_panic() {
+        let blob = json!({
+            "v": 1,
+            "nonce": "00",
+            "ciphertext": "00"
+        });
+        let result = std::panic::catch_unwind(|| decrypt_backup("password", &blob));
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_err());
+    }
+}

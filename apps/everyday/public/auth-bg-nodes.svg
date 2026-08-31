@@ -1,0 +1,67 @@
+<svg width="1920" height="1080" viewBox="0 0 1920 1080" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <rect width="1920" height="1080" fill="#2E3160"/>
+  <radialGradient id="g1" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(420 300) rotate(90) scale(520)">
+    <stop stop-color="#66C6BE" stop-opacity="0.20"/>
+    <stop offset="1" stop-color="#66C6BE" stop-opacity="0"/>
+  </radialGradient>
+  <radialGradient id="g2" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(1520 780) rotate(90) scale(560)">
+    <stop stop-color="#C9C9F0" stop-opacity="0.22"/>
+    <stop offset="1" stop-color="#C9C9F0" stop-opacity="0"/>
+  </radialGradient>
+  <rect width="1920" height="1080" fill="url(#g1)"/>
+  <rect width="1920" height="1080" fill="url(#g2)"/>
+  <g stroke-width="1" opacity="0.55">
+    <line x1="180" y1="200" x2="420" y2="300" stroke="#66C6BE" opacity="0.35"/>
+    <line x1="420" y1="300" x2="640" y2="180" stroke="#C9C9F0" opacity="0.30"/>
+    <line x1="640" y1="180" x2="900" y2="320" stroke="#66C6BE" opacity="0.35"/>
+    <line x1="900" y1="320" x2="1180" y2="220" stroke="#C9C9F0" opacity="0.30"/>
+    <line x1="1180" y1="220" x2="1450" y2="380" stroke="#66C6BE" opacity="0.35"/>
+    <line x1="1450" y1="380" x2="1720" y2="260" stroke="#C9C9F0" opacity="0.30"/>
+    <line x1="260" y1="520" x2="520" y2="560" stroke="#66C6BE" opacity="0.35"/>
+    <line x1="520" y1="560" x2="780" y2="460" stroke="#C9C9F0" opacity="0.30"/>
+    <line x1="780" y1="460" x2="1040" y2="580" stroke="#66C6BE" opacity="0.35"/>
+    <line x1="1040" y1="580" x2="1300" y2="520" stroke="#C9C9F0" opacity="0.30"/>
+    <line x1="1300" y1="520" x2="1600" y2="640" stroke="#66C6BE" opacity="0.35"/>
+    <line x1="1600" y1="640" x2="1820" y2="540" stroke="#C9C9F0" opacity="0.30"/>
+    <line x1="140" y1="820" x2="400" y2="880" stroke="#66C6BE" opacity="0.35"/>
+    <line x1="400" y1="880" x2="680" y2="780" stroke="#C9C9F0" opacity="0.30"/>
+    <line x1="680" y1="780" x2="940" y2="900" stroke="#66C6BE" opacity="0.35"/>
+    <line x1="940" y1="900" x2="1220" y2="800" stroke="#C9C9F0" opacity="0.30"/>
+    <line x1="1220" y1="800" x2="1520" y2="780" stroke="#66C6BE" opacity="0.35"/>
+    <line x1="1520" y1="780" x2="1780" y2="900" stroke="#C9C9F0" opacity="0.30"/>
+    <line x1="420" y1="300" x2="520" y2="560" stroke="#C9C9F0" opacity="0.25"/>
+    <line x1="900" y1="320" x2="780" y2="460" stroke="#66C6BE" opacity="0.25"/>
+    <line x1="1180" y1="220" x2="1300" y2="520" stroke="#C9C9F0" opacity="0.25"/>
+    <line x1="520" y1="560" x2="400" y2="880" stroke="#66C6BE" opacity="0.25"/>
+    <line x1="1040" y1="580" x2="940" y2="900" stroke="#C9C9F0" opacity="0.25"/>
+    <line x1="1300" y1="520" x2="1220" y2="800" stroke="#66C6BE" opacity="0.25"/>
+    <line x1="1600" y1="640" x2="1520" y2="780" stroke="#C9C9F0" opacity="0.25"/>
+    <line x1="180" y1="200" x2="260" y2="520" stroke="#C9C9F0" opacity="0.25"/>
+    <line x1="260" y1="520" x2="140" y2="820" stroke="#66C6BE" opacity="0.25"/>
+    <line x1="640" y1="180" x2="780" y2="460" stroke="#66C6BE" opacity="0.25"/>
+    <line x1="680" y1="780" x2="520" y2="560" stroke="#C9C9F0" opacity="0.25"/>
+  </g>
+  <g>
+    <circle cx="180" cy="200" r="4" fill="#66C6BE" opacity="0.9"/>
+    <circle cx="420" cy="300" r="5" fill="#C9C9F0" opacity="0.85"/>
+    <circle cx="640" cy="180" r="3.5" fill="#66C6BE" opacity="0.8"/>
+    <circle cx="900" cy="320" r="5" fill="#C9C9F0" opacity="0.9"/>
+    <circle cx="1180" cy="220" r="4" fill="#66C6BE" opacity="0.8"/>
+    <circle cx="1450" cy="380" r="5" fill="#C9C9F0" opacity="0.85"/>
+    <circle cx="1720" cy="260" r="3.5" fill="#66C6BE" opacity="0.75"/>
+    <circle cx="260" cy="520" r="5" fill="#C9C9F0" opacity="0.85"/>
+    <circle cx="520" cy="560" r="4" fill="#66C6BE" opacity="0.9"/>
+    <circle cx="780" cy="460" r="3.5" fill="#C9C9F0" opacity="0.8"/>
+    <circle cx="1040" cy="580" r="5" fill="#66C6BE" opacity="0.85"/>
+    <circle cx="1300" cy="520" r="4" fill="#C9C9F0" opacity="0.9"/>
+    <circle cx="1600" cy="640" r="5" fill="#66C6BE" opacity="0.8"/>
+    <circle cx="1820" cy="540" r="3.5" fill="#C9C9F0" opacity="0.75"/>
+    <circle cx="140" cy="820" r="4" fill="#66C6BE" opacity="0.8"/>
+    <circle cx="400" cy="880" r="5" fill="#C9C9F0" opacity="0.85"/>
+    <circle cx="680" cy="780" r="3.5" fill="#66C6BE" opacity="0.9"/>
+    <circle cx="940" cy="900" r="5" fill="#C9C9F0" opacity="0.8"/>
+    <circle cx="1220" cy="800" r="4" fill="#66C6BE" opacity="0.85"/>
+    <circle cx="1520" cy="780" r="5" fill="#C9C9F0" opacity="0.9"/>
+    <circle cx="1780" cy="900" r="3.5" fill="#66C6BE" opacity="0.75"/>
+  </g>
+</svg>

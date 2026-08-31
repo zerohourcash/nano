@@ -1,0 +1,30 @@
+<svg width="480" height="360" viewBox="0 0 480 360" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <rect width="480" height="360" rx="16" fill="#EDEDF7"/>
+  <ellipse cx="240" cy="296" rx="130" ry="16" fill="#C9C9F0" opacity="0.5"/>
+  <!-- open toolbox -->
+  <path d="M120 200 L240 168 L360 200 L360 280 Q360 292 348 292 L132 292 Q120 292 120 280 Z" fill="#5E629B"/>
+  <path d="M120 200 L240 168 L360 200 L240 232 Z" fill="#4C4F82"/>
+  <path d="M120 200 L240 232 L240 292 L132 292 Q120 292 120 280 Z" fill="#5E629B"/>
+  <path d="M360 200 L240 232 L240 292 L348 292 Q360 292 360 280 Z" fill="#6E72AC"/>
+  <!-- open lid -->
+  <path d="M120 200 L96 128 Q94 120 102 118 L228 90 L240 168 Z" fill="#7A7EC4"/>
+  <rect x="216" y="150" width="48" height="12" rx="6" fill="#66C6BE"/>
+  <!-- mesh nodes flying out -->
+  <g stroke-linecap="round">
+    <line x1="200" y1="140" x2="240" y2="100" stroke="#66C6BE" stroke-width="1.6"/>
+    <line x1="240" y1="100" x2="290" y2="120" stroke="#5E629B" stroke-width="1.6"/>
+    <line x1="290" y1="120" x2="320" y2="76" stroke="#66C6BE" stroke-width="1.6"/>
+    <line x1="240" y1="100" x2="212" y2="60" stroke="#5E629B" stroke-width="1.6"/>
+    <line x1="200" y1="140" x2="160" y2="96" stroke="#5E629B" stroke-width="1.6"/>
+    <line x1="212" y1="60" x2="160" y2="96" stroke="#66C6BE" stroke-width="1.4" opacity="0.6"/>
+    <line x1="290" y1="120" x2="240" y2="100" stroke="#66C6BE" stroke-width="1.2" opacity="0.5"/>
+  </g>
+  <circle cx="200" cy="140" r="6" fill="#5E629B"/>
+  <circle cx="240" cy="100" r="7" fill="#66C6BE"/>
+  <circle cx="290" cy="120" r="6" fill="#5E629B"/>
+  <circle cx="320" cy="76" r="5" fill="#66C6BE"/>
+  <circle cx="212" cy="60" r="5" fill="#5E629B"/>
+  <circle cx="160" cy="96" r="4" fill="#66C6BE"/>
+  <!-- wrench accent -->
+  <path d="M262 246a9 9 0 0 1 11.8-2l-4.4 4.4 2.3 2.3 4.4-4.4a9 9 0 0 1-11.3 12l-6.6 6.6a3 3 0 1 1-4.2-4.2l6.6-6.6a9 9 0 0 1 1.4-8.1z" fill="#C9C9F0"/>
+</svg>

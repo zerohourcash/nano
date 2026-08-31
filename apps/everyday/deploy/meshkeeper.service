@@ -1,0 +1,40 @@
+[Unit]
+Description=MeshKeeper — учёт оборудования (центральный сервер)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=meshkeeper
+Group=meshkeeper
+WorkingDirectory=/opt/meshkeeper
+
+# Секреты держим в отдельном файле с правами 600, а не в юните.
+EnvironmentFile=/etc/meshkeeper/meshkeeper.env
+ExecStart=/opt/meshkeeper/meshkeeper-node
+
+Restart=always
+RestartSec=3
+
+# Узел слушает только локальный порт; наружу его публикует nginx с TLS.
+Environment=MESHKEEPER_BIND=127.0.0.1:8080
+Environment=MESHKEEPER_DB=/var/lib/meshkeeper/meshkeeper.db
+Environment=MESHKEEPER_WEB_ROOT=/opt/meshkeeper/public
+Environment=MESHKEEPER_COOKIE_SECURE=1
+
+# Ограничения: сервису нужны только своя рабочая папка и каталог базы.
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ReadWritePaths=/var/lib/meshkeeper
+RestrictAddressFamilies=AF_INET AF_INET6
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+
+[Install]
+WantedBy=multi-user.target

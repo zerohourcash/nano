@@ -1,0 +1,4997 @@
+use crate::json as jsn;
+use crate::{db, ledger};
+use argon2::{
+    password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
+    Argon2,
+};
+use rusqlite::{params, Connection, OptionalExtension};
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use std::cell::Cell;
+use uuid::Uuid;
+
+thread_local! {
+    static CURRENT_UID: Cell<Option<i64>> = const { Cell::new(None) };
+}
+
+fn ws_fallback(conn: &Connection) -> i64 {
+    CURRENT_UID.with(|c| {
+        if let Some(uid) = c.get() {
+            if let Ok(id) = conn.query_row(
+                "SELECT workspace_id FROM user_workspaces WHERE user_id=?1 ORDER BY id DESC LIMIT 1",
+                params![uid],
+                |r| r.get(0),
+            ) {
+                return id;
+            }
+        }
+        jsn::default_ws(conn)
+    })
+}
+
+#[derive(Debug)]
+pub struct ApiError {
+    pub message: String,
+    pub code: &'static str,
+    pub http: u16,
+}
+
+impl From<rusqlite::Error> for ApiError {
+    fn from(e: rusqlite::Error) -> Self {
+        Self::new("BAD_REQUEST", 400, e.to_string())
+    }
+}
+
+impl ApiError {
+    fn new(code: &'static str, http: u16, message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            code,
+            http,
+        }
+    }
+    fn unauth(m: impl Into<String>) -> Self {
+        Self::new("UNAUTHORIZED", 401, m)
+    }
+    fn not_found(m: impl Into<String>) -> Self {
+        Self::new("NOT_FOUND", 404, m)
+    }
+    fn bad(m: impl Into<String>) -> Self {
+        Self::new("BAD_REQUEST", 400, m)
+    }
+    fn conflict(m: impl Into<String>) -> Self {
+        Self::new("CONFLICT", 409, m)
+    }
+    pub fn internal(m: impl Into<String>) -> Self {
+        Self::new("INTERNAL_SERVER_ERROR", 500, m)
+    }
+}
+
+type ApiResult = Result<Value, ApiError>;
+
+pub fn is_mutation(procedure: &str) -> bool {
+    !matches!(
+        procedure,
+        "ping"
+            | "auth.directory"
+            | "auth.options"
+            | "auth.me"
+            | "auth.inviteInfo"
+            | "meta.currentUser"
+            | "meta.transferCounts"
+            | "meta.workspaces"
+            | "items.list"
+            | "items.byId"
+            | "items.byCode"
+            | "items.nextInternalId"
+            | "items.faults"
+            | "items.changeRequests"
+            | "chat.list"
+            | "sync.status"
+            | "sync.peers"
+            | "sync.conflicts"
+            | "transfers.outgoing"
+            | "transfers.incoming"
+            | "transfers.byId"
+            | "history.movements"
+            | "history.quantityOps"
+            | "history.all"
+            | "inventory.sessions"
+            | "inventory.byId"
+            | "inventory.results"
+            | "notifications.list"
+            | "notifications.unreadCount"
+            | "reports.byUsers"
+            | "reports.quantityTransactions"
+            | "reports.allItems"
+            | "profile.get"
+            | "admin.users.list"
+            | "admin.users.defaultRights"
+            | "admin.workspaces.list"
+            | "admin.workspaces.invites"
+            | "admin.storages.list"
+            | "admin.buildingSites.list"
+            | "admin.dictionaries.list"
+    )
+}
+
+fn atomic<T>(
+    conn: &mut Connection,
+    operation: impl FnOnce(&Connection) -> Result<T, ApiError>,
+) -> Result<T, ApiError> {
+    let tx = conn.transaction()?;
+    let result = operation(&tx)?;
+    tx.commit()?;
+    Ok(result)
+}
+
+fn g<'a>(input: &'a Value, key: &str) -> &'a Value {
+    input.get(key).unwrap_or(&Value::Null)
+}
+fn s(input: &Value, key: &str) -> Option<String> {
+    g(input, key)
+        .as_str()
+        .map(|x| x.to_string())
+        .filter(|x| !x.is_empty())
+}
+fn i64v(input: &Value, key: &str) -> Option<i64> {
+    g(input, key)
+        .as_i64()
+        .or_else(|| g(input, key).as_u64().map(|x| x as i64))
+        .or_else(|| g(input, key).as_f64().map(|x| x as i64))
+}
+fn f64v(input: &Value, key: &str) -> Option<f64> {
+    g(input, key)
+        .as_f64()
+        .or_else(|| g(input, key).as_i64().map(|x| x as f64))
+}
+fn b(input: &Value, key: &str) -> Option<bool> {
+    g(input, key).as_bool()
+}
+
+/// Расширенные поля интеграций хранятся как JSON-объект. Ограничение не даёт
+/// превратить карточку ТМЦ в неограниченное файловое хранилище.
+fn item_metadata(input: &Value) -> Result<Option<String>, ApiError> {
+    let Some(value) = input.get("metadata") else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    if !value.is_object() {
+        return Err(ApiError::bad("metadata должно быть JSON-объектом"));
+    }
+    let raw = serde_json::to_string(value)
+        .map_err(|_| ApiError::bad("Некорректные дополнительные данные"))?;
+    if raw.len() > 64 * 1024 {
+        return Err(ApiError::bad("Дополнительные данные превышают 64 КБ"));
+    }
+    Ok(Some(raw))
+}
+fn now() -> String {
+    chrono::Utc::now().to_rfc3339()
+}
+
+fn hash_password(password: &str) -> String {
+    let salt_raw = rand::random::<[u8; 16]>();
+    let salt = SaltString::encode_b64(&salt_raw).expect("valid salt length");
+    Argon2::default()
+        .hash_password(password.as_bytes(), &salt)
+        .expect("Argon2 password hashing")
+        .to_string()
+}
+fn verify_password(password: &str, stored: &str) -> bool {
+    if stored.starts_with("$argon2") {
+        return PasswordHash::new(stored).ok().is_some_and(|parsed| {
+            Argon2::default()
+                .verify_password(password.as_bytes(), &parsed)
+                .is_ok()
+        });
+    }
+    let Some((salt, digest)) = stored.split_once('$') else {
+        return false;
+    };
+    let mut h = Sha256::new();
+    h.update(format!("{salt}:{password}"));
+    hex::encode(h.finalize()) == digest
+}
+
+fn validate_new_password(password: &str) -> Result<(), ApiError> {
+    let length = password.chars().count();
+    if !(12..=128).contains(&length) {
+        return Err(ApiError::bad(
+            "Пароль должен содержать от 12 до 128 символов",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_phone(phone: &str) -> Result<(), ApiError> {
+    let digits = db::digits_only(phone);
+    if !(7..=20).contains(&digits.len()) {
+        return Err(ApiError::bad("Некорректный номер телефона"));
+    }
+    Ok(())
+}
+
+fn find_user_phone(conn: &Connection, phone: &str) -> Option<i64> {
+    let want = db::digits_only(phone);
+    let mut stmt = conn.prepare("SELECT id, phone FROM users").ok()?;
+    let rows: Vec<(i64, String)> = stmt
+        .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
+        .ok()?
+        .filter_map(|x| x.ok())
+        .collect();
+    rows.into_iter()
+        .find(|(_, p)| db::digits_only(p) == want)
+        .map(|(id, _)| id)
+}
+
+fn require_user(conn: &Connection, user_id: Option<i64>) -> Result<i64, ApiError> {
+    let Some(id) = user_id else {
+        return Err(ApiError::unauth("Войдите в систему"));
+    };
+    let status: Option<String> = conn
+        .query_row("SELECT status FROM users WHERE id=?1", params![id], |r| {
+            r.get(0)
+        })
+        .optional()
+        .ok()
+        .flatten();
+    match status.as_deref() {
+        Some("disabled") => Err(ApiError::unauth("Аккаунт заблокирован")),
+        Some(_) => Ok(id),
+        None => Err(ApiError::unauth("Пользователь не найден")),
+    }
+}
+
+fn user_can(conn: &Connection, uid: i64, key: &str) -> bool {
+    let mut rights = db::default_rights();
+    if let Some(stored) = jsn::user_public(conn, uid).and_then(|u| u.get("roleRights").cloned()) {
+        if let (Value::Object(ref mut dest), Value::Object(src)) = (&mut rights, stored) {
+            for (k, v) in src {
+                dest.insert(k, v);
+            }
+        }
+    }
+    rights.get(key).and_then(|v| v.as_bool()).unwrap_or(false)
+}
+
+fn require_can(conn: &Connection, uid: i64, key: &str) -> Result<(), ApiError> {
+    if user_can(conn, uid, key) {
+        Ok(())
+    } else {
+        Err(ApiError::new(
+            "FORBIDDEN",
+            403,
+            "Недостаточно прав для этого действия",
+        ))
+    }
+}
+
+/// Права пользователя в пространстве, наложенные на набор по умолчанию.
+///
+/// Наложение обязательно: у записей, созданных до появления нового права,
+/// ключа просто нет, и без слияния такой пользователь потерял бы доступ,
+/// которого у него никто не отбирал.
+fn merged_rights(conn: &Connection, uid: i64, ws: i64) -> Value {
+    let raw: Option<String> = conn.query_row(
+        "SELECT COALESCE(uw.rights_json,u.role_rights) FROM user_workspaces uw JOIN users u ON u.id=uw.user_id WHERE uw.user_id=?1 AND uw.workspace_id=?2",
+        params![uid, ws], |r| r.get(0),
+    ).optional().ok().flatten().flatten();
+    let mut rights = db::default_rights();
+    if let Some(stored) = raw.and_then(|v| serde_json::from_str::<Value>(&v).ok()) {
+        if let (Value::Object(dest), Value::Object(src)) = (&mut rights, stored) {
+            for (k, v) in src {
+                dest.insert(k, v);
+            }
+        }
+    }
+    rights
+}
+
+fn require_can_in_workspace(
+    conn: &Connection,
+    uid: i64,
+    ws: i64,
+    key: &str,
+) -> Result<(), ApiError> {
+    let rights = merged_rights(conn, uid, ws);
+    if rights.get(key).and_then(Value::as_bool).unwrap_or(false) {
+        Ok(())
+    } else {
+        Err(ApiError::new(
+            "FORBIDDEN",
+            403,
+            "Недостаточно прав в этом рабочем пространстве",
+        ))
+    }
+}
+
+/// Пространство пользователя по умолчанию — то же, которое подставит `ws_fallback`.
+fn own_workspace(conn: &Connection, uid: i64) -> Option<i64> {
+    conn.query_row(
+        "SELECT workspace_id FROM user_workspaces WHERE user_id=?1 ORDER BY id DESC LIMIT 1",
+        params![uid],
+        |r| r.get(0),
+    )
+    .optional()
+    .ok()
+    .flatten()
+}
+
+fn require_member(conn: &Connection, uid: i64, workspace_id: i64) -> Result<(), ApiError> {
+    let member: bool = conn
+        .query_row(
+            "SELECT 1 FROM user_workspaces WHERE user_id=?1 AND workspace_id=?2",
+            params![uid, workspace_id],
+            |_| Ok(true),
+        )
+        .optional()?
+        .unwrap_or(false);
+    if member {
+        Ok(())
+    } else {
+        Err(ApiError::new(
+            "FORBIDDEN",
+            403,
+            "Нет доступа к рабочему пространству",
+        ))
+    }
+}
+
+fn require_item_access(conn: &Connection, uid: i64, item_id: i64) -> Result<i64, ApiError> {
+    let ws = conn
+        .query_row(
+            "SELECT workspace_id FROM items WHERE id=?1",
+            params![item_id],
+            |r| r.get(0),
+        )
+        .optional()?
+        .ok_or_else(|| ApiError::not_found("Инструмент не найден"))?;
+    require_member(conn, uid, ws)?;
+    Ok(ws)
+}
+
+fn validate_item_references(conn: &Connection, input: &Value, ws: i64) -> Result<(), ApiError> {
+    for (key, table) in [
+        ("categoryId", "categories"),
+        ("brandId", "brands"),
+        ("statusId", "statuses"),
+        ("storageId", "storages"),
+        ("buildingSiteId", "building_sites"),
+    ] {
+        if input.get(key).is_some() {
+            if let Some(id) = i64v(input, key) {
+                let sql = format!("SELECT COUNT(*) FROM {table} WHERE id=?1 AND workspace_id=?2");
+                let found: i64 = conn.query_row(&sql, params![id, ws], |r| r.get(0))?;
+                if found == 0 {
+                    return Err(ApiError::bad(format!(
+                        "{key} относится к другому рабочему пространству"
+                    )));
+                }
+            }
+        }
+    }
+    if input.get("responsibleUserId").is_some() {
+        if let Some(user) = i64v(input, "responsibleUserId") {
+            require_member(conn, user, ws)
+                .map_err(|_| ApiError::bad("Ответственный не состоит в рабочем пространстве"))?;
+        }
+    }
+    Ok(())
+}
+
+/// Статусы, перевод в которые требует явной причины (ТЗ §8).
+const STATUSES_REQUIRING_REASON: [&str; 4] = ["in-repair", "needs-check", "written-off", "broken"];
+
+fn status_label(conn: &Connection, status_id: Option<i64>) -> (Option<String>, Option<String>) {
+    let Some(id) = status_id else {
+        return (None, None);
+    };
+    conn.query_row(
+        "SELECT name, slug FROM statuses WHERE id=?1",
+        params![id],
+        |r| {
+            Ok((
+                r.get::<_, Option<String>>(0)?,
+                r.get::<_, Option<String>>(1)?,
+            ))
+        },
+    )
+    .optional()
+    .ok()
+    .flatten()
+    .unwrap_or((None, None))
+}
+
+/// Причина перевода в «неисправен», «на ремонте» или «списан».
+/// Возвращает текст причины, если он обязателен и указан.
+fn status_change_reason(
+    conn: &Connection,
+    input: &Value,
+    before_status: Option<i64>,
+    next_status: Option<i64>,
+) -> Result<Option<String>, ApiError> {
+    if before_status == next_status {
+        return Ok(None);
+    }
+    let (name, slug) = status_label(conn, next_status);
+    let slug = slug.unwrap_or_default();
+    if !STATUSES_REQUIRING_REASON.contains(&slug.as_str()) {
+        return Ok(None);
+    }
+    let reason = s(input, "reason").or_else(|| s(input, "comment"));
+    match reason {
+        Some(text) if text.trim().chars().count() >= 3 => Ok(Some(text)),
+        _ => Err(ApiError::bad(format!(
+            "Укажите причину перевода в статус «{}»",
+            name.unwrap_or(slug)
+        ))),
+    }
+}
+
+fn required_admin_right(procedure: &str) -> Option<&'static str> {
+    if procedure.starts_with("admin.users.") {
+        Some("manageUsers")
+    } else if procedure.starts_with("admin.workspaces.") {
+        Some("manageWorkspaces")
+    } else if procedure.starts_with("admin.storages.") {
+        Some("manageStorages")
+    } else if procedure.starts_with("admin.buildingSites.") {
+        Some("manageSites")
+    } else if procedure.starts_with("admin.dictionaries.") {
+        Some("manageDictionaries")
+    } else if procedure.starts_with("sync.") || procedure.starts_with("backup.") {
+        Some("manageWorkspaces")
+    } else {
+        None
+    }
+}
+
+fn required_right(procedure: &str) -> Option<&'static str> {
+    if let Some(right) = required_admin_right(procedure) {
+        return Some(right);
+    }
+    if matches!(procedure, "items.create") {
+        Some("createItems")
+    } else if matches!(procedure, "items.remove") {
+        Some("deleteItems")
+    } else if matches!(
+        procedure,
+        "items.update"
+            | "items.addPhoto"
+            | "history.move"
+            | "items.resolveFault"
+            | "items.decideChange"
+    ) {
+        Some("editItems")
+    } else if matches!(procedure, "items.reportFault") {
+        Some("reportFaults")
+    } else if matches!(procedure, "items.requestChange") {
+        Some("requestChanges")
+    } else if procedure.starts_with("items.") {
+        Some("viewItems")
+    } else if matches!(
+        procedure,
+        "transfers.accept" | "transfers.reject" | "transfers.acceptAll"
+    ) {
+        Some("acceptTransfers")
+    } else if procedure.starts_with("transfers.") {
+        Some("transferItems")
+    } else if matches!(procedure, "history.writeOff") {
+        Some("writeOff")
+    } else if matches!(procedure, "history.replenish") {
+        Some("replenish")
+    } else if procedure.starts_with("history.") {
+        Some("viewHistory")
+    } else if procedure.starts_with("inventory.") {
+        Some("inventory")
+    } else if procedure.starts_with("reports.") {
+        Some("viewReports")
+    } else {
+        None
+    }
+}
+
+fn target_workspace(
+    conn: &Connection,
+    procedure: &str,
+    input: &Value,
+) -> Result<Option<i64>, ApiError> {
+    if let Some(ws) = i64v(input, "workspaceId") {
+        return Ok(Some(ws));
+    }
+    if let Some(item_id) = i64v(input, "itemId") {
+        return Ok(conn
+            .query_row(
+                "SELECT workspace_id FROM items WHERE id=?1",
+                params![item_id],
+                |r| r.get(0),
+            )
+            .optional()?);
+    }
+    let id = i64v(input, "id").or_else(|| i64v(input, "sessionId"));
+    let Some(id) = id else { return Ok(None) };
+    let table = if matches!(procedure, "items.resolveFault") {
+        Some("faults")
+    } else if matches!(procedure, "items.decideChange") {
+        Some("change_requests")
+    } else if procedure.starts_with("items.") {
+        Some("items")
+    } else if procedure.starts_with("transfers.") {
+        Some("transfers")
+    } else if procedure.starts_with("inventory.") {
+        Some("inventory_sessions")
+    } else if matches!(
+        procedure,
+        "admin.workspaces.update" | "admin.workspaces.remove"
+    ) {
+        return Ok(Some(id));
+    } else if procedure.starts_with("admin.storages.") {
+        Some("storages")
+    } else if procedure.starts_with("admin.buildingSites.") {
+        Some("building_sites")
+    } else {
+        None
+    };
+    if procedure.starts_with("admin.dictionaries.")
+        && !matches!(
+            procedure,
+            "admin.dictionaries.list" | "admin.dictionaries.create"
+        )
+    {
+        let kind = s(input, "kind").unwrap_or_else(|| "categories".into());
+        let table = dict_table(&kind)?;
+        let sql = format!("SELECT workspace_id FROM {table} WHERE id=?1");
+        return Ok(conn.query_row(&sql, params![id], |r| r.get(0)).optional()?);
+    }
+    let Some(table) = table else { return Ok(None) };
+    let sql = format!("SELECT workspace_id FROM {table} WHERE id=?1");
+    Ok(conn.query_row(&sql, params![id], |r| r.get(0)).optional()?)
+}
+
+fn require_shared_workspace(
+    conn: &Connection,
+    actor: i64,
+    target_user: i64,
+) -> Result<(), ApiError> {
+    let shared = conn.query_row(
+        "SELECT 1 FROM user_workspaces a JOIN user_workspaces b ON b.workspace_id=a.workspace_id
+         WHERE a.user_id=?1 AND b.user_id=?2 LIMIT 1",
+        params![actor, target_user], |_| Ok(true),
+    ).optional()?.unwrap_or(false);
+    if shared {
+        Ok(())
+    } else {
+        Err(ApiError::new(
+            "FORBIDDEN",
+            403,
+            "Пользователь из другого рабочего пространства",
+        ))
+    }
+}
+
+pub fn dispatch(
+    conn: &mut Connection,
+    procedure: &str,
+    input: &Value,
+    user_id: Option<i64>,
+) -> ApiResult {
+    CURRENT_UID.with(|c| c.set(user_id));
+    let public = matches!(
+        procedure,
+        "ping"
+            | "auth.login"
+            | "auth.register"
+            | "auth.joinRegister"
+            | "auth.inviteInfo"
+            | "auth.logout"
+            | "auth.options"
+    ) || (procedure == "auth.directory"
+        && std::env::var("MESHKEEPER_DEMO_LOGIN").as_deref() == Ok("1"));
+    if !public {
+        let uid = require_user(conn, user_id)?;
+        let target_ws = target_workspace(conn, procedure, input)?;
+        // Если пространство в запросе не указано, обработчик всё равно возьмёт
+        // пространство пользователя по умолчанию — права проверяем там же,
+        // иначе проверку можно было бы обойти, просто не передав workspaceId.
+        let effective_ws = match target_ws {
+            Some(ws) => {
+                require_member(conn, uid, ws)?;
+                Some(ws)
+            }
+            None => own_workspace(conn, uid),
+        };
+        if let Some(right) = required_right(procedure) {
+            match effective_ws {
+                Some(ws) => require_can_in_workspace(conn, uid, ws, right)?,
+                None => require_can(conn, uid, right)?,
+            }
+        }
+        if matches!(procedure, "admin.users.update" | "admin.users.remove") {
+            let target = i64v(input, "id").ok_or_else(|| ApiError::bad("id"))?;
+            require_shared_workspace(conn, uid, target)?;
+        }
+    }
+    // Обработчик выполняется ровно один раз: повторный вызов создавал бы
+    // дубли на мутациях.
+    let mut value = dispatch_inner(conn, procedure, input, user_id)?;
+    // Фото и местонахождение — отдельные права (ТЗ §4). Прячем их в ответе,
+    // а не в каждом обработчике: карточка предмета встречается вложенной
+    // в историю, заявки, отчёты и передачи.
+    if let Some(uid) = user_id {
+        if let Some(ws) = target_workspace(conn, procedure, input)
+            .ok()
+            .flatten()
+            .or_else(|| own_workspace(conn, uid))
+        {
+            let rights = merged_rights(conn, uid, ws);
+            let hide_photos = !rights
+                .get("viewPhotos")
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
+            let hide_location = !rights
+                .get("viewLocation")
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
+            if hide_photos || hide_location {
+                redact_item_fields(&mut value, hide_photos, hide_location);
+            }
+        }
+    }
+    Ok(value)
+}
+
+/// Рекурсивно вычищает из ответа поля карточки, закрытые правами.
+fn redact_item_fields(value: &mut Value, hide_photos: bool, hide_location: bool) {
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                redact_item_fields(item, hide_photos, hide_location);
+            }
+        }
+        Value::Object(map) => {
+            // Признак карточки предмета: у неё есть внутренний номер и название.
+            let is_item = map.contains_key("internalId") && map.contains_key("title");
+            if is_item {
+                if hide_photos {
+                    map.remove("photos");
+                    map.remove("photoUrl");
+                }
+                if hide_location {
+                    for key in ["storage", "storageId", "buildingSite", "buildingSiteId"] {
+                        map.remove(key);
+                    }
+                }
+            }
+            for (_, nested) in map.iter_mut() {
+                redact_item_fields(nested, hide_photos, hide_location);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn dispatch_inner(
+    conn: &mut Connection,
+    procedure: &str,
+    input: &Value,
+    user_id: Option<i64>,
+) -> ApiResult {
+    match procedure {
+        "ping" => Ok(json!({"ok": true, "ts": chrono::Utc::now().timestamp_millis()})),
+        "auth.directory" => {
+            if std::env::var("MESHKEEPER_DEMO_LOGIN").as_deref() == Ok("1") {
+                auth_directory(conn)
+            } else {
+                Err(ApiError::not_found("Процедура отключена"))
+            }
+        }
+        "auth.options" => auth_options(conn),
+        "auth.login" => auth_login(conn, input),
+        "auth.register" => auth_register(conn, input),
+        "auth.join" => auth_join(conn, input, user_id),
+        "auth.joinRegister" => auth_join_register(conn, input),
+        "auth.logout" => Ok(json!({"ok": true})),
+        "auth.me" => {
+            Ok(jsn::user_public(conn, require_user(conn, user_id)?).unwrap_or(Value::Null))
+        }
+        "auth.inviteInfo" => invite_info(conn, input),
+        "meta.currentUser" => {
+            Ok(jsn::user_public(conn, require_user(conn, user_id)?).unwrap_or(Value::Null))
+        }
+        "meta.transferCounts" => transfer_counts(conn, require_user(conn, user_id)?),
+        "meta.workspaces" => workspaces_list(conn),
+        "items.list" => items_list(conn, input, user_id),
+        "items.byId" => items_by_id(conn, input, user_id),
+        "items.byCode" => items_by_code(conn, input, user_id),
+        "items.nextInternalId" => items_next_id(conn, input),
+        "items.create" => items_create(conn, input, user_id),
+        "items.update" => items_update(conn, input, user_id),
+        "items.remove" => items_remove(conn, input, user_id),
+        "items.addPhoto" => items_add_photo(conn, input, user_id),
+        "items.addComment" => items_add_comment(conn, input, user_id),
+        "items.reportFault" => report_fault(conn, input, user_id),
+        "items.faults" => list_faults(conn, input),
+        "items.resolveFault" => resolve_fault(conn, input, user_id),
+        "items.requestChange" => request_change(conn, input, user_id),
+        "items.changeRequests" => list_changes(conn, input),
+        "items.decideChange" => decide_change(conn, input, user_id),
+        "chat.list" => chat_list(conn, input, user_id),
+        "chat.send" => chat_send(conn, input, user_id),
+        "sync.status" => Ok(crate::sync::status(conn)),
+        "sync.peers" => Ok(crate::sync::list_peers(conn)),
+        "sync.addPeer" => {
+            let url = s(input, "url").ok_or_else(|| ApiError::bad("Укажите адрес узла"))?;
+            if !url.starts_with("http://") && !url.starts_with("https://") {
+                return Err(ApiError::bad(
+                    "Адрес должен начинаться с http:// или https://",
+                ));
+            }
+            Ok(crate::sync::add_peer(
+                conn,
+                &url,
+                s(input, "name").as_deref(),
+                None,
+            ))
+        }
+        "sync.conflicts" => Ok(crate::sync::list_conflicts(conn)),
+        "sync.resolveConflict" => {
+            let uid = require_user(conn, user_id)?;
+            require_can(conn, uid, "editItems")?;
+            crate::sync::resolve_conflict(
+                conn,
+                i64v(input, "id").ok_or_else(|| ApiError::bad("id"))?,
+                i64v(input, "responsibleUserId"),
+                uid,
+            )
+            .map_err(|e| ApiError::bad(e.to_string()))
+        }
+        "sync.pullNow" => {
+            if std::env::var("MESHKEEPER_UPSTREAM")
+                .ok()
+                .filter(|u| !u.trim().is_empty())
+                .is_none()
+            {
+                return Err(ApiError::bad(
+                    "Сервер не настроен: задайте MESHKEEPER_UPSTREAM на этом узле",
+                ));
+            }
+            crate::sync::request_sync_now();
+            Ok(json!({"ok": true, "queued": true}))
+        }
+        "backup.export" => backup_export(conn, input, user_id),
+        "backup.import" => backup_import(conn, input, user_id),
+        "transfers.outgoing" => transfers_list(conn, user_id, true),
+        "transfers.incoming" => transfers_list(conn, user_id, false),
+        "transfers.byId" => transfer_by_id(conn, input, user_id),
+        "transfers.prepare" => transfers_prepare(conn, input, user_id),
+        "transfers.accept" => transfers_accept(conn, input, user_id, true),
+        "transfers.reject" => transfers_accept(conn, input, user_id, false),
+        "transfers.acceptAll" => transfers_accept_all(conn, user_id),
+        "transfers.take" => transfers_take(conn, input, user_id),
+        "transfers.takeMany" => transfers_take_many(conn, input, user_id),
+        "transfers.returnItem" => transfers_return(conn, input, user_id),
+        "history.movements" => {
+            history_list(conn, input, &["move", "transfer_send", "transfer_receive"])
+        }
+        "history.quantityOps" => history_list(conn, input, &["write_off", "replenish"]),
+        "history.all" => history_list(conn, input, &[]),
+        "history.writeOff" => history_write_off(conn, input, user_id),
+        "history.replenish" => history_replenish(conn, input, user_id),
+        "history.move" => history_move(conn, input, user_id),
+        "inventory.sessions" => inv_sessions(conn, input),
+        "inventory.byId" => inv_by_id(conn, input, user_id),
+        "inventory.results" => inv_results(conn, input, user_id),
+        "inventory.create" => inv_create(conn, input, user_id),
+        "inventory.checkItem" => inv_check(conn, input, user_id),
+        "inventory.complete" => inv_complete(conn, input, user_id),
+        "notifications.list" => notif_list(conn, user_id),
+        "notifications.unreadCount" => notif_unread(conn, user_id),
+        "notifications.markRead" => notif_mark(conn, input, false, user_id),
+        "notifications.markAllRead" => notif_mark(conn, input, true, user_id),
+        "reports.byUsers" => reports_by_users(conn, input),
+        "reports.quantityTransactions" => history_list(conn, input, &["write_off", "replenish"]),
+        "reports.allItems" => reports_all(conn, input),
+        "profile.get" => profile_get(conn, user_id),
+        "profile.update" => profile_update(conn, input, user_id),
+        "profile.changePassword" => profile_password(conn, input, user_id),
+        "admin.users.list" => admin_users(conn, input),
+        "admin.users.create" => admin_user_create(conn, input),
+        "admin.users.update" => admin_user_update(conn, input, user_id),
+        "admin.users.remove" => admin_user_remove(conn, input, user_id),
+        "admin.users.invite" => admin_user_invite(conn, input, user_id),
+        "admin.users.defaultRights" => Ok(db::default_rights()),
+        "admin.workspaces.list" => workspaces_list(conn),
+        "admin.workspaces.create" => ws_create(conn, input, user_id),
+        "admin.workspaces.update" => ws_update(conn, input),
+        "admin.workspaces.remove" => {
+            conn.execute(
+                "DELETE FROM workspaces WHERE id=?1",
+                params![i64v(input, "id").unwrap_or(0)],
+            )?;
+            Ok(json!({"ok": true}))
+        }
+        "admin.workspaces.createInvite" => ws_create_invite(conn, input, user_id),
+        "admin.workspaces.invites" => ws_invites(conn, input),
+        "admin.storages.list" => storages_list(conn, input),
+        "admin.storages.create" => storage_create(conn, input),
+        "admin.storages.update" => storage_update(conn, input),
+        "admin.storages.remove" => {
+            conn.execute(
+                "DELETE FROM storages WHERE id=?1",
+                params![i64v(input, "id").unwrap_or(0)],
+            )?;
+            Ok(json!({"ok": true}))
+        }
+        "admin.buildingSites.list" => sites_list(conn, input),
+        "admin.buildingSites.create" => site_create(conn, input),
+        "admin.buildingSites.update" => site_update(conn, input),
+        "admin.buildingSites.remove" => {
+            conn.execute(
+                "DELETE FROM building_sites WHERE id=?1",
+                params![i64v(input, "id").unwrap_or(0)],
+            )?;
+            Ok(json!({"ok": true}))
+        }
+        "admin.dictionaries.list" => dict_list(conn, input),
+        "admin.dictionaries.create" => dict_create(conn, input),
+        "admin.dictionaries.update" => dict_update(conn, input),
+        "admin.dictionaries.remove" => dict_remove(conn, input),
+        _ => Err(ApiError::not_found(format!("Нет процедуры {procedure}"))),
+    }
+}
+
+fn auth_directory(conn: &Connection) -> ApiResult {
+    let mut stmt = conn.prepare("SELECT id FROM users WHERE status!='disabled' ORDER BY id")?;
+    let ids: Vec<i64> = stmt
+        .query_map([], |r| r.get(0))?
+        .filter_map(|x| x.ok())
+        .collect();
+    let mut out = Vec::new();
+    for id in ids {
+        if let Some(mut u) = jsn::user_public(conn, id) {
+            let has: Option<String> = conn
+                .query_row(
+                    "SELECT password_hash FROM users WHERE id=?1",
+                    params![id],
+                    |r| r.get(0),
+                )
+                .ok()
+                .flatten();
+            u["hasPassword"] = json!(has.filter(|s| !s.is_empty()).is_some());
+            out.push(u);
+        }
+    }
+    Ok(Value::Array(out))
+}
+
+/// Что экран входа может предложить прямо сейчас. Регистрация владельца
+/// доступна, пока база пуста (bootstrap) либо если она открыта явно.
+fn auth_options(conn: &Connection) -> ApiResult {
+    let users: i64 = conn
+        .query_row("SELECT COUNT(*) FROM users", [], |r| r.get(0))
+        .unwrap_or(0);
+    let open = std::env::var("MESHKEEPER_OPEN_REGISTRATION").as_deref() == Ok("1");
+    Ok(json!({
+        "registrationOpen": users == 0 || open,
+        "bootstrap": users == 0,
+        "demoLogin": std::env::var("MESHKEEPER_DEMO_LOGIN").as_deref() == Ok("1"),
+    }))
+}
+
+/// Сколько неудачных попыток проходит без задержки.
+const LOGIN_FREE_ATTEMPTS: i64 = 5;
+/// Базовая пауза после исчерпания попыток; дальше удваивается.
+const LOGIN_LOCK_BASE_SECS: i64 = 30;
+const LOGIN_LOCK_MAX_SECS: i64 = 900;
+/// Через столько тишины счётчик неудач обнуляется.
+const LOGIN_FAILURE_TTL_SECS: i64 = 3600;
+
+/// Ключ троттлинга — только цифры номера, чтобы «+7 900…» и «8900…»
+/// считались одной учётной записью.
+fn throttle_key(phone: &str) -> String {
+    db::digits_only(phone)
+}
+
+/// Отказ, если по этому номеру уже перебирали пароль.
+fn check_login_allowed(conn: &Connection, key: &str) -> Result<(), ApiError> {
+    let locked: Option<String> = conn
+        .query_row(
+            "SELECT locked_until FROM login_throttle WHERE key=?1",
+            params![key],
+            |r| r.get(0),
+        )
+        .optional()?
+        .flatten();
+    let Some(raw) = locked else { return Ok(()) };
+    let Ok(until) = chrono::DateTime::parse_from_rfc3339(&raw) else {
+        return Ok(());
+    };
+    let left = (until.with_timezone(&chrono::Utc) - chrono::Utc::now()).num_seconds();
+    if left <= 0 {
+        return Ok(());
+    }
+    Err(ApiError::new(
+        "TOO_MANY_REQUESTS",
+        429,
+        format!("Слишком много попыток входа. Повторите через {left} с."),
+    ))
+}
+
+fn note_login_failure(conn: &Connection, key: &str) {
+    let now_ts = chrono::Utc::now();
+    let previous: Option<(i64, Option<String>)> = conn
+        .query_row(
+            "SELECT failures, last_failure_at FROM login_throttle WHERE key=?1",
+            params![key],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+        .ok()
+        .flatten();
+    // Давние неудачи не должны копиться месяцами.
+    let stale = previous
+        .as_ref()
+        .and_then(|(_, at)| at.as_deref())
+        .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
+        .is_none_or(|at| {
+            (now_ts - at.with_timezone(&chrono::Utc)).num_seconds() > LOGIN_FAILURE_TTL_SECS
+        });
+    let failures = if stale {
+        1
+    } else {
+        previous.map(|(n, _)| n).unwrap_or(0) + 1
+    };
+
+    let locked_until = if failures >= LOGIN_FREE_ATTEMPTS {
+        let steps = (failures - LOGIN_FREE_ATTEMPTS).min(20) as u32;
+        let secs = LOGIN_LOCK_BASE_SECS
+            .saturating_mul(1_i64 << steps.min(10))
+            .min(LOGIN_LOCK_MAX_SECS);
+        Some((now_ts + chrono::Duration::seconds(secs)).to_rfc3339())
+    } else {
+        None
+    };
+    let _ = conn.execute(
+        "INSERT INTO login_throttle (key, failures, last_failure_at, locked_until)
+         VALUES (?1,?2,?3,?4)
+         ON CONFLICT(key) DO UPDATE SET
+           failures=excluded.failures,
+           last_failure_at=excluded.last_failure_at,
+           locked_until=excluded.locked_until",
+        params![key, failures, now_ts.to_rfc3339(), locked_until],
+    );
+}
+
+fn clear_login_failures(conn: &Connection, key: &str) {
+    let _ = conn.execute("DELETE FROM login_throttle WHERE key=?1", params![key]);
+}
+
+fn auth_login(conn: &Connection, input: &Value) -> ApiResult {
+    let id = if let Some(uid) = i64v(input, "userId") {
+        if std::env::var("MESHKEEPER_DEMO_LOGIN").as_deref() != Ok("1") {
+            return Err(ApiError::unauth("Вход по идентификатору отключён"));
+        }
+        uid
+    } else if let Some(phone) = s(input, "phone") {
+        validate_phone(&phone).map_err(|_| ApiError::unauth("Неверный телефон или пароль"))?;
+        // Проверяем до обращения к базе паролей: перебор не должен
+        // получать даже ответ «есть такой аккаунт или нет».
+        check_login_allowed(conn, &throttle_key(&phone))?;
+        find_user_phone(conn, &phone).ok_or_else(|| {
+            note_login_failure(conn, &throttle_key(&phone));
+            // Одна Argon2-операция выравнивает время ответа с существующим
+            // аккаунтом и затрудняет перебор зарегистрированных телефонов.
+            let _ = hash_password("invalid-login-placeholder");
+            ApiError::unauth("Неверный телефон или пароль")
+        })?
+    } else {
+        return Err(ApiError::unauth("Укажите телефон"));
+    };
+    let (status, hash, name): (String, Option<String>, String) = conn
+        .query_row(
+            "SELECT status, password_hash, full_name FROM users WHERE id=?1",
+            params![id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .map_err(|_| ApiError::unauth("Аккаунт не найден"))?;
+    if status == "disabled" {
+        if let Some(k) = s(input, "phone").map(|p| throttle_key(&p)) {
+            note_login_failure(conn, &k);
+        }
+        let _ = hash_password("disabled-login-placeholder");
+        return Err(ApiError::unauth("Неверный телефон или пароль"));
+    }
+    let key = s(input, "phone").map(|p| throttle_key(&p));
+    if let Some(h) = hash.filter(|x| !x.is_empty()) {
+        let pw = s(input, "password").unwrap_or_default();
+        if pw.chars().count() > 128 {
+            if let Some(k) = &key {
+                note_login_failure(conn, k);
+            }
+            return Err(ApiError::unauth("Неверный телефон или пароль"));
+        }
+        if !verify_password(&pw, &h) {
+            if let Some(k) = &key {
+                note_login_failure(conn, k);
+            }
+            return Err(ApiError::unauth("Неверный телефон или пароль"));
+        }
+        if !h.starts_with("$argon2") {
+            conn.execute(
+                "UPDATE users SET password_hash=?1 WHERE id=?2",
+                params![hash_password(&pw), id],
+            )?;
+        }
+    } else if std::env::var("MESHKEEPER_DEMO_LOGIN").as_deref() != Ok("1") {
+        return Err(ApiError::unauth("Неверный телефон или пароль"));
+    }
+    if status == "invited" {
+        let _ = conn.execute("UPDATE users SET status='active' WHERE id=?1", params![id]);
+    }
+    if let Some(k) = &key {
+        clear_login_failures(conn, k);
+    }
+    let mut u = jsn::user_public(conn, id).ok_or_else(|| ApiError::unauth("Аккаунт не найден"))?;
+    u["fullName"] = json!(name);
+    Ok(u)
+}
+
+/// Базовые статусы и склад нового пространства. Без них у предметов не будет
+/// ни «В работе», ни «На проверке» (ТЗ §9), а конфликты синхронизации не смогут
+/// пометить предмет как требующий проверки.
+fn seed_workspace_defaults(conn: &Connection, ws: i64, owner: i64) -> Result<(), ApiError> {
+    for (name, slug, color, bg) in [
+        ("В работе", "in-work", "#2E9E5B", "#C8FCD2"),
+        ("В ремонте", "in-repair", "#A87C0F", "#FBFCC8"),
+        ("На складе", "in-stock", "#5E629B", "#EDEDF7"),
+        ("На проверке", "needs-check", "#A87C0F", "#FBFCC8"),
+        ("Списан", "written-off", "#D64545", "#FAD8D1"),
+    ] {
+        conn.execute(
+            "INSERT INTO statuses (name, workspace_id, type, slug, color, bg)
+             SELECT ?2, ?1, 'status', ?3, ?4, ?5
+             WHERE NOT EXISTS (SELECT 1 FROM statuses WHERE workspace_id=?1 AND slug=?3)",
+            params![ws, name, slug, color, bg],
+        )?;
+    }
+    conn.execute(
+        "INSERT INTO storages (name, responsible_user_id, workspace_id, address)
+         SELECT 'Основной склад', ?2, ?1, ''
+         WHERE NOT EXISTS (SELECT 1 FROM storages WHERE workspace_id=?1)",
+        params![ws, owner],
+    )?;
+    Ok(())
+}
+
+fn auth_register(conn: &Connection, input: &Value) -> ApiResult {
+    let users: i64 = conn.query_row("SELECT COUNT(*) FROM users", [], |r| r.get(0))?;
+    if users > 0 && std::env::var("MESHKEEPER_OPEN_REGISTRATION").as_deref() != Ok("1") {
+        return Err(ApiError::new(
+            "FORBIDDEN",
+            403,
+            "Открытая регистрация отключена; используйте приглашение",
+        ));
+    }
+    let full_name = s(input, "fullName").ok_or_else(|| ApiError::bad("Введите имя"))?;
+    let phone = s(input, "phone").ok_or_else(|| ApiError::bad("Введите телефон"))?;
+    let password = s(input, "password").ok_or_else(|| ApiError::bad("Введите пароль"))?;
+    if full_name.chars().count() > 200 {
+        return Err(ApiError::bad("Имя слишком длинное"));
+    }
+    validate_phone(&phone)?;
+    validate_new_password(&password)?;
+    if find_user_phone(conn, &phone).is_some() {
+        return Err(ApiError::conflict(
+            "Этот телефон уже зарегистрирован. Войдите с тем же номером и паролем.",
+        ));
+    }
+    let ws_name = s(input, "workspaceName").unwrap_or_else(|| "Моя группа".into());
+    if ws_name.chars().count() > 200 {
+        return Err(ApiError::bad("Название группы слишком длинное"));
+    }
+    let sync_url = s(input, "syncUrl");
+    conn.execute(
+        "INSERT INTO workspaces (name, timezone, internal_id_prefix, comment, created_at, sync_url) VALUES (?1,?2,'ВН-',?3,?4,?5)",
+        params![ws_name, "Europe/Moscow", "Создано при регистрации", now(), sync_url],
+    ).map_err(|e| ApiError::bad(e.to_string()))?;
+    let ws = conn.last_insert_rowid();
+    if let Some(url) = sync_url {
+        crate::sync::add_peer(conn, &url, Some("relay"), None);
+    }
+    conn.execute(
+        "INSERT INTO users (full_name, position, phone, status, password_hash, role_rights, created_at)
+         VALUES (?1,'Владелец',?2,'active',?3,?4,?5)",
+        params![full_name, phone, hash_password(&password), db::owner_rights().to_string(), now()],
+    ).map_err(|e| ApiError::conflict(e.to_string()))?;
+    let uid = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO user_workspaces (user_id, workspace_id, rights_json) VALUES (?1,?2,?3)",
+        params![uid, ws, db::owner_rights().to_string()],
+    )?;
+    seed_workspace_defaults(conn, ws, uid)?;
+    Ok(jsn::user_public(conn, uid).unwrap())
+}
+
+struct Invite {
+    id: i64,
+    workspace_id: i64,
+    role: String,
+    max_uses: i64,
+    used_count: i64,
+    revoked: i64,
+    expires_at: Option<String>,
+}
+
+impl Invite {
+    fn is_expired(&self) -> bool {
+        let Some(raw) = self.expires_at.as_deref().filter(|s| !s.is_empty()) else {
+            return false;
+        };
+        match chrono::DateTime::parse_from_rfc3339(raw) {
+            Ok(ts) => ts.with_timezone(&chrono::Utc) <= chrono::Utc::now(),
+            // Нечитаемый срок считаем истёкшим: приглашение не должно «оживать» из-за битой даты.
+            Err(_) => true,
+        }
+    }
+}
+
+fn invite_by_token(conn: &Connection, token: &str) -> Result<Invite, ApiError> {
+    conn.query_row(
+        "SELECT id, workspace_id, role, max_uses, used_count, revoked, expires_at FROM invites WHERE token=?1",
+        params![token],
+        |r| {
+            Ok(Invite {
+                id: r.get(0)?,
+                workspace_id: r.get(1)?,
+                role: r.get(2)?,
+                max_uses: r.get(3)?,
+                used_count: r.get(4)?,
+                revoked: r.get(5)?,
+                expires_at: r.get(6)?,
+            })
+        },
+    )
+    .map_err(|_| ApiError::not_found("Приглашение недействительно или истекло"))
+}
+
+/// Общая проверка пригодности приглашения: отзыв, исчерпание и срок действия.
+fn ensure_invite_usable(invite: &Invite) -> Result<(), ApiError> {
+    if invite.revoked != 0 {
+        return Err(ApiError::bad("Приглашение отозвано"));
+    }
+    if invite.used_count >= invite.max_uses {
+        return Err(ApiError::bad("Приглашение уже использовано"));
+    }
+    if invite.is_expired() {
+        return Err(ApiError::bad("Срок действия приглашения истёк"));
+    }
+    Ok(())
+}
+
+fn consume_invite(conn: &Connection, token: &str, user_id: i64) -> ApiResult {
+    let invite = invite_by_token(conn, token)?;
+    ensure_invite_usable(&invite)?;
+    let (id, ws) = (invite.id, invite.workspace_id);
+    let exists: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM user_workspaces WHERE user_id=?1 AND workspace_id=?2",
+        params![user_id, ws],
+        |r| r.get(0),
+    )?;
+    if exists == 0 {
+        conn.execute(
+            "INSERT INTO user_workspaces (user_id, workspace_id, rights_json) VALUES (?1,?2,?3)",
+            params![user_id, ws, db::rights_for_role(&invite.role).to_string()],
+        )?;
+    }
+    conn.execute(
+        "UPDATE invites SET used_count=used_count+1 WHERE id=?1",
+        params![id],
+    )?;
+    Ok(jsn::workspace_json(conn, ws).unwrap_or(json!({"id": ws})))
+}
+
+fn auth_join(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
+    let uid = require_user(conn, user_id)?;
+    let token = s(input, "token").ok_or_else(|| ApiError::bad("Нет токена приглашения"))?;
+    consume_invite(conn, &token, uid)
+}
+
+fn auth_join_register(conn: &Connection, input: &Value) -> ApiResult {
+    let token = s(input, "token").ok_or_else(|| ApiError::bad("Нет токена приглашения"))?;
+    let invite = invite_by_token(conn, &token)?;
+    ensure_invite_usable(&invite)?;
+    let ws = invite.workspace_id;
+    let full_name = s(input, "fullName").ok_or_else(|| ApiError::bad("Введите имя"))?;
+    let phone = s(input, "phone").ok_or_else(|| ApiError::bad("Введите телефон"))?;
+    let password = s(input, "password").unwrap_or_default();
+    if full_name.chars().count() > 200 {
+        return Err(ApiError::bad("Имя слишком длинное"));
+    }
+    validate_phone(&phone)?;
+    let uid = if let Some(existing) = find_user_phone(conn, &phone) {
+        let h: Option<String> = conn.query_row(
+            "SELECT password_hash FROM users WHERE id=?1",
+            params![existing],
+            |r| r.get(0),
+        )?;
+        let h = h.unwrap_or_default();
+        if !h.is_empty() && !verify_password(&password, &h) {
+            return Err(ApiError::unauth("Неверный пароль для этого телефона"));
+        }
+        if h.is_empty() {
+            let invited_here: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM user_workspaces uw JOIN users u ON u.id=uw.user_id WHERE uw.user_id=?1 AND uw.workspace_id=?2 AND u.status='invited'",
+                params![existing, ws], |r| r.get(0),
+            )?;
+            if invited_here == 0 || validate_new_password(&password).is_err() {
+                return Err(ApiError::unauth("Аккаунт требует персональной активации"));
+            }
+            conn.execute(
+                "UPDATE users SET password_hash=?1,status='active' WHERE id=?2",
+                params![hash_password(&password), existing],
+            )?;
+        }
+        existing
+    } else {
+        validate_new_password(&password)?;
+        conn.execute(
+            "INSERT INTO users (full_name, position, phone, status, password_hash, role_rights, created_at)
+             VALUES (?1,?2,?3,'active',?4,?5,?6)",
+            params![
+                full_name,
+                invite_position(&invite.role),
+                phone,
+                hash_password(&password),
+                db::rights_for_role(&invite.role).to_string(),
+                now()
+            ],
+        ).map_err(|e| ApiError::bad(e.to_string()))?;
+        conn.last_insert_rowid()
+    };
+    let wsj = consume_invite(conn, &token, uid)?;
+    let mut u = jsn::user_public(conn, uid).unwrap();
+    u["joinedWorkspace"] = wsj;
+    u["workspaceId"] = json!(ws);
+    Ok(u)
+}
+
+fn invite_info(conn: &Connection, input: &Value) -> ApiResult {
+    let token = s(input, "token").ok_or_else(|| ApiError::bad("token"))?;
+    let invite = invite_by_token(conn, &token)?;
+    ensure_invite_usable(&invite)?;
+    let wsj = jsn::workspace_json(conn, invite.workspace_id).unwrap_or(json!({}));
+    Ok(json!({
+        "workspace": wsj,
+        "role": invite.role,
+        "token": token,
+        "expiresAt": invite.expires_at,
+    }))
+}
+
+fn workspaces_list(conn: &Connection) -> ApiResult {
+    let ids: Vec<i64> = CURRENT_UID.with(|c| {
+        if let Some(uid) = c.get() {
+            conn.prepare("SELECT workspace_id FROM user_workspaces WHERE user_id=?1 ORDER BY id")
+                .ok()
+                .and_then(|mut stmt| {
+                    stmt.query_map(params![uid], |r| r.get(0))
+                        .ok()
+                        .map(|rows| rows.filter_map(|x| x.ok()).collect())
+                })
+                .unwrap_or_default()
+        } else {
+            conn.prepare("SELECT id FROM workspaces ORDER BY id")
+                .ok()
+                .and_then(|mut stmt| {
+                    stmt.query_map([], |r| r.get(0))
+                        .ok()
+                        .map(|rows| rows.filter_map(|x| x.ok()).collect())
+                })
+                .unwrap_or_default()
+        }
+    });
+    Ok(Value::Array(
+        ids.into_iter()
+            .filter_map(|id| jsn::workspace_json(conn, id))
+            .collect(),
+    ))
+}
+
+fn transfer_counts(conn: &Connection, uid: i64) -> ApiResult {
+    let outgoing: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM transfers WHERE from_user_id=?1 AND status IN ('draft','pending')",
+        params![uid],
+        |r| r.get(0),
+    )?;
+    let incoming: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM transfers WHERE to_user_id=?1 AND status='pending'",
+        params![uid],
+        |r| r.get(0),
+    )?;
+    Ok(json!({"outgoing": outgoing, "incoming": incoming}))
+}
+
+/// Карточка для списка: без оригиналов снимков.
+fn item_for_list(conn: &Connection, id: i64) -> Option<Value> {
+    let mut item = jsn::item_json(conn, id, false)?;
+    jsn::strip_full_photos(&mut item);
+    Some(item)
+}
+
+fn items_list(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
+    let ws = i64v(input, "workspaceId").unwrap_or_else(|| ws_fallback(conn));
+    let page = i64v(input, "page").unwrap_or(1).max(1);
+    let limit = i64v(input, "limit").unwrap_or(20).clamp(1, 500);
+    let search = s(input, "search").map(|q| q.to_lowercase());
+    let only_mine = b(input, "onlyMine").unwrap_or(false);
+    let mut stmt = conn.prepare("SELECT id, title, internal_id, serial_number, responsible_user_id FROM items WHERE workspace_id=?1 ORDER BY created_at DESC, id DESC")?;
+    let mut ids: Vec<i64> = Vec::new();
+    let rows = stmt.query_map(params![ws], |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, Option<String>>(3)?,
+            r.get::<_, Option<i64>>(4)?,
+        ))
+    })?;
+    for row in rows.flatten() {
+        let (id, title, internal, serial, resp) = row;
+        if only_mine && resp != user_id {
+            continue;
+        }
+        if let Some(ref q) = search {
+            let blob = format!(
+                "{} {} {}",
+                title,
+                internal,
+                serial.clone().unwrap_or_default()
+            )
+            .to_lowercase();
+            if !blob.contains(q) {
+                continue;
+            }
+        }
+        ids.push(id);
+    }
+    let total = ids.len() as i64;
+    let start = ((page - 1) * limit) as usize;
+    let has_more = total > start as i64 + limit;
+    let rows: Vec<Value> = ids
+        .into_iter()
+        .skip(start)
+        .take(limit as usize)
+        .filter_map(|id| item_for_list(conn, id))
+        .collect();
+    Ok(json!({"rows": rows, "page": page, "limit": limit, "hasMore": has_more, "total": total}))
+}
+
+fn items_by_id(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
+    let uid = require_user(conn, user_id)?;
+    let id = i64v(input, "id").ok_or_else(|| ApiError::bad("id"))?;
+    require_item_access(conn, uid, id)?;
+    jsn::item_json(conn, id, true).ok_or_else(|| ApiError::not_found("Инструмент не найден"))
+}
+
+fn items_by_code(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
+    let uid = require_user(conn, user_id)?;
+    let code = s(input, "code").ok_or_else(|| ApiError::bad("code"))?;
+    let id: Option<i64> = conn.query_row(
+        "SELECT id FROM items WHERE qr_code=?1 OR internal_id=?1 OR UPPER(qr_code)=UPPER(?1) OR UPPER(internal_id)=UPPER(?1) LIMIT 1",
+        params![code], |r| r.get(0),
+    ).optional().ok().flatten();
+    let id = id.ok_or_else(|| ApiError::not_found("Инструмент с таким QR/номером не найден"))?;
+    require_item_access(conn, uid, id)?;
+    jsn::item_json(conn, id, false).ok_or_else(|| ApiError::not_found("Инструмент не найден"))
+}
+
+fn items_next_id(conn: &Connection, input: &Value) -> ApiResult {
+    let ws = i64v(input, "workspaceId").unwrap_or_else(|| ws_fallback(conn));
+    let prefix: String = conn
+        .query_row(
+            "SELECT internal_id_prefix FROM workspaces WHERE id=?1",
+            params![ws],
+            |r| r.get(0),
+        )
+        .unwrap_or_else(|_| "ВН-".into());
+    let mut stmt = conn.prepare("SELECT internal_id FROM items WHERE workspace_id=?1")?;
+    let ids: Vec<String> = stmt
+        .query_map(params![ws], |r| r.get(0))?
+        .filter_map(|x| x.ok())
+        .collect();
+    let mut max = 0i64;
+    for id in ids {
+        if let Some(n) = id.strip_prefix(&prefix).and_then(|x| x.parse::<i64>().ok()) {
+            if n > max {
+                max = n;
+            }
+        }
+    }
+    Ok(json!(format!("{prefix}{:04}", max + 1)))
+}
+
+fn items_create(conn: &mut Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
+    atomic(conn, |conn| items_create_atomic(conn, input, user_id))
+}
+
+fn items_create_atomic(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
+    let uid = require_user(conn, user_id)?;
+    let ws = i64v(input, "workspaceId").unwrap_or_else(|| ws_fallback(conn));
+    require_member(conn, uid, ws)?;
+    require_can_in_workspace(conn, uid, ws, "createItems")?;
+    validate_item_references(conn, input, ws)?;
+    let title = s(input, "title").ok_or_else(|| ApiError::bad("Название обязательно"))?;
+    let internal = if let Some(v) = s(input, "internalId") {
+        v
+    } else {
+        items_next_id(conn, &json!({"workspaceId": ws}))?
+            .as_str()
+            .unwrap_or("ВН-0001")
+            .to_string()
+    };
+    let qr = s(input, "qrCode").or(Some(internal.clone()));
+    let metadata = item_metadata(input)?;
+    conn.execute(
+        "INSERT INTO items (internal_id, title, category_id, brand_id, status_id, responsible_user_id, building_site_id, storage_id, workspace_id, serial_number, cost, quantitative, quantity, unit, comment, qr_code, source_system, external_id, metadata_json, created_at)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
+        params![
+            internal, title, i64v(input,"categoryId"), i64v(input,"brandId"), i64v(input,"statusId"),
+            i64v(input,"responsibleUserId"), i64v(input,"buildingSiteId"), i64v(input,"storageId"), ws,
+            s(input,"serialNumber"), f64v(input,"cost"), b(input,"quantitative").unwrap_or(false) as i64,
+            f64v(input,"quantity"), s(input,"unit"), s(input,"comment"), qr,
+            s(input,"sourceSystem"), s(input,"externalId"), metadata, now()
+        ],
+    ).map_err(|e| ApiError::bad(e.to_string()))?;
+    let id = conn.last_insert_rowid();
+    if let Some(arr) = g(input, "photos").as_array() {
+        for (i, p) in arr.iter().enumerate() {
+            // Принимаем и строку с оригиналом, и пару {url, thumbUrl}.
+            let (url, thumb) = match p {
+                Value::String(url) => (Some(url.clone()), None),
+                Value::Object(_) => (
+                    p.get("url").and_then(Value::as_str).map(str::to_owned),
+                    p.get("thumbUrl").and_then(Value::as_str).map(str::to_owned),
+                ),
+                _ => (None, None),
+            };
+            if let Some(url) = url {
+                insert_photo(conn, id, &url, thumb.as_deref(), i == 0)?;
+            }
+        }
+    }
+    ledger::append(
+        conn,
+        ws,
+        uid,
+        Some(id),
+        "create",
+        None,
+        Some(&title),
+        None,
+        Some("Инструмент добавлен в каталог"),
+    )
+    .map_err(|e| ApiError::internal(format!("Ошибка журнала: {e}")))?;
+    jsn::item_json(conn, id, true).ok_or_else(|| ApiError::bad("не создан"))
+}
+
+fn items_update(conn: &mut Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
+    atomic(conn, |conn| items_update_atomic(conn, input, user_id))
+}
+
+fn items_update_atomic(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
+    let uid = require_user(conn, user_id)?;
+    require_can(conn, uid, "editItems")?;
+    let id = i64v(input, "id").ok_or_else(|| ApiError::bad("id"))?;
+    require_item_access(conn, uid, id)?;
+    let before = jsn::item_json(conn, id, false)
+        .ok_or_else(|| ApiError::not_found("Инструмент не найден"))?;
+    let ws = before["workspaceId"]
+        .as_i64()
+        .ok_or_else(|| ApiError::bad("Некорректный item"))?;
+    validate_item_references(conn, input, ws)?;
+    let before_status = before["statusId"].as_i64();
+    let next_status = if input.get("statusId").is_some() {
+        i64v(input, "statusId")
+    } else {
+        before_status
+    };
+    let reason = status_change_reason(conn, input, before_status, next_status)?;
+    let metadata = item_metadata(input)?;
+    conn.execute(
+        "UPDATE items SET title=COALESCE(?2,title),
+         category_id=CASE WHEN ?3 THEN ?4 ELSE category_id END,
+         brand_id=CASE WHEN ?5 THEN ?6 ELSE brand_id END,
+         status_id=CASE WHEN ?7 THEN ?8 ELSE status_id END,
+         responsible_user_id=CASE WHEN ?9 THEN ?10 ELSE responsible_user_id END,
+         building_site_id=CASE WHEN ?11 THEN ?12 ELSE building_site_id END,
+         storage_id=CASE WHEN ?13 THEN ?14 ELSE storage_id END,
+         serial_number=CASE WHEN ?15 THEN ?16 ELSE serial_number END,
+         cost=CASE WHEN ?17 THEN ?18 ELSE cost END,
+         comment=CASE WHEN ?19 THEN ?20 ELSE comment END,
+         qr_code=CASE WHEN ?21 THEN ?22 ELSE qr_code END,
+         calibrated_until=CASE WHEN ?23 THEN ?24 ELSE calibrated_until END,
+         min_quantity=CASE WHEN ?25 THEN ?26 ELSE min_quantity END,
+         source_system=CASE WHEN ?27 THEN ?28 ELSE source_system END,
+         external_id=CASE WHEN ?29 THEN ?30 ELSE external_id END,
+         metadata_json=CASE WHEN ?31 THEN ?32 ELSE metadata_json END
+         WHERE id=?1",
+        params![
+            id,
+            s(input, "title"),
+            input.get("categoryId").is_some(),
+            i64v(input, "categoryId"),
+            input.get("brandId").is_some(),
+            i64v(input, "brandId"),
+            input.get("statusId").is_some(),
+            i64v(input, "statusId"),
+            input.get("responsibleUserId").is_some(),
+            i64v(input, "responsibleUserId"),
+            input.get("buildingSiteId").is_some(),
+            i64v(input, "buildingSiteId"),
+            input.get("storageId").is_some(),
+            i64v(input, "storageId"),
+            input.get("serialNumber").is_some(),
+            s(input, "serialNumber"),
+            input.get("cost").is_some(),
+            f64v(input, "cost"),
+            input.get("comment").is_some(),
+            s(input, "comment"),
+            input.get("qrCode").is_some(),
+            s(input, "qrCode"),
+            input.get("calibratedUntil").is_some(),
+            s(input, "calibratedUntil"),
+            input.get("minQuantity").is_some(),
+            f64v(input, "minQuantity"),
+            input.get("sourceSystem").is_some(),
+            s(input, "sourceSystem"),
+            input.get("externalId").is_some(),
+            s(input, "externalId"),
+            input.get("metadata").is_some(),
+            metadata
+        ],
+    )?;
+    // Смена статуса и места хранения не должна выглядеть как безымянная правка:
+    // журнал фиксирует переход и причину.
+    let mut note = String::from("Данные инструмента обновлены");
+    if before_status != next_status {
+        let (from_name, _) = status_label(conn, before_status);
+        let (to_name, _) = status_label(conn, next_status);
+        note = format!(
+            "Статус: {} → {}",
+            from_name.unwrap_or_else(|| "—".into()),
+            to_name.unwrap_or_else(|| "—".into())
+        );
+        if let Some(text) = &reason {
+            note.push_str(&format!(". Причина: {text}"));
+        }
+    }
+    let before_storage = before["storageId"].as_i64();
+    let next_storage = if input.get("storageId").is_some() {
+        i64v(input, "storageId")
+    } else {
+        before_storage
+    };
+    if before_storage != next_storage {
+        let name: Option<String> = next_storage.and_then(|sid| {
+            conn.query_row("SELECT name FROM storages WHERE id=?1", params![sid], |r| {
+                r.get::<_, String>(0)
+            })
+            .optional()
+            .ok()
+            .flatten()
+        });
+        note.push_str(&format!(
+            ". Место хранения: {}",
+            name.unwrap_or_else(|| "не указано".into())
+        ));
+    }
+    ledger::append(
+        conn,
+        ws,
+        uid,
+        Some(id),
+        "update",
+        None,
+        None,
+        None,
+        Some(&note),
+    )
+    .map_err(|e| ApiError::internal(format!("Ошибка журнала: {e}")))?;
+    jsn::item_json(conn, id, true).ok_or_else(|| ApiError::not_found("нет"))
+}
+
+fn items_remove(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
+    let uid = require_user(conn, user_id)?;
+    require_can(conn, uid, "deleteItems")?;
+    let _ = uid;
+    let id = i64v(input, "id").ok_or_else(|| ApiError::bad("id"))?;
+    require_item_access(conn, uid, id)?;
+    conn.execute("DELETE FROM item_photos WHERE item_id=?1", params![id])?;
+    conn.execute("DELETE FROM items WHERE id=?1", params![id])?;
+    Ok(json!({"ok": true}))
+}
+
+/// Контрольная сумма вложения (ТЗ §5): по ней видно подмену снимка.
+fn photo_checksum(url: &str) -> String {
+    hex::encode(Sha256::digest(url.as_bytes()))
+}
+
+fn insert_photo(
+    conn: &Connection,
+    item_id: i64,
+    url: &str,
+    thumb: Option<&str>,
+    is_title: bool,
+) -> Result<i64, ApiError> {
+    conn.execute(
+        "INSERT INTO item_photos (item_id, url, thumb_url, sha256, is_title) VALUES (?1,?2,?3,?4,?5)",
+        params![
+            item_id,
+            url,
+            thumb.unwrap_or(url),
+            photo_checksum(url),
+            is_title as i64
+        ],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+fn items_add_photo(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
+    let uid = require_user(conn, user_id)?;
+    require_can(conn, uid, "editItems")?;
+    let item_id = i64v(input, "itemId").ok_or_else(|| ApiError::bad("itemId"))?;
+    require_item_access(conn, uid, item_id)?;
+    let url = s(input, "url").ok_or_else(|| ApiError::bad("url"))?;
+    let is_title = b(input, "isTitle").unwrap_or(false);
+    let thumb = s(input, "thumbUrl");
+    let id = insert_photo(conn, item_id, &url, thumb.as_deref(), is_title)?;
+    Ok(json!({
+        "id": id,
+        "itemId": item_id,
+        "url": url,
+        "thumbUrl": thumb.unwrap_or(url.clone()),
+        "sha256": photo_checksum(&url),
+        "isTitle": is_title
+    }))
+}
+
+fn items_add_comment(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
+    let uid = require_user(conn, user_id)?;
+    let item_id = i64v(input, "itemId").ok_or_else(|| ApiError::bad("itemId"))?;
+    require_item_access(conn, uid, item_id)?;
+    let text = s(input, "text").ok_or_else(|| ApiError::bad("text"))?;
+    conn.execute(
+        "INSERT INTO item_comments (item_id, user_id, text, created_at) VALUES (?1,?2,?3,?4)",
+        params![item_id, uid, text, now()],
+    )?;
+    Ok(
+        json!({"id": conn.last_insert_rowid(), "itemId": item_id, "userId": uid, "text": text, "user": jsn::user_public(conn, uid)}),
+    )
+}
+
+fn transfers_list(conn: &Connection, user_id: Option<i64>, outgoing: bool) -> ApiResult {
+    let uid = require_user(conn, user_id)?;
+    let sql = if outgoing {
+        "SELECT id FROM transfers WHERE from_user_id=?1 AND status IN ('draft','pending') ORDER BY id DESC"
+    } else {
+        "SELECT id FROM transfers WHERE to_user_id=?1 AND status='pending' ORDER BY id DESC"
+    };
+    let mut stmt = conn.prepare(sql)?;
+    let ids: Vec<i64> = stmt
+        .query_map(params![uid], |r| r.get(0))?
+        .filter_map(|x| x.ok())
+        .collect();
+    Ok(Value::Array(
+        ids.into_iter()
+            .filter_map(|id| jsn::transfer_json(conn, id))
+            .collect(),
+    ))
+}
+
+fn transfer_by_id(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
+    let uid = require_user(conn, user_id)?;
+    let id = i64v(input, "id").ok_or_else(|| ApiError::bad("id"))?;
+    let transfer =
+        jsn::transfer_json(conn, id).ok_or_else(|| ApiError::not_found("Передача не найдена"))?;
+    let ws = transfer["workspaceId"]
+        .as_i64()
+        .ok_or_else(|| ApiError::bad("Некорректная передача"))?;
+    require_member(conn, uid, ws)?;
+    let party =
+        transfer["fromUserId"].as_i64() == Some(uid) || transfer["toUserId"].as_i64() == Some(uid);
+    if !party && !user_can(conn, uid, "manageUsers") {
+        return Err(ApiError::new(
+            "FORBIDDEN",
+            403,
+            "Передача доступна только её участникам",
+        ));
+    }
+    Ok(transfer)
+}
+
+fn next_transfer_code(conn: &Connection, ws: i64) -> String {
+    let n: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM transfers WHERE workspace_id=?1",
+            params![ws],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    format!("ПП-{:04}", n + 1)
+}
+
+fn checkout_policy(conn: &Connection, uid: i64) -> Value {
+    jsn::user_public(conn, uid)
+        .and_then(|u| u.get("checkoutPolicy").cloned())
+        .unwrap_or_else(db::default_checkout_policy)
+}
+
+/// Списанный, отправленный в ремонт или на проверку предмет не участвует
+/// в обороте — ни выдача, ни передача другому сотруднику.
+fn ensure_item_circulates(conn: &Connection, item: &Value, item_id: i64) -> Result<(), ApiError> {
+    match item["status"]["slug"].as_str() {
+        Some("written-off") => {
+            return Err(ApiError::bad("Списанный инструмент недоступен для выдачи"))
+        }
+        Some("in-repair") | Some("needs-check") => {
+            return Err(ApiError::bad(
+                "Инструмент на проверке или в ремонте, выдача запрещена",
+            ))
+        }
+        _ => {}
+    }
+    let open_faults: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM faults WHERE item_id=?1 AND status IN ('open','repair')",
+            params![item_id],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    if open_faults > 0 {
+        return Err(ApiError::bad(
+            "По предмету есть неисправность, выдача запрещена",
+        ));
+    }
+    Ok(())
+}
+
+fn take_one(
+    conn: &mut Connection,
+    uid: i64,
+    item_id: i64,
+    comment: Option<&str>,
+    due_at: Option<&str>,
+    photo_url: Option<&str>,
+    qty: Option<f64>,
+) -> ApiResult {
+    atomic(conn, |conn| {
+        take_one_atomic(conn, uid, item_id, comment, due_at, photo_url, qty)
+    })
+}
+
+fn take_one_atomic(
+    conn: &Connection,
+    uid: i64,
+    item_id: i64,
+    comment: Option<&str>,
+    due_at: Option<&str>,
+    photo_url: Option<&str>,
+    qty: Option<f64>,
+) -> ApiResult {
+    let item_ws = require_item_access(conn, uid, item_id)?;
+    require_can_in_workspace(conn, uid, item_ws, "transferItems")?;
+    let item = jsn::item_json(conn, item_id, false)
+        .ok_or_else(|| ApiError::not_found("Инструмент не найден"))?;
+    ensure_item_circulates(conn, &item, item_id)?;
+    if item["responsibleUserId"].as_i64() == Some(uid)
+        && !item["quantitative"].as_bool().unwrap_or(false)
+    {
+        return Err(ApiError::bad("Инструмент уже у вас"));
+    }
+    let policy = checkout_policy(conn, uid);
+    if let Some(cats) = policy.get("allowedCategoryIds").and_then(|v| v.as_array()) {
+        if !cats.is_empty() {
+            let cat = item["categoryId"].as_i64();
+            let ok = cat
+                .map(|c| cats.iter().any(|x| x.as_i64() == Some(c)))
+                .unwrap_or(false);
+            if !ok {
+                return Err(ApiError::bad("Вам не разрешено брать эту категорию"));
+            }
+        }
+    }
+    let allow_none = policy
+        .get("allowNoDueDate")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    if due_at.is_none() && !allow_none {
+        return Err(ApiError::bad("Укажите срок возврата"));
+    }
+    if let (Some(due), Some(max_h)) = (due_at, policy.get("maxHours").and_then(|v| v.as_f64())) {
+        if let Ok(due_ts) = chrono::DateTime::parse_from_rfc3339(due) {
+            let hours =
+                (due_ts.with_timezone(&chrono::Utc) - chrono::Utc::now()).num_hours() as f64;
+            if hours > max_h + 0.1 {
+                return Err(ApiError::bad(format!(
+                    "Срок больше разрешённого ({max_h} ч)"
+                )));
+            }
+        }
+    }
+    let ws = item["workspaceId"].as_i64().unwrap_or(1);
+    let from = item["responsibleUserId"]
+        .as_i64()
+        .or_else(|| item["storage"]["responsibleUserId"].as_i64())
+        .unwrap_or(uid);
+    let need_admin = policy
+        .get("requireApproval")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let code = next_transfer_code(conn, ws);
+    if item["quantitative"].as_bool().unwrap_or(false) {
+        let take_qty = qty.unwrap_or(1.0);
+        if take_qty <= 0.0 {
+            return Err(ApiError::bad("Укажите количество"));
+        }
+        let stock = item["quantity"].as_f64().unwrap_or(0.0);
+        if take_qty > stock + 1e-9 {
+            return Err(ApiError::bad(format!("На складе только {stock}")));
+        }
+        if need_admin {
+            conn.execute(
+                "INSERT INTO transfers (code, item_id, from_user_id, to_user_id, to_storage_id, building_site_id, workspace_id, quantity, status, comment, no_confirmation, needs_admin, photo_url, created_at)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,'pending',?9,0,1,?10,?11)",
+                params![code, item_id, from, uid, item["storageId"].as_i64(), item["buildingSiteId"].as_i64(), ws, take_qty, comment, photo_url, now()],
+            )?;
+            return Ok(
+                json!({"pending": true, "code": code, "itemId": item_id, "quantity": take_qty, "message": "Заявка отправлена администратору"}),
+            );
+        }
+        let changed = conn.execute(
+            "UPDATE items SET quantity=quantity-?1 WHERE id=?2 AND quantity>=?1",
+            params![take_qty, item_id],
+        )?;
+        if changed != 1 {
+            return Err(ApiError::conflict("Остаток изменился; повторите операцию"));
+        }
+        conn.execute(
+            "INSERT INTO item_holdings (item_id, user_id, quantity, due_at, comment, photo_url, created_at) VALUES (?1,?2,?3,?4,?5,?6,?7)",
+            params![item_id, uid, take_qty, due_at, comment, photo_url, now()],
+        )?;
+        conn.execute(
+            "INSERT INTO transfers (code, item_id, from_user_id, to_user_id, to_storage_id, building_site_id, workspace_id, quantity, status, comment, no_confirmation, photo_url, created_at, completed_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,'accepted',?9,1,?10,?11,?11)",
+            params![code, item_id, from, uid, item["storageId"].as_i64(), item["buildingSiteId"].as_i64(), ws, take_qty, comment, photo_url, now()],
+        )?;
+        let title = item["title"].as_str().unwrap_or("");
+        let to_name = jsn::user_public(conn, uid)
+            .and_then(|u| u["fullName"].as_str().map(|s| s.to_string()))
+            .unwrap_or_default();
+        ledger::append(
+            conn,
+            ws,
+            uid,
+            Some(item_id),
+            "transfer_receive",
+            Some("Склад"),
+            Some(&to_name),
+            Some(take_qty),
+            Some(&format!("Выдача {code}: {take_qty} × {title}")),
+        )
+        .map_err(|e| ApiError::internal(format!("Ошибка журнала: {e}")))?;
+        return jsn::item_json(conn, item_id, false).ok_or_else(|| ApiError::bad("ошибка"));
+    }
+    if need_admin {
+        conn.execute(
+            "INSERT INTO transfers (code, item_id, from_user_id, to_user_id, to_storage_id, building_site_id, workspace_id, status, comment, no_confirmation, needs_admin, photo_url, created_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,'pending',?8,0,1,?9,?10)",
+            params![code, item_id, from, uid, item["storageId"].as_i64(), item["buildingSiteId"].as_i64(), ws, comment, photo_url, now()],
+        )?;
+        notify_admins(
+            conn,
+            ws,
+            item_id,
+            "Заявка на выдачу",
+            &format!(
+                "{} просит {} ({})",
+                jsn::user_public(conn, uid)
+                    .and_then(|u| u["fullName"].as_str().map(|s| s.to_string()))
+                    .unwrap_or_default(),
+                item["title"].as_str().unwrap_or(""),
+                code
+            ),
+        );
+        return Ok(
+            json!({"pending": true, "code": code, "itemId": item_id, "message": "Заявка отправлена администратору"}),
+        );
+    }
+    let in_work: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM statuses WHERE workspace_id=?1 AND slug='in-work'",
+            params![ws],
+            |r| r.get(0),
+        )
+        .optional()
+        .ok()
+        .flatten();
+    conn.execute(
+        "INSERT INTO transfers (code, item_id, from_user_id, to_user_id, to_storage_id, building_site_id, workspace_id, status, comment, no_confirmation, photo_url, created_at, completed_at)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,'accepted',?8,1,?9,?10,?10)",
+        params![code, item_id, from, uid, item["storageId"].as_i64(), item["buildingSiteId"].as_i64(), ws, comment, photo_url, now()],
+    )?;
+    conn.execute(
+        "UPDATE items SET responsible_user_id=?1, status_id=COALESCE(?2,status_id), due_at=?4 WHERE id=?3",
+        params![uid, in_work, item_id, due_at],
+    )?;
+    let title = item["title"].as_str().unwrap_or("");
+    let from_name = jsn::user_public(conn, from)
+        .and_then(|u| u["fullName"].as_str().map(|s| s.to_string()))
+        .unwrap_or_else(|| "Склад".into());
+    let to_name = jsn::user_public(conn, uid)
+        .and_then(|u| u["fullName"].as_str().map(|s| s.to_string()))
+        .unwrap_or_default();
+    ledger::append(
+        conn,
+        ws,
+        from,
+        Some(item_id),
+        "transfer_send",
+        Some(&from_name),
+        Some(&to_name),
+        None,
+        Some(&format!("Выдача {code}: {title}")),
+    )
+    .map_err(|e| ApiError::internal(format!("Ошибка журнала: {e}")))?;
+    ledger::append(
+        conn,
+        ws,
+        uid,
+        Some(item_id),
+        "transfer_receive",
+        Some(&from_name),
+        Some(&to_name),
+        None,
+        Some(&format!("Получение {code}")),
+    )
+    .map_err(|e| ApiError::internal(format!("Ошибка журнала: {e}")))?;
+    jsn::item_json(conn, item_id, false).ok_or_else(|| ApiError::bad("ошибка"))
+}
+
+fn transfers_take(conn: &mut Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
+    let uid = require_user(conn, user_id)?;
+    let id = i64v(input, "itemId").ok_or_else(|| ApiError::bad("itemId"))?;
+    let qty = f64v(input, "quantity");
+    let item = jsn::item_json(conn, id, false)
+        .ok_or_else(|| ApiError::not_found("Инструмент не найден"))?;
+    let want = qty.unwrap_or(1.0).max(1.0);
+    if !item["quantitative"].as_bool().unwrap_or(false) && want > 1.0 {
+        let mut taken = Vec::new();
+        let mut failed = Vec::new();
+        match take_one(
+            conn,
+            uid,
+            id,
+            s(input, "comment").as_deref(),
+            s(input, "dueAt").as_deref(),
+            s(input, "photoUrl").as_deref(),
+            None,
+        ) {
+            Ok(_) => taken.push(id),
+            Err(e) => failed.push(json!({"itemId": id, "message": e.message})),
+        }
+        if let Some(members) = item
+            .get("family")
+            .and_then(|f| f.get("members"))
+            .and_then(|v| v.as_array())
+        {
+            for m in members {
+                if taken.len() as f64 >= want {
+                    break;
+                }
+                let sid = m.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
+                if sid == id || m.get("inStock").and_then(|v| v.as_bool()) != Some(true) {
+                    continue;
+                }
+                match take_one(
+                    conn,
+                    uid,
+                    sid,
+                    s(input, "comment").as_deref(),
+                    s(input, "dueAt").as_deref(),
+                    s(input, "photoUrl").as_deref(),
+                    None,
+                ) {
+                    Ok(_) => taken.push(sid),
+                    Err(e) => failed.push(json!({"itemId": sid, "message": e.message})),
+                }
+            }
+        }
+        return Ok(
+            json!({"takenCount": taken.len(), "taken": taken, "failed": failed, "itemId": id}),
+        );
+    }
+    take_one(
+        conn,
+        uid,
+        id,
+        s(input, "comment").as_deref(),
+        s(input, "dueAt").as_deref(),
+        s(input, "photoUrl").as_deref(),
+        qty,
+    )
+}
+
+fn transfers_take_many(conn: &mut Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
+    let uid = require_user(conn, user_id)?;
+    let ids = g(input, "itemIds").as_array().cloned().unwrap_or_default();
+    let mut taken = Vec::new();
+    let mut failed = Vec::new();
+    for v in ids {
+        let id = v.as_i64().unwrap_or(0);
+        match take_one(
+            conn,
+            uid,
+            id,
+            s(input, "comment").as_deref(),
+            s(input, "dueAt").as_deref(),
+            s(input, "photoUrl").as_deref(),
+            f64v(input, "quantity"),
+        ) {
+            Ok(_) => taken.push(id),
+            Err(e) => failed.push(json!({"itemId": id, "message": e.message})),
+        }
+    }
+    Ok(json!({"takenCount": taken.len(), "taken": taken, "failed": failed}))
+}
+
+fn transfers_return(conn: &mut Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
+    atomic(conn, |conn| transfers_return_atomic(conn, input, user_id))
+}
+
+fn transfers_return_atomic(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
+    let uid = require_user(conn, user_id)?;
+    let id = i64v(input, "itemId").ok_or_else(|| ApiError::bad("itemId"))?;
+    let item = jsn::item_json(conn, id, false)
+        .ok_or_else(|| ApiError::not_found("Инструмент не найден"))?;
+    if item["quantitative"].as_bool().unwrap_or(false) {
+        let held: f64 = conn.query_row(
+            "SELECT COALESCE(SUM(quantity),0) FROM item_holdings WHERE item_id=?1 AND user_id=?2 AND returned_at IS NULL",
+            params![id, uid], |r| r.get(0),
+        ).unwrap_or(0.0);
+        if held <= 0.0 {
+            return Err(ApiError::bad("У вас нет этого материала"));
+        }
+        let give = f64v(input, "quantity").unwrap_or(held).min(held);
+        conn.execute(
+            "UPDATE item_holdings SET returned_at=?1 WHERE item_id=?2 AND user_id=?3 AND returned_at IS NULL",
+            params![now(), id, uid],
+        )?;
+        if give + 1e-9 < held {
+            conn.execute(
+                "INSERT INTO item_holdings (item_id, user_id, quantity, created_at) VALUES (?1,?2,?3,?4)",
+                params![id, uid, held - give, now()],
+            )?;
+        }
+        conn.execute(
+            "UPDATE items SET quantity=COALESCE(quantity,0)+?1 WHERE id=?2",
+            params![give, id],
+        )?;
+        let vn = item["internalId"].as_str().unwrap_or("");
+        let name = jsn::user_public(conn, uid)
+            .and_then(|u| u["fullName"].as_str().map(|s| s.to_string()))
+            .unwrap_or_default();
+        ledger::append(
+            conn,
+            item["workspaceId"].as_i64().unwrap_or(1),
+            uid,
+            Some(id),
+            "transfer_send",
+            Some(&name),
+            Some("Склад"),
+            Some(give),
+            Some(&format!("Возврат {give} × {vn}")),
+        )
+        .map_err(|e| ApiError::internal(format!("Ошибка журнала: {e}")))?;
+        return jsn::item_json(conn, id, false).ok_or_else(|| ApiError::bad("ошибка"));
+    }
+    if item["responsibleUserId"].as_i64() != Some(uid) {
+        if item["responsibleUserId"].is_null() {
+            return Err(ApiError::bad("Инструмент уже на складе"));
+        }
+        return Err(ApiError::bad("Инструмент на другом сотруднике"));
+    }
+    let ws = item["workspaceId"].as_i64().unwrap_or(1);
+    let in_stock: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM statuses WHERE workspace_id=?1 AND slug='in-stock'",
+            params![ws],
+            |r| r.get(0),
+        )
+        .optional()
+        .ok()
+        .flatten();
+    conn.execute("UPDATE items SET responsible_user_id=NULL, building_site_id=NULL, status_id=COALESCE(?1,status_id), due_at=NULL WHERE id=?2", params![in_stock, id])?;
+    let vn = item["internalId"].as_str().unwrap_or("");
+    let name = jsn::user_public(conn, uid)
+        .and_then(|u| u["fullName"].as_str().map(|s| s.to_string()))
+        .unwrap_or_default();
+    ledger::append(
+        conn,
+        ws,
+        uid,
+        Some(id),
+        "transfer_send",
+        Some(&name),
+        Some("Склад"),
+        None,
+        Some(&format!("Возврат {vn} на склад")),
+    )
+    .map_err(|e| ApiError::internal(format!("Ошибка журнала: {e}")))?;
+    jsn::item_json(conn, id, false).ok_or_else(|| ApiError::bad("ошибка"))
+}
+
+fn transfers_prepare(conn: &mut Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
+    atomic(conn, |conn| transfers_prepare_atomic(conn, input, user_id))
+}
+
+fn transfers_prepare_atomic(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
+    let uid = require_user(conn, user_id)?;
+    let item_id = i64v(input, "itemId").ok_or_else(|| ApiError::bad("itemId"))?;
+    let to = i64v(input, "toUserId").ok_or_else(|| ApiError::bad("toUserId"))?;
+    let item = jsn::item_json(conn, item_id, false)
+        .ok_or_else(|| ApiError::not_found("Инструмент не найден"))?;
+    let ws = item["workspaceId"].as_i64().unwrap_or(1);
+    require_member(conn, uid, ws)?;
+    require_can_in_workspace(conn, uid, ws, "transferItems")?;
+    require_member(conn, to, ws)
+        .map_err(|_| ApiError::bad("Получатель не состоит в этом рабочем пространстве"))?;
+    ensure_item_circulates(conn, &item, item_id)?;
+    if !item["quantitative"].as_bool().unwrap_or(false)
+        && item["responsibleUserId"].as_i64().is_some()
+        && item["responsibleUserId"].as_i64() != Some(uid)
+    {
+        return Err(ApiError::new(
+            "FORBIDDEN",
+            403,
+            "Передать инструмент может только ответственный сотрудник",
+        ));
+    }
+    let status = if b(input, "asDraft").unwrap_or(false) {
+        "draft"
+    } else {
+        "pending"
+    };
+    let code = next_transfer_code(conn, ws);
+    conn.execute(
+        "INSERT INTO transfers (code, item_id, from_user_id, to_user_id, to_storage_id, building_site_id, workspace_id, quantity, status, comment, no_confirmation, created_at)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+        params![code, item_id, uid, to, i64v(input,"toStorageId"), i64v(input,"buildingSiteId"), ws, f64v(input,"quantity"), status, s(input,"comment"), b(input,"noConfirmation").unwrap_or(false) as i64, now()],
+    )?;
+    let tid = conn.last_insert_rowid();
+    ledger::append(
+        conn,
+        ws,
+        uid,
+        Some(item_id),
+        "transfer_send",
+        None,
+        None,
+        None,
+        Some(&format!("Передача {code} оформлена")),
+    )
+    .map_err(|e| ApiError::internal(format!("Ошибка журнала: {e}")))?;
+    if to != uid {
+        let title = item["title"].as_str().unwrap_or("");
+        let from_name = jsn::user_public(conn, uid)
+            .and_then(|u| u["fullName"].as_str().map(|s| s.to_string()))
+            .unwrap_or_default();
+        conn.execute(
+            "INSERT INTO notifications (user_id, item_id, type, title, text, created_at) VALUES (?1,?2,'transfer','Ожидает приёма',?3,?4)",
+            params![to, item_id, format!("Передача {code}: {title} от {from_name}"), now()],
+        )?;
+    }
+    jsn::transfer_json(conn, tid).ok_or_else(|| ApiError::bad("ошибка"))
+}
+
+fn transfers_accept(
+    conn: &mut Connection,
+    input: &Value,
+    user_id: Option<i64>,
+    accept: bool,
+) -> ApiResult {
+    atomic(conn, |conn| {
+        transfers_accept_atomic(conn, input, user_id, accept)
+    })
+}
+
+fn transfers_accept_atomic(
+    conn: &Connection,
+    input: &Value,
+    user_id: Option<i64>,
+    accept: bool,
+) -> ApiResult {
+    let uid = require_user(conn, user_id)?;
+    let id = i64v(input, "id").ok_or_else(|| ApiError::bad("id"))?;
+    let t =
+        jsn::transfer_json(conn, id).ok_or_else(|| ApiError::not_found("Передача не найдена"))?;
+    let ws = t["workspaceId"]
+        .as_i64()
+        .ok_or_else(|| ApiError::bad("Некорректная передача"))?;
+    require_member(conn, uid, ws)?;
+    let needs_admin: bool = conn.query_row(
+        "SELECT needs_admin != 0 FROM transfers WHERE id=?1",
+        params![id],
+        |row| row.get(0),
+    )?;
+    if needs_admin {
+        require_can(conn, uid, "manageUsers")?;
+    } else if t["toUserId"].as_i64() != Some(uid) {
+        return Err(ApiError::new(
+            "FORBIDDEN",
+            403,
+            "Подтвердить передачу может только получатель",
+        ));
+    }
+    let st = t["status"].as_str().unwrap_or("");
+    if st != "pending" && st != "draft" {
+        return Err(ApiError::bad("Передача уже завершена"));
+    }
+    let new_st = if accept { "accepted" } else { "rejected" };
+    conn.execute(
+        "UPDATE transfers SET status=?1, completed_at=?2, comment=COALESCE(?3,comment) WHERE id=?4",
+        params![new_st, now(), s(input, "comment"), id],
+    )?;
+    if accept {
+        let item_id = t["itemId"]
+            .as_i64()
+            .ok_or_else(|| ApiError::bad("В передаче нет инструмента"))?;
+        let item = jsn::item_json(conn, item_id, false)
+            .ok_or_else(|| ApiError::not_found("Инструмент не найден"))?;
+        if item["quantitative"].as_bool().unwrap_or(false) {
+            let quantity = t["quantity"]
+                .as_f64()
+                .filter(|q| *q > 0.0)
+                .ok_or_else(|| ApiError::bad("В передаче не указано количество"))?;
+            let changed = conn.execute(
+                "UPDATE items SET quantity=quantity-?1 WHERE id=?2 AND quantity>=?1",
+                params![quantity, item_id],
+            )?;
+            if changed != 1 {
+                return Err(ApiError::conflict("Недостаточное количество на складе"));
+            }
+            conn.execute(
+                "INSERT INTO item_holdings (item_id, user_id, quantity, created_at) VALUES (?1,?2,?3,?4)",
+                params![item_id, t["toUserId"].as_i64(), quantity, now()],
+            )?;
+        } else {
+            conn.execute("UPDATE items SET responsible_user_id=?1, storage_id=COALESCE(?2,storage_id), building_site_id=COALESCE(?3,building_site_id) WHERE id=?4",
+                params![t["toUserId"].as_i64(), t["toStorageId"].as_i64(), t["buildingSiteId"].as_i64(), item_id])?;
+        }
+    }
+    ledger::append(
+        conn,
+        ws,
+        uid,
+        t["itemId"].as_i64(),
+        "transfer_receive",
+        None,
+        None,
+        t["quantity"].as_f64(),
+        Some(if accept {
+            "Принята"
+        } else {
+            "Отклонена"
+        }),
+    )
+    .map_err(|e| ApiError::internal(format!("Ошибка журнала: {e}")))?;
+    jsn::transfer_json(conn, id).ok_or_else(|| ApiError::bad("ошибка"))
+}
+
+fn transfers_accept_all(conn: &mut Connection, user_id: Option<i64>) -> ApiResult {
+    let uid = require_user(conn, user_id)?;
+    let mut stmt =
+        conn.prepare("SELECT id FROM transfers WHERE to_user_id=?1 AND status='pending'")?;
+    let ids: Vec<i64> = stmt
+        .query_map(params![uid], |r| r.get(0))?
+        .filter_map(|x| x.ok())
+        .collect();
+    drop(stmt);
+    let mut accepted = Vec::new();
+    for id in ids {
+        if let Ok(v) = transfers_accept(conn, &json!({"id": id}), Some(uid), true) {
+            accepted.push(v);
+        }
+    }
+    Ok(json!({"acceptedCount": accepted.len(), "accepted": accepted}))
+}
+
+fn history_list(conn: &Connection, input: &Value, types: &[&str]) -> ApiResult {
+    let ws = i64v(input, "workspaceId").unwrap_or_else(|| ws_fallback(conn));
+    let mut sql = String::from("SELECT id FROM history_entries WHERE workspace_id=?1");
+    if !types.is_empty() {
+        sql.push_str(" AND type IN (");
+        sql.push_str(
+            &types
+                .iter()
+                .map(|t| format!("'{t}'"))
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+        sql.push(')');
+    }
+    if let Some(id) = i64v(input, "itemId") {
+        sql.push_str(&format!(" AND item_id={id}"));
+    }
+    sql.push_str(" ORDER BY id DESC LIMIT 500");
+    let mut stmt = conn.prepare(&sql)?;
+    let ids: Vec<i64> = stmt
+        .query_map(params![ws], |r| r.get(0))?
+        .filter_map(|x| x.ok())
+        .collect();
+    let mut out = Vec::new();
+    for id in ids {
+        if let Ok(v) = conn.query_row(
+            "SELECT id, workspace_id, item_id, type, actor_user_id, from_label, to_label, quantity_delta, comment, hash, created_at, photo_url FROM history_entries WHERE id=?1",
+            params![id],
+            |r| {
+                let actor: i64 = r.get(4)?;
+                let item_id: Option<i64> = r.get(2)?;
+                Ok(json!({
+                    "id": r.get::<_, i64>(0)?,
+                    "workspaceId": r.get::<_, i64>(1)?,
+                    "itemId": item_id,
+                    "type": r.get::<_, String>(3)?,
+                    "actorUserId": actor,
+                    "fromLabel": r.get::<_, Option<String>>(5)?,
+                    "toLabel": r.get::<_, Option<String>>(6)?,
+                    "quantityDelta": r.get::<_, Option<f64>>(7)?,
+                    "comment": r.get::<_, Option<String>>(8)?,
+                    "opId": r.get::<_, String>(9)?,
+                    "createdAt": r.get::<_, String>(10)?,
+                    "photoUrl": r.get::<_, Option<String>>(11)?,
+                    "actor": jsn::user_public(conn, actor),
+                    "item": item_id.and_then(|i| jsn::item_json(conn, i, false)),
+                }))
+            },
+        ) { out.push(v); }
+    }
+    Ok(Value::Array(out))
+}
+
+/// Требует ли группа фото при списании.
+fn requires_writeoff_photo(conn: &Connection, ws: i64) -> bool {
+    conn.query_row(
+        "SELECT require_writeoff_photo FROM workspaces WHERE id=?1",
+        params![ws],
+        |r| r.get::<_, i64>(0),
+    )
+    .optional()
+    .ok()
+    .flatten()
+    .unwrap_or(0)
+        != 0
+}
+
+/// Привязывает фото к уже созданной записи журнала. Отдельным шагом, чтобы
+/// не расширять и без того длинную сигнатуру `ledger::append`.
+fn attach_photo(conn: &Connection, entry: &Value, photo: Option<&str>) -> Result<(), ApiError> {
+    let (Some(url), Some(id)) = (photo, entry.get("id").and_then(Value::as_i64)) else {
+        return Ok(());
+    };
+    conn.execute(
+        "UPDATE history_entries SET photo_url=?1 WHERE id=?2",
+        params![url, id],
+    )?;
+    Ok(())
+}
+
+fn history_write_off(conn: &mut Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
+    atomic(conn, |conn| history_write_off_atomic(conn, input, user_id))
+}
+
+fn history_write_off_atomic(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
+    let uid = require_user(conn, user_id)?;
+    require_can(conn, uid, "writeOff")?;
+    if s(input, "comment").is_none() {
+        return Err(ApiError::bad("Укажите причину списания"));
+    }
+    let id = i64v(input, "itemId").ok_or_else(|| ApiError::bad("itemId"))?;
+    let item_ws = require_item_access(conn, uid, id)?;
+    // ТЗ §8: если группа так настроена, списание без фото не принимается.
+    let photo = s(input, "photoUrl");
+    if requires_writeoff_photo(conn, item_ws) && photo.is_none() {
+        return Err(ApiError::bad(
+            "В этой группе списание требует фото-подтверждения",
+        ));
+    }
+    let item = jsn::item_json(conn, id, false).ok_or_else(|| ApiError::not_found("нет"))?;
+    let ws = item["workspaceId"].as_i64().unwrap_or(1);
+    if item["quantitative"].as_bool().unwrap_or(false) {
+        let qty = f64v(input, "quantity").unwrap_or(1.0);
+        if qty <= 0.0 {
+            return Err(ApiError::bad("Количество должно быть больше нуля"));
+        }
+        let stock = item["quantity"].as_f64().unwrap_or(0.0);
+        if qty > stock + 1e-9 {
+            return Err(ApiError::bad(format!(
+                "Нельзя списать {qty}: доступно {stock}"
+            )));
+        }
+        let changed = conn.execute(
+            "UPDATE items SET quantity=quantity-?1 WHERE id=?2 AND quantity>=?1",
+            params![qty, id],
+        )?;
+        if changed != 1 {
+            return Err(ApiError::conflict("Остаток изменился; повторите операцию"));
+        }
+        let entry = ledger::append(
+            conn,
+            ws,
+            uid,
+            Some(id),
+            "write_off",
+            None,
+            None,
+            Some(-qty),
+            s(input, "comment").as_deref(),
+        )
+        .map_err(|e| ApiError::internal(format!("Ошибка журнала: {e}")))?;
+        attach_photo(conn, &entry, photo.as_deref())?;
+    } else {
+        let st = conn
+            .query_row(
+                "SELECT id FROM statuses WHERE workspace_id=?1 AND slug='written-off'",
+                params![ws],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()?
+            .ok_or_else(|| ApiError::bad("В рабочем пространстве нет статуса списания"))?;
+        conn.execute("UPDATE items SET status_id=?1 WHERE id=?2", params![st, id])?;
+        let entry = ledger::append(
+            conn,
+            ws,
+            uid,
+            Some(id),
+            "write_off",
+            None,
+            None,
+            None,
+            s(input, "comment").as_deref(),
+        )
+        .map_err(|e| ApiError::internal(format!("Ошибка журнала: {e}")))?;
+        attach_photo(conn, &entry, photo.as_deref())?;
+    }
+    jsn::item_json(conn, id, false).ok_or_else(|| ApiError::bad("ошибка"))
+}
+
+fn history_replenish(conn: &mut Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
+    atomic(conn, |conn| history_replenish_atomic(conn, input, user_id))
+}
+
+fn history_replenish_atomic(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
+    let uid = require_user(conn, user_id)?;
+    require_can(conn, uid, "replenish")?;
+    let id = i64v(input, "itemId").ok_or_else(|| ApiError::bad("itemId"))?;
+    let qty = f64v(input, "quantity").ok_or_else(|| ApiError::bad("quantity"))?;
+    if qty <= 0.0 {
+        return Err(ApiError::bad("Количество должно быть больше нуля"));
+    }
+    require_item_access(conn, uid, id)?;
+    let item = jsn::item_json(conn, id, false).ok_or_else(|| ApiError::not_found("нет"))?;
+    if !item["quantitative"].as_bool().unwrap_or(false) {
+        return Err(ApiError::bad("Инструмент не количественный"));
+    }
+    conn.execute(
+        "UPDATE items SET quantity=COALESCE(quantity,0)+?1 WHERE id=?2",
+        params![qty, id],
+    )?;
+    ledger::append(
+        conn,
+        item["workspaceId"].as_i64().unwrap_or(1),
+        uid,
+        Some(id),
+        "replenish",
+        None,
+        None,
+        Some(qty),
+        s(input, "comment").as_deref(),
+    )
+    .map_err(|e| ApiError::internal(format!("Ошибка журнала: {e}")))?;
+    jsn::item_json(conn, id, false).ok_or_else(|| ApiError::bad("ошибка"))
+}
+
+fn history_move(conn: &mut Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
+    atomic(conn, |conn| history_move_atomic(conn, input, user_id))
+}
+
+fn history_move_atomic(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
+    let uid = require_user(conn, user_id)?;
+    require_can(conn, uid, "editItems")?;
+    let id = i64v(input, "itemId").ok_or_else(|| ApiError::bad("itemId"))?;
+    require_item_access(conn, uid, id)?;
+    conn.execute(
+        "UPDATE items SET storage_id=COALESCE(?1,storage_id), building_site_id=?2 WHERE id=?3",
+        params![
+            i64v(input, "toStorageId"),
+            i64v(input, "toBuildingSiteId"),
+            id
+        ],
+    )?;
+    let item = jsn::item_json(conn, id, false).ok_or_else(|| ApiError::not_found("нет"))?;
+    ledger::append(
+        conn,
+        item["workspaceId"].as_i64().unwrap_or(1),
+        uid,
+        Some(id),
+        "move",
+        None,
+        None,
+        None,
+        s(input, "comment").as_deref(),
+    )
+    .map_err(|e| ApiError::internal(format!("Ошибка журнала: {e}")))?;
+    Ok(item)
+}
+
+fn inv_sessions(conn: &Connection, input: &Value) -> ApiResult {
+    let ws = i64v(input, "workspaceId").unwrap_or_else(|| ws_fallback(conn));
+    let mut stmt = conn.prepare("SELECT id, number, workspace_id, status, started_by, created_at, completed_at FROM inventory_sessions WHERE workspace_id=?1 ORDER BY id DESC")?;
+    let rows: Vec<Value> = stmt
+        .query_map(params![ws], |r| {
+            let id: i64 = r.get(0)?;
+            let total: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM inventory_results WHERE session_id=?1",
+                    params![id],
+                    |x| x.get(0),
+                )
+                .unwrap_or(0);
+            let checked: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM inventory_results WHERE session_id=?1 AND checked=1",
+                    params![id],
+                    |x| x.get(0),
+                )
+                .unwrap_or(0);
+            Ok(json!({
+                "id": id, "number": r.get::<_, String>(1)?, "workspaceId": r.get::<_, i64>(2)?,
+                "status": r.get::<_, String>(3)?, "startedBy": r.get::<_, i64>(4)?,
+                "createdAt": r.get::<_, String>(5)?, "completedAt": r.get::<_, Option<String>>(6)?,
+                "totalItems": total, "checkedItems": checked,
+                "starter": jsn::user_public(conn, r.get(4)?),
+            }))
+        })?
+        .filter_map(|x| x.ok())
+        .collect();
+    Ok(Value::Array(rows))
+}
+
+fn inv_session_full(conn: &Connection, id: i64) -> Option<Value> {
+    conn.query_row(
+        "SELECT id, number, workspace_id, status, started_by, created_at, completed_at FROM inventory_sessions WHERE id=?1",
+        params![id],
+        |r| {
+            let mut results = Vec::new();
+            let mut stmt = conn.prepare("SELECT id, session_id, item_id, expected_qty, actual_qty, checked FROM inventory_results WHERE session_id=?1").unwrap();
+            for row in stmt.query_map(params![id], |x| {
+                let item_id: i64 = x.get(2)?;
+                Ok(json!({
+                    "id": x.get::<_, i64>(0)?, "sessionId": x.get::<_, i64>(1)?, "itemId": item_id,
+                    "expectedQty": x.get::<_, Option<f64>>(3)?, "actualQty": x.get::<_, Option<f64>>(4)?,
+                    "checked": x.get::<_, i64>(5)? != 0,
+                    "item": jsn::item_json(conn, item_id, false)
+                }))
+            }).unwrap().flatten() { results.push(row); }
+            Ok(json!({
+                "id": r.get::<_, i64>(0)?, "number": r.get::<_, String>(1)?, "workspaceId": r.get::<_, i64>(2)?,
+                "status": r.get::<_, String>(3)?, "startedBy": r.get::<_, i64>(4)?,
+                "createdAt": r.get::<_, String>(5)?, "completedAt": r.get::<_, Option<String>>(6)?,
+                "starter": jsn::user_public(conn, r.get(4)?),
+                "results": results
+            }))
+        },
+    ).ok()
+}
+
+fn inv_by_id(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
+    let uid = require_user(conn, user_id)?;
+    let id = i64v(input, "id").ok_or_else(|| ApiError::bad("id"))?;
+    let ws: i64 = conn.query_row(
+        "SELECT workspace_id FROM inventory_sessions WHERE id=?1",
+        params![id],
+        |r| r.get(0),
+    )?;
+    require_member(conn, uid, ws)?;
+    inv_session_full(conn, id).ok_or_else(|| ApiError::not_found("Сессия не найдена"))
+}
+fn inv_results(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
+    let uid = require_user(conn, user_id)?;
+    let sid = i64v(input, "sessionId").ok_or_else(|| ApiError::bad("sessionId"))?;
+    let ws: i64 = conn.query_row(
+        "SELECT workspace_id FROM inventory_sessions WHERE id=?1",
+        params![sid],
+        |r| r.get(0),
+    )?;
+    require_member(conn, uid, ws)?;
+    let s = inv_session_full(conn, sid).ok_or_else(|| ApiError::not_found("Сессия не найдена"))?;
+    Ok(s.get("results").cloned().unwrap_or(json!([])))
+}
+fn inv_create(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
+    let uid = require_user(conn, user_id)?;
+    require_can(conn, uid, "inventory")?;
+    let ws = i64v(input, "workspaceId").unwrap_or_else(|| ws_fallback(conn));
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM inventory_sessions WHERE workspace_id=?1",
+        params![ws],
+        |r| r.get(0),
+    )?;
+    let number = format!("ИНВ-{:03}", n + 1);
+    conn.execute("INSERT INTO inventory_sessions (number, workspace_id, started_by, created_at) VALUES (?1,?2,?3,?4)", params![number, ws, uid, now()])?;
+    let sid = conn.last_insert_rowid();
+    let mut sql =
+        String::from("SELECT id, quantity, quantitative FROM items WHERE workspace_id=?1");
+    if let Some(st) = i64v(input, "storageId") {
+        sql.push_str(&format!(" AND storage_id={st}"));
+    }
+    let mut stmt = conn.prepare(&sql)?;
+    let rows: Vec<(i64, Option<f64>, i64)> = stmt
+        .query_map(params![ws], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .filter_map(|x| x.ok())
+        .collect();
+    for (id, qty, qnt) in rows {
+        let exp = if qnt != 0 { qty.unwrap_or(0.0) } else { 1.0 };
+        conn.execute("INSERT INTO inventory_results (session_id, item_id, expected_qty, checked) VALUES (?1,?2,?3,0)", params![sid, id, exp])?;
+    }
+    inv_session_full(conn, sid).ok_or_else(|| ApiError::bad("ошибка"))
+}
+fn inv_check(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
+    let uid = require_user(conn, user_id)?;
+    require_can(conn, uid, "inventory")?;
+    let sid = i64v(input, "sessionId").ok_or_else(|| ApiError::bad("sessionId"))?;
+    let iid = i64v(input, "itemId").ok_or_else(|| ApiError::bad("itemId"))?;
+    let (ws, status): (i64, String) = conn.query_row(
+        "SELECT workspace_id,status FROM inventory_sessions WHERE id=?1",
+        params![sid],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    require_member(conn, uid, ws)?;
+    if status != "in_progress" {
+        return Err(ApiError::conflict("Инвентаризация уже завершена"));
+    }
+    require_item_access(conn, uid, iid)?;
+    let checked = b(input, "checked").unwrap_or(true);
+    if checked {
+        conn.execute("UPDATE inventory_results SET checked=1, actual_qty=COALESCE(?3, actual_qty) WHERE session_id=?1 AND item_id=?2",
+            params![sid, iid, f64v(input,"actualQty")])?;
+    } else {
+        conn.execute(
+            "UPDATE inventory_results SET checked=0 WHERE session_id=?1 AND item_id=?2",
+            params![sid, iid],
+        )?;
+    }
+    inv_session_full(conn, sid).ok_or_else(|| ApiError::not_found("нет"))
+}
+/// Расхождения инвентаризации не затирают историю: каждое оформляется
+/// отдельной корректирующей записью журнала, а для количественных позиций
+/// остаток приводится к фактическому (ТЗ §4, «Инвентаризация»).
+fn apply_inventory_corrections(
+    conn: &Connection,
+    session_id: i64,
+    ws: i64,
+    uid: i64,
+    number: &str,
+) -> Result<usize, ApiError> {
+    let mut stmt = conn.prepare(
+        "SELECT r.item_id, r.expected_qty, r.actual_qty, i.quantitative, i.title, i.internal_id
+         FROM inventory_results r JOIN items i ON i.id = r.item_id
+         WHERE r.session_id = ?1 AND r.checked = 1 AND r.actual_qty IS NOT NULL",
+    )?;
+    let rows: Vec<(i64, f64, f64, i64, String, String)> = stmt
+        .query_map(params![session_id], |r| {
+            Ok((
+                r.get(0)?,
+                r.get::<_, Option<f64>>(1)?.unwrap_or(0.0),
+                r.get::<_, Option<f64>>(2)?.unwrap_or(0.0),
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+            ))
+        })?
+        .filter_map(|x| x.ok())
+        .collect();
+    drop(stmt);
+
+    let mut corrections = 0usize;
+    for (item_id, expected, actual, quantitative, title, internal_id) in rows {
+        let delta = actual - expected;
+        if delta.abs() < 1e-9 {
+            continue;
+        }
+        if quantitative != 0 {
+            conn.execute(
+                "UPDATE items SET quantity=?1 WHERE id=?2",
+                params![actual, item_id],
+            )?;
+        }
+        ledger::append(
+            conn,
+            ws,
+            uid,
+            Some(item_id),
+            "inventory",
+            None,
+            None,
+            Some(delta),
+            Some(&format!(
+                "Корректировка по {number}: {internal_id} {title}, учтено {expected}, фактически {actual}"
+            )),
+        )
+        .map_err(|e| ApiError::internal(format!("Ошибка журнала: {e}")))?;
+        corrections += 1;
+    }
+    Ok(corrections)
+}
+
+fn inv_complete(conn: &mut Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
+    atomic(conn, |conn| inv_complete_atomic(conn, input, user_id))
+}
+
+fn inv_complete_atomic(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
+    let uid = require_user(conn, user_id)?;
+    require_can(conn, uid, "inventory")?;
+    let sid = i64v(input, "sessionId").ok_or_else(|| ApiError::bad("sessionId"))?;
+    let ws: i64 = conn.query_row(
+        "SELECT workspace_id FROM inventory_sessions WHERE id=?1",
+        params![sid],
+        |r| r.get(0),
+    )?;
+    require_member(conn, uid, ws)?;
+    let number: String = conn.query_row(
+        "SELECT number FROM inventory_sessions WHERE id=?1",
+        params![sid],
+        |r| r.get(0),
+    )?;
+    let changed = conn.execute(
+        "UPDATE inventory_sessions SET status='completed', completed_at=?1 WHERE id=?2 AND status='in_progress'",
+        params![now(), sid],
+    )?;
+    if changed != 1 {
+        return Err(ApiError::conflict("Инвентаризация уже завершена"));
+    }
+    let corrections = apply_inventory_corrections(conn, sid, ws, uid, &number)?;
+    ledger::append(
+        conn,
+        ws,
+        uid,
+        None,
+        "inventory",
+        None,
+        None,
+        None,
+        Some(&format!(
+            "Инвентаризация {number} завершена. Расхождений: {corrections}"
+        )),
+    )
+    .map_err(|e| ApiError::internal(format!("Ошибка журнала: {e}")))?;
+    let mut session = inv_session_full(conn, sid).ok_or_else(|| ApiError::not_found("нет"))?;
+    session["corrections"] = json!(corrections);
+    Ok(session)
+}
+
+fn emit_overdue_and_stock(conn: &Connection) {
+    let nows = now();
+    if let Ok(mut stmt) = conn.prepare("SELECT id, workspace_id, title, responsible_user_id, due_at FROM items WHERE due_at IS NOT NULL AND responsible_user_id IS NOT NULL") {
+        let rows: Vec<(i64, i64, String, i64, String)> = stmt.query_map([], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+        }).ok().map(|x| x.filter_map(|y| y.ok()).collect()).unwrap_or_default();
+        for (id, _ws, title, resp, due) in rows {
+            if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&due) {
+                if dt.with_timezone(&chrono::Utc) < chrono::Utc::now() {
+                    let exists: i64 = conn.query_row(
+                        "SELECT COUNT(*) FROM notifications WHERE item_id=?1 AND type='reminder' AND text LIKE '%просроч%'",
+                        params![id], |r| r.get(0),
+                    ).unwrap_or(0);
+                    if exists == 0 {
+                        let _ = conn.execute(
+                            "INSERT INTO notifications (user_id, item_id, type, title, text, created_at) VALUES (?1,?2,'reminder','Просроченный возврат',?3,?4)",
+                            params![resp, id, format!("Просрочен возврат: {title}"), nows.clone()],
+                        );
+                    }
+                }
+            }
+        }
+    }
+    if let Ok(mut stmt) = conn.prepare("SELECT id, workspace_id, title, quantity, min_quantity FROM items WHERE quantitative=1 AND min_quantity IS NOT NULL AND quantity IS NOT NULL AND quantity < min_quantity") {
+        let rows: Vec<(i64, i64, String, f64, f64)> = stmt.query_map([], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+        }).ok().map(|x| x.filter_map(|y| y.ok()).collect()).unwrap_or_default();
+        for (id, ws, title, qty, minq) in rows {
+            let exists: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM notifications WHERE item_id=?1 AND title='Мало на складе' AND read=0",
+                params![id], |r| r.get(0),
+            ).unwrap_or(0);
+            if exists == 0 {
+                notify_admins(conn, ws, id, "Мало на складе", &format!("{title}: {qty} (мин. {minq})"));
+            }
+        }
+    }
+    if let Ok(mut stmt) = conn.prepare("SELECT id, workspace_id, title, calibrated_until FROM items WHERE calibrated_until IS NOT NULL") {
+        let rows: Vec<(i64, i64, String, String)> = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .ok().map(|x| x.filter_map(|y| y.ok()).collect()).unwrap_or_default();
+        for (id, ws, title, until) in rows {
+            if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&until) {
+                if dt.with_timezone(&chrono::Utc) < chrono::Utc::now() {
+                    let exists: i64 = conn.query_row(
+                        "SELECT COUNT(*) FROM notifications WHERE item_id=?1 AND title='Истекла поверка' AND read=0",
+                        params![id], |r| r.get(0),
+                    ).unwrap_or(0);
+                    if exists == 0 {
+                        notify_admins(conn, ws, id, "Истекла поверка", &format!("{title}: срок поверки прошёл"));
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn notif_list(conn: &Connection, user_id: Option<i64>) -> ApiResult {
+    emit_overdue_and_stock(conn);
+    let uid = require_user(conn, user_id)?;
+    let mut stmt = conn.prepare("SELECT id, user_id, item_id, type, title, text, read, created_at FROM notifications WHERE user_id=?1 ORDER BY id DESC LIMIT 100")?;
+    let rows: Vec<Value> = stmt
+        .query_map(params![uid], |r| {
+            let item_id: Option<i64> = r.get(2)?;
+            Ok(json!({
+                "id": r.get::<_, i64>(0)?, "userId": r.get::<_, i64>(1)?, "itemId": item_id,
+                "type": r.get::<_, String>(3)?, "title": r.get::<_, Option<String>>(4)?,
+                "text": r.get::<_, String>(5)?, "read": r.get::<_, i64>(6)? != 0,
+                "createdAt": r.get::<_, String>(7)?,
+                "item": item_id.and_then(|i| jsn::item_json(conn, i, false))
+            }))
+        })?
+        .filter_map(|x| x.ok())
+        .collect();
+    Ok(Value::Array(rows))
+}
+fn notif_unread(conn: &Connection, user_id: Option<i64>) -> ApiResult {
+    let uid = require_user(conn, user_id)?;
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM notifications WHERE user_id=?1 AND read=0",
+        params![uid],
+        |r| r.get(0),
+    )?;
+    Ok(json!({"count": n}))
+}
+fn notif_mark(conn: &Connection, input: &Value, all: bool, user_id: Option<i64>) -> ApiResult {
+    let uid = require_user(conn, user_id)?;
+    if all {
+        conn.execute(
+            "UPDATE notifications SET read=1 WHERE user_id=?1 AND read=0",
+            params![uid],
+        )?;
+    } else if let Some(id) = i64v(input, "id") {
+        conn.execute(
+            "UPDATE notifications SET read=1 WHERE id=?1 AND user_id=?2",
+            params![id, uid],
+        )?;
+    }
+    Ok(json!({"ok": true}))
+}
+
+fn reports_by_users(conn: &Connection, input: &Value) -> ApiResult {
+    let ws = i64v(input, "workspaceId").unwrap_or_else(|| ws_fallback(conn));
+    let mut stmt =
+        conn.prepare("SELECT DISTINCT responsible_user_id FROM items WHERE workspace_id=?1")?;
+    let uids: Vec<Option<i64>> = stmt
+        .query_map(params![ws], |r| r.get(0))?
+        .filter_map(|x| x.ok())
+        .collect();
+    let mut out = Vec::new();
+    for uid in uids {
+        let mut st = conn.prepare("SELECT id FROM items WHERE workspace_id=?1 AND ((?2 IS NULL AND responsible_user_id IS NULL) OR responsible_user_id=?2)")?;
+        let ids: Vec<i64> = st
+            .query_map(params![ws, uid], |r| r.get(0))?
+            .filter_map(|x| x.ok())
+            .collect();
+        let items: Vec<Value> = ids
+            .iter()
+            .filter_map(|id| jsn::item_json(conn, *id, false))
+            .collect();
+        let total: f64 = items
+            .iter()
+            .map(|i| i["cost"].as_f64().unwrap_or(0.0))
+            .sum();
+        out.push(json!({
+            "userId": uid,
+            "user": uid.and_then(|i| jsn::user_public(conn, i)),
+            "itemsCount": items.len(),
+            "totalCost": total,
+            "items": items
+        }));
+    }
+    Ok(Value::Array(out))
+}
+fn reports_all(conn: &Connection, input: &Value) -> ApiResult {
+    let ws = i64v(input, "workspaceId").unwrap_or_else(|| ws_fallback(conn));
+    let mut stmt =
+        conn.prepare("SELECT id FROM items WHERE workspace_id=?1 ORDER BY created_at DESC")?;
+    let ids: Vec<i64> = stmt
+        .query_map(params![ws], |r| r.get(0))?
+        .filter_map(|x| x.ok())
+        .collect();
+    Ok(Value::Array(
+        ids.into_iter()
+            .filter_map(|id| item_for_list(conn, id))
+            .collect(),
+    ))
+}
+
+fn profile_get(conn: &Connection, user_id: Option<i64>) -> ApiResult {
+    let uid = require_user(conn, user_id)?;
+    let mut u = jsn::user_public(conn, uid).ok_or_else(|| ApiError::unauth("нет"))?;
+    let mut st = conn.prepare("SELECT workspace_id FROM user_workspaces WHERE user_id=?1")?;
+    let wids: Vec<i64> = st
+        .query_map(params![uid], |r| r.get(0))?
+        .filter_map(|x| x.ok())
+        .collect();
+    u["workspaces"] = Value::Array(
+        wids.into_iter()
+            .filter_map(|id| jsn::workspace_json(conn, id))
+            .collect(),
+    );
+    Ok(u)
+}
+fn profile_update(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
+    let uid = require_user(conn, user_id)?;
+    if let Some(phone) = s(input, "phone") {
+        validate_phone(&phone)?;
+    }
+    if s(input, "fullName").is_some_and(|name| name.chars().count() > 200) {
+        return Err(ApiError::bad("Имя слишком длинное"));
+    }
+    conn.execute("UPDATE users SET full_name=COALESCE(?2,full_name), position=COALESCE(?3,position), phone=COALESCE(?4,phone), avatar_url=COALESCE(?5,avatar_url) WHERE id=?1",
+        params![uid, s(input,"fullName"), s(input,"position"), s(input,"phone"), s(input,"avatarUrl")])?;
+    jsn::user_public(conn, uid).ok_or_else(|| ApiError::not_found("нет"))
+}
+fn profile_password(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
+    let uid = require_user(conn, user_id)?;
+    let newp = s(input, "newPassword").ok_or_else(|| ApiError::bad("newPassword"))?;
+    validate_new_password(&newp)?;
+    let old = conn
+        .query_row(
+            "SELECT password_hash FROM users WHERE id=?1",
+            params![uid],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .ok()
+        .flatten();
+    if let Some(h) = old.filter(|x| !x.is_empty()) {
+        let cur = s(input, "currentPassword").unwrap_or_default();
+        if !verify_password(&cur, &h) {
+            return Err(ApiError::unauth("Неверный текущий пароль"));
+        }
+    }
+    conn.execute(
+        "UPDATE users SET password_hash=?1 WHERE id=?2",
+        params![hash_password(&newp), uid],
+    )?;
+    conn.execute(
+        "UPDATE sessions SET revoked_at=?1 WHERE user_id=?2 AND revoked_at IS NULL",
+        params![now(), uid],
+    )?;
+    Ok(json!({"ok": true, "message": "Пароль изменён"}))
+}
+
+fn admin_users(conn: &Connection, input: &Value) -> ApiResult {
+    let ws = i64v(input, "workspaceId").unwrap_or_else(|| ws_fallback(conn));
+    let mut stmt = conn.prepare("SELECT user_id FROM user_workspaces WHERE workspace_id=?1")?;
+    let ids: Vec<i64> = stmt
+        .query_map(params![ws], |r| r.get(0))?
+        .filter_map(|x| x.ok())
+        .collect();
+    Ok(Value::Array(
+        ids.into_iter()
+            .filter_map(|id| jsn::user_public(conn, id))
+            .collect(),
+    ))
+}
+fn admin_user_create(conn: &Connection, input: &Value) -> ApiResult {
+    let name = s(input, "fullName").ok_or_else(|| ApiError::bad("fullName"))?;
+    let phone = s(input, "phone").ok_or_else(|| ApiError::bad("phone"))?;
+    conn.execute(
+        "INSERT INTO users (full_name, position, phone, status, role_rights, created_at) VALUES (?1,?2,?3,'invited',?4,?5)",
+        params![name, s(input,"position"), phone, db::default_rights().to_string(), now()],
+    ).map_err(|e| ApiError::conflict(e.to_string()))?;
+    let uid = conn.last_insert_rowid();
+    let ws = i64v(input, "workspaceId").unwrap_or_else(|| ws_fallback(conn));
+    conn.execute(
+        "INSERT INTO user_workspaces (user_id, workspace_id, rights_json) VALUES (?1,?2,?3)",
+        params![uid, ws, db::default_rights().to_string()],
+    )?;
+    jsn::user_public(conn, uid).ok_or_else(|| ApiError::bad("ошибка"))
+}
+fn admin_user_update(conn: &Connection, input: &Value, actor: Option<i64>) -> ApiResult {
+    if let Some(uid) = actor {
+        require_can(conn, uid, "manageUsers")?;
+    }
+    let id = i64v(input, "id").ok_or_else(|| ApiError::bad("id"))?;
+    conn.execute("UPDATE users SET full_name=COALESCE(?2,full_name), position=COALESCE(?3,position), phone=COALESCE(?4,phone), status=COALESCE(?5,status) WHERE id=?1",
+        params![id, s(input,"fullName"), s(input,"position"), s(input,"phone"), s(input,"status")])?;
+    if let Some(rr) = input.get("roleRights") {
+        if !rr.is_null() {
+            let ws = i64v(input, "workspaceId").unwrap_or_else(|| ws_fallback(conn));
+            conn.execute(
+                "UPDATE user_workspaces SET rights_json=?1 WHERE user_id=?2 AND workspace_id=?3",
+                params![rr.to_string(), id, ws],
+            )?;
+        }
+    }
+    if let Some(cp) = input.get("checkoutPolicy") {
+        if !cp.is_null() {
+            conn.execute(
+                "UPDATE users SET checkout_policy=?1 WHERE id=?2",
+                params![cp.to_string(), id],
+            )?;
+        }
+    }
+    jsn::user_public(conn, id).ok_or_else(|| ApiError::not_found("нет"))
+}
+/// Исключение участника. Историю и подписанные блоки трогать нельзя (ТЗ §7—8):
+/// если за человеком что-то числится, он блокируется и выводится из пространства,
+/// а не стирается вместе со следами своих операций.
+fn admin_user_remove(conn: &Connection, input: &Value, actor: Option<i64>) -> ApiResult {
+    let uid = require_user(conn, actor)?;
+    let id = i64v(input, "id").ok_or_else(|| ApiError::bad("id"))?;
+    if id == uid {
+        return Err(ApiError::bad("Нельзя удалить собственную учётную запись"));
+    }
+    let exists: i64 =
+        conn.query_row("SELECT COUNT(*) FROM users WHERE id=?1", params![id], |r| {
+            r.get(0)
+        })?;
+    if exists == 0 {
+        return Err(ApiError::not_found("Пользователь не найден"));
+    }
+    let traces: i64 = conn.query_row(
+        "SELECT (SELECT COUNT(*) FROM history_entries WHERE actor_user_id=?1)
+              + (SELECT COUNT(*) FROM items WHERE responsible_user_id=?1)
+              + (SELECT COUNT(*) FROM item_holdings WHERE user_id=?1 AND returned_at IS NULL)
+              + (SELECT COUNT(*) FROM transfers WHERE from_user_id=?1 OR to_user_id=?1)",
+        params![id],
+        |r| r.get(0),
+    )?;
+    let ws = i64v(input, "workspaceId").unwrap_or_else(|| ws_fallback(conn));
+    conn.execute(
+        "DELETE FROM user_workspaces WHERE user_id=?1 AND workspace_id=?2",
+        params![id, ws],
+    )?;
+    let other_workspaces: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM user_workspaces WHERE user_id=?1",
+        params![id],
+        |r| r.get(0),
+    )?;
+    if other_workspaces == 0 {
+        conn.execute(
+            "UPDATE users SET status='disabled' WHERE id=?1",
+            params![id],
+        )?;
+        conn.execute(
+            "UPDATE sessions SET revoked_at=?1 WHERE user_id=?2 AND revoked_at IS NULL",
+            params![now(), id],
+        )?;
+    }
+    if traces == 0 && other_workspaces == 0 {
+        conn.execute("DELETE FROM users WHERE id=?1", params![id])?;
+        return Ok(json!({"ok": true, "deleted": true}));
+    }
+    Ok(json!({
+        "ok": true,
+        "deleted": false,
+        "disabled": other_workspaces == 0,
+        "message": "Участник исключён из пространства; история его операций сохранена"
+    }))
+}
+
+fn admin_user_invite(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
+    let created = admin_user_create(conn, input)?;
+    let ws = i64v(input, "workspaceId").unwrap_or_else(|| ws_fallback(conn));
+    let token = Uuid::new_v4().to_string().replace('-', "");
+    let expires_at = invite_expiry(input);
+    conn.execute(
+        "INSERT INTO invites (workspace_id, token, role, created_by, max_uses, expires_at, created_at) VALUES (?1,?2,'member',?3,20,?4,?5)",
+        params![ws, token, user_id, expires_at, now()],
+    )?;
+    Ok(json!({"user": created, "token": token, "expiresAt": expires_at}))
+}
+
+fn ws_create(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
+    let uid = require_user(conn, user_id)?;
+    conn.execute(
+        "INSERT INTO workspaces (name, timezone, internal_id_prefix, comment, created_at, sync_url) VALUES (?1,?2,?3,?4,?5,?6)",
+        params![s(input,"name").unwrap_or("Группа".into()), s(input,"timezone").unwrap_or("Europe/Moscow".into()), s(input,"internalIdPrefix").unwrap_or("ВН-".into()), s(input,"comment"), now(), s(input,"syncUrl")],
+    )?;
+    let id = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO user_workspaces (user_id, workspace_id, rights_json) VALUES (?1,?2,?3)",
+        params![uid, id, db::owner_rights().to_string()],
+    )?;
+    seed_workspace_defaults(conn, id, uid)?;
+    if let Some(url) = s(input, "syncUrl") {
+        crate::sync::add_peer(conn, &url, Some("relay"), None);
+    }
+    jsn::workspace_json(conn, id).ok_or_else(|| ApiError::bad("ошибка"))
+}
+fn ws_update(conn: &Connection, input: &Value) -> ApiResult {
+    let id = i64v(input, "id").ok_or_else(|| ApiError::bad("id"))?;
+    conn.execute("UPDATE workspaces SET name=COALESCE(?2,name), timezone=COALESCE(?3,timezone), internal_id_prefix=COALESCE(?4,internal_id_prefix), comment=?5, sync_url=COALESCE(?6,sync_url), require_writeoff_photo=CASE WHEN ?7 THEN ?8 ELSE require_writeoff_photo END WHERE id=?1",
+        params![id, s(input,"name"), s(input,"timezone"), s(input,"internalIdPrefix"), s(input,"comment"), s(input,"syncUrl"),
+                input.get("requireWriteoffPhoto").is_some(), b(input,"requireWriteoffPhoto").unwrap_or(false) as i64])?;
+    if let Some(url) = s(input, "syncUrl") {
+        crate::sync::add_peer(conn, &url, Some("relay"), None);
+    }
+    jsn::workspace_json(conn, id).ok_or_else(|| ApiError::not_found("нет"))
+}
+/// Срок жизни приглашения по умолчанию — неделя (ТЗ: у приглашения есть срок действия).
+const INVITE_DEFAULT_TTL_HOURS: i64 = 168;
+const INVITE_MAX_TTL_HOURS: i64 = 24 * 365;
+
+fn invite_expiry(input: &Value) -> String {
+    let hours = i64v(input, "expiresInHours")
+        .unwrap_or(INVITE_DEFAULT_TTL_HOURS)
+        .clamp(1, INVITE_MAX_TTL_HOURS);
+    (chrono::Utc::now() + chrono::Duration::hours(hours)).to_rfc3339()
+}
+
+/// Должность по умолчанию для участника, вступившего по приглашению с ролью.
+fn invite_position(role: &str) -> &'static str {
+    match role.trim().to_lowercase().as_str() {
+        "owner" | "владелец" => "Владелец",
+        "admin" | "администратор" => "Администратор",
+        "viewer" | "observer" | "наблюдатель" => "Наблюдатель",
+        _ => "Участник",
+    }
+}
+
+fn ws_create_invite(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
+    let ws = i64v(input, "workspaceId").unwrap_or_else(|| ws_fallback(conn));
+    let token = Uuid::new_v4().to_string().replace('-', "");
+    let role = s(input, "role").unwrap_or_else(|| "member".into());
+    let expires_at = invite_expiry(input);
+    conn.execute(
+        "INSERT INTO invites (workspace_id, token, role, created_by, max_uses, expires_at, created_at) VALUES (?1,?2,?3,?4,?5,?6,?7)",
+        params![ws, token, role, user_id, i64v(input,"maxUses").unwrap_or(20), expires_at, now()],
+    )?;
+    let wsj = jsn::workspace_json(conn, ws).unwrap_or(json!({}));
+    Ok(json!({
+        "token": token,
+        "workspaceId": ws,
+        "role": role,
+        "expiresAt": expires_at,
+        "workspace": wsj,
+        "payload": {
+            "v": 1,
+            "t": "join",
+            "ws": ws,
+            "token": token,
+            "role": role,
+            "exp": expires_at,
+            "name": wsj.get("name"),
+            "server": wsj.get("syncUrl")
+        }
+    }))
+}
+fn ws_invites(conn: &Connection, input: &Value) -> ApiResult {
+    let ws = i64v(input, "workspaceId").unwrap_or_else(|| ws_fallback(conn));
+    let mut stmt = conn.prepare("SELECT id, token, role, max_uses, used_count, revoked, created_at, expires_at FROM invites WHERE workspace_id=?1 AND revoked=0 ORDER BY id DESC")?;
+    let rows: Vec<Value> = stmt
+        .query_map(params![ws], |r| {
+            let invite = Invite {
+                id: r.get(0)?,
+                workspace_id: ws,
+                role: r.get(2)?,
+                max_uses: r.get(3)?,
+                used_count: r.get(4)?,
+                revoked: r.get(5)?,
+                expires_at: r.get(7)?,
+            };
+            Ok(json!({
+                "id": invite.id, "token": r.get::<_, String>(1)?, "role": invite.role,
+                "maxUses": invite.max_uses, "usedCount": invite.used_count,
+                "revoked": invite.revoked != 0, "createdAt": r.get::<_, String>(6)?,
+                "expiresAt": invite.expires_at,
+                "expired": invite.is_expired(),
+                "usable": ensure_invite_usable(&invite).is_ok(),
+            }))
+        })?
+        .filter_map(|x| x.ok())
+        .collect();
+    Ok(Value::Array(rows))
+}
+
+fn storages_list(conn: &Connection, input: &Value) -> ApiResult {
+    let ws = i64v(input, "workspaceId").unwrap_or_else(|| ws_fallback(conn));
+    let mut stmt = conn.prepare("SELECT id FROM storages WHERE workspace_id=?1")?;
+    let ids: Vec<i64> = stmt
+        .query_map(params![ws], |r| r.get(0))?
+        .filter_map(|x| x.ok())
+        .collect();
+    let mut out = Vec::new();
+    for id in ids {
+        let mut v = jsn::storage_obj(conn, Some(id));
+        if let Some(uid) = v.get("responsibleUserId").and_then(|x| x.as_i64()) {
+            v["responsible"] = jsn::user_public(conn, uid).unwrap_or(Value::Null);
+        }
+        out.push(v);
+    }
+    Ok(Value::Array(out))
+}
+fn storage_create(conn: &Connection, input: &Value) -> ApiResult {
+    let ws = i64v(input, "workspaceId").unwrap_or_else(|| ws_fallback(conn));
+    conn.execute("INSERT INTO storages (name, responsible_user_id, workspace_id, address) VALUES (?1,?2,?3,?4)",
+        params![s(input,"name").unwrap_or("Склад".into()), i64v(input,"responsibleUserId"), ws, s(input,"address")])?;
+    Ok(jsn::storage_obj(conn, Some(conn.last_insert_rowid())))
+}
+fn storage_update(conn: &Connection, input: &Value) -> ApiResult {
+    let id = i64v(input, "id").ok_or_else(|| ApiError::bad("id"))?;
+    conn.execute("UPDATE storages SET name=COALESCE(?2,name), responsible_user_id=?3, address=COALESCE(?4,address) WHERE id=?1",
+        params![id, s(input,"name"), i64v(input,"responsibleUserId"), s(input,"address")])?;
+    Ok(jsn::storage_obj(conn, Some(id)))
+}
+fn sites_list(conn: &Connection, input: &Value) -> ApiResult {
+    let ws = i64v(input, "workspaceId").unwrap_or_else(|| ws_fallback(conn));
+    let mut stmt = conn.prepare("SELECT id, name, responsible_user_id, workspace_id FROM building_sites WHERE workspace_id=?1")?;
+    let rows: Vec<Value> = stmt
+        .query_map(params![ws], |r| {
+            let uid: Option<i64> = r.get(2)?;
+            Ok(json!({
+                "id": r.get::<_, i64>(0)?, "name": r.get::<_, String>(1)?,
+                "responsibleUserId": uid, "workspaceId": r.get::<_, i64>(3)?,
+                "responsible": uid.and_then(|i| jsn::user_public(conn, i))
+            }))
+        })?
+        .filter_map(|x| x.ok())
+        .collect();
+    Ok(Value::Array(rows))
+}
+fn site_create(conn: &Connection, input: &Value) -> ApiResult {
+    let ws = i64v(input, "workspaceId").unwrap_or_else(|| ws_fallback(conn));
+    conn.execute(
+        "INSERT INTO building_sites (name, responsible_user_id, workspace_id) VALUES (?1,?2,?3)",
+        params![
+            s(input, "name").unwrap_or("Объект".into()),
+            i64v(input, "responsibleUserId"),
+            ws
+        ],
+    )?;
+    let id = conn.last_insert_rowid();
+    Ok(
+        json!({"id": id, "name": s(input,"name"), "workspaceId": ws, "responsibleUserId": i64v(input,"responsibleUserId")}),
+    )
+}
+fn site_update(conn: &Connection, input: &Value) -> ApiResult {
+    let id = i64v(input, "id").ok_or_else(|| ApiError::bad("id"))?;
+    conn.execute(
+        "UPDATE building_sites SET name=COALESCE(?2,name), responsible_user_id=?3 WHERE id=?1",
+        params![id, s(input, "name"), i64v(input, "responsibleUserId")],
+    )?;
+    Ok(json!({"id": id, "name": s(input,"name")}))
+}
+
+fn dict_table(kind: &str) -> Result<&'static str, ApiError> {
+    match kind {
+        "categories" => Ok("categories"),
+        "brands" => Ok("brands"),
+        "statuses" => Ok("statuses"),
+        _ => Err(ApiError::bad("kind")),
+    }
+}
+fn dict_list(conn: &Connection, input: &Value) -> ApiResult {
+    let kind = s(input, "kind").unwrap_or_else(|| "categories".into());
+    let table = dict_table(&kind)?;
+    let ws = i64v(input, "workspaceId").unwrap_or_else(|| ws_fallback(conn));
+    let sql = if table == "statuses" {
+        format!("SELECT id, name, description, workspace_id, type, slug, color, bg FROM {table} WHERE workspace_id=?1")
+    } else {
+        format!("SELECT id, name, description, workspace_id, type, NULL, NULL, NULL FROM {table} WHERE workspace_id=?1")
+    };
+    let mut stmt = conn.prepare(&sql)?;
+    let rows: Vec<Value> = stmt
+        .query_map(params![ws], |r| {
+            Ok(json!({
+                "id": r.get::<_, i64>(0)?, "name": r.get::<_, String>(1)?,
+                "description": r.get::<_, Option<String>>(2)?, "workspaceId": r.get::<_, i64>(3)?,
+                "type": r.get::<_, String>(4)?, "slug": r.get::<_, Option<String>>(5)?,
+                "color": r.get::<_, Option<String>>(6)?, "bg": r.get::<_, Option<String>>(7)?,
+            }))
+        })?
+        .filter_map(|x| x.ok())
+        .collect();
+    Ok(Value::Array(rows))
+}
+fn dict_create(conn: &Connection, input: &Value) -> ApiResult {
+    let kind = s(input, "kind").unwrap_or_else(|| "categories".into());
+    let table = dict_table(&kind)?;
+    let ws = i64v(input, "workspaceId").unwrap_or_else(|| ws_fallback(conn));
+    let name = s(input, "name").ok_or_else(|| ApiError::bad("name"))?;
+    if table == "statuses" {
+        conn.execute("INSERT INTO statuses (name, description, workspace_id, type, slug, color, bg) VALUES (?1,?2,?3,'status',?4,?5,?6)",
+            params![name, s(input,"description"), ws, s(input,"slug").unwrap_or("custom".into()), s(input,"color").unwrap_or("#5E629B".into()), s(input,"bg").unwrap_or("#EDEDF7".into())])?;
+    } else {
+        let ty = if table == "brands" {
+            "brand"
+        } else {
+            "category"
+        };
+        conn.execute(
+            &format!(
+                "INSERT INTO {table} (name, description, workspace_id, type) VALUES (?1,?2,?3,?4)"
+            ),
+            params![name, s(input, "description"), ws, ty],
+        )?;
+    }
+    Ok(json!({"id": conn.last_insert_rowid(), "name": name, "workspaceId": ws}))
+}
+fn dict_update(conn: &Connection, input: &Value) -> ApiResult {
+    let kind = s(input, "kind").unwrap_or_else(|| "categories".into());
+    let table = dict_table(&kind)?;
+    let id = i64v(input, "id").ok_or_else(|| ApiError::bad("id"))?;
+    conn.execute(
+        &format!("UPDATE {table} SET name=COALESCE(?2,name), description=?3 WHERE id=?1"),
+        params![id, s(input, "name"), s(input, "description")],
+    )?;
+    Ok(json!({"id": id, "ok": true}))
+}
+fn dict_remove(conn: &Connection, input: &Value) -> ApiResult {
+    let kind = s(input, "kind").unwrap_or_else(|| "categories".into());
+    let table = dict_table(&kind)?;
+    let id = i64v(input, "id").ok_or_else(|| ApiError::bad("id"))?;
+    conn.execute(&format!("DELETE FROM {table} WHERE id=?1"), params![id])?;
+    Ok(json!({"ok": true}))
+}
+
+fn notify_admins(conn: &Connection, ws: i64, item_id: i64, title: &str, text: &str) {
+    let mut stmt = match conn.prepare("SELECT user_id FROM user_workspaces WHERE workspace_id=?1") {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    let ids: Vec<i64> = stmt
+        .query_map(params![ws], |r| r.get(0))
+        .ok()
+        .map(|r| r.filter_map(|x| x.ok()).collect())
+        .unwrap_or_default();
+    for uid in ids {
+        if user_can(conn, uid, "manageUsers") || user_can(conn, uid, "editItems") {
+            let _ = conn.execute(
+                "INSERT INTO notifications (user_id, item_id, type, title, text, created_at) VALUES (?1,?2,'system',?3,?4,?5)",
+                params![uid, item_id, title, text, now()],
+            );
+        }
+    }
+}
+
+fn report_fault(conn: &mut Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
+    atomic(conn, |conn| report_fault_atomic(conn, input, user_id))
+}
+
+fn report_fault_atomic(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
+    let uid = require_user(conn, user_id)?;
+    let item_id = i64v(input, "itemId").ok_or_else(|| ApiError::bad("itemId"))?;
+    let ws = require_item_access(conn, uid, item_id)?;
+    require_can_in_workspace(conn, uid, ws, "reportFaults")?;
+    let desc = s(input, "description").ok_or_else(|| ApiError::bad("Опишите неисправность"))?;
+    let item = jsn::item_json(conn, item_id, false)
+        .ok_or_else(|| ApiError::not_found("Инструмент не найден"))?;
+    let severity = s(input, "severity").unwrap_or_else(|| "medium".into());
+    conn.execute(
+        "INSERT INTO faults (item_id, workspace_id, author_id, severity, description, photo_url, created_at) VALUES (?1,?2,?3,?4,?5,?6,?7)",
+        params![item_id, ws, uid, severity, desc, s(input, "photoUrl"), now()],
+    )?;
+    let fid = conn.last_insert_rowid();
+    // Сообщение о неисправности переводит предмет в «На проверке»: решение о
+    // ремонте принимает администратор (ТЗ §4, «Неисправность и ремонт»).
+    if let Ok(st) = conn.query_row(
+        "SELECT id FROM statuses WHERE workspace_id=?1 AND slug='needs-check'",
+        params![ws],
+        |r| r.get::<_, i64>(0),
+    ) {
+        conn.execute(
+            "UPDATE items SET status_id=?1 WHERE id=?2",
+            params![st, item_id],
+        )?;
+    }
+    let title = item["title"].as_str().unwrap_or("");
+    ledger::append(
+        conn,
+        ws,
+        uid,
+        Some(item_id),
+        "update",
+        None,
+        Some("На проверке"),
+        None,
+        Some(&format!("Неисправность ({severity}): {desc}")),
+    )
+    .map_err(|e| ApiError::internal(format!("Ошибка журнала: {e}")))?;
+    notify_admins(
+        conn,
+        ws,
+        item_id,
+        "Неисправность",
+        &format!("{title}: {desc}"),
+    );
+    Ok(json!({"id": fid, "itemId": item_id, "status": "open"}))
+}
+
+fn list_faults(conn: &Connection, input: &Value) -> ApiResult {
+    let mut sql = String::from("SELECT id, item_id, workspace_id, author_id, severity, description, photo_url, status, resolution, resolver_id, created_at, resolved_at FROM faults WHERE 1=1");
+    if let Some(id) = i64v(input, "itemId") {
+        sql.push_str(&format!(" AND item_id={id}"));
+    } else {
+        let ws = i64v(input, "workspaceId").unwrap_or_else(|| ws_fallback(conn));
+        sql.push_str(&format!(" AND workspace_id={ws}"));
+    }
+    sql.push_str(" ORDER BY id DESC LIMIT 200");
+    let mut stmt = conn.prepare(&sql)?;
+    let rows: Vec<Value> = stmt.query_map([], |r| {
+        let author: i64 = r.get(3)?;
+        Ok(json!({
+            "id": r.get::<_, i64>(0)?, "itemId": r.get::<_, i64>(1)?, "workspaceId": r.get::<_, i64>(2)?,
+            "authorId": author, "severity": r.get::<_, String>(4)?, "description": r.get::<_, String>(5)?,
+            "photoUrl": r.get::<_, Option<String>>(6)?, "status": r.get::<_, String>(7)?,
+            "resolution": r.get::<_, Option<String>>(8)?, "resolverId": r.get::<_, Option<i64>>(9)?,
+            "createdAt": r.get::<_, String>(10)?, "resolvedAt": r.get::<_, Option<String>>(11)?,
+            "author": jsn::user_public(conn, author)
+        }))
+    })?.filter_map(|x| x.ok()).collect();
+    Ok(Value::Array(rows))
+}
+
+fn resolve_fault(conn: &mut Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
+    atomic(conn, |conn| resolve_fault_atomic(conn, input, user_id))
+}
+
+fn resolve_fault_atomic(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
+    let uid = require_user(conn, user_id)?;
+    let id = i64v(input, "id").ok_or_else(|| ApiError::bad("id"))?;
+    let (item_id, ws): (i64, i64) = conn
+        .query_row(
+            "SELECT item_id, workspace_id FROM faults WHERE id=?1",
+            params![id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?
+        .ok_or_else(|| ApiError::not_found("Неисправность не найдена"))?;
+    require_member(conn, uid, ws)?;
+    require_can_in_workspace(conn, uid, ws, "editItems")?;
+    let status = s(input, "status").unwrap_or_else(|| "resolved".into());
+    conn.execute(
+        "UPDATE faults SET status=?1, resolution=?2, resolver_id=?3, resolved_at=?4 WHERE id=?5",
+        params![status, s(input, "comment"), uid, now(), id],
+    )?;
+    let slug = if status == "repair" || status == "open" {
+        "in-repair"
+    } else {
+        "in-stock"
+    };
+    if let Ok(st) = conn.query_row(
+        "SELECT id FROM statuses WHERE workspace_id=?1 AND slug=?2",
+        params![ws, slug],
+        |r| r.get::<_, i64>(0),
+    ) {
+        conn.execute(
+            "UPDATE items SET status_id=?1 WHERE id=?2",
+            params![st, item_id],
+        )?;
+    }
+    ledger::append(
+        conn,
+        ws,
+        uid,
+        Some(item_id),
+        "update",
+        None,
+        Some(&status),
+        None,
+        Some(
+            s(input, "comment")
+                .unwrap_or_else(|| format!("Решение по неисправности: {status}"))
+                .as_str(),
+        ),
+    )
+    .map_err(|e| ApiError::internal(format!("Ошибка журнала: {e}")))?;
+    Ok(json!({"ok": true, "id": id, "status": status}))
+}
+
+fn request_change(conn: &mut Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
+    let uid = require_user(conn, user_id)?;
+    let item_id = i64v(input, "itemId").ok_or_else(|| ApiError::bad("itemId"))?;
+    let ws = require_item_access(conn, uid, item_id)?;
+    require_can_in_workspace(conn, uid, ws, "requestChanges")?;
+    let payload = input.get("payload").cloned().unwrap_or(json!({}));
+    conn.execute(
+        "INSERT INTO change_requests (item_id, workspace_id, author_id, payload, comment, created_at) VALUES (?1,?2,?3,?4,?5,?6)",
+        params![item_id, ws, uid, payload.to_string(), s(input, "comment"), now()],
+    )?;
+    let rid = conn.last_insert_rowid();
+    notify_admins(
+        conn,
+        ws,
+        item_id,
+        "Заявка на правку",
+        s(input, "comment")
+            .as_deref()
+            .unwrap_or("Изменение карточки"),
+    );
+    Ok(json!({"id": rid, "status": "pending"}))
+}
+
+/// Человекочитаемое имя записи справочника. Для пользователей это ФИО,
+/// для остальных таблиц — колонка name.
+fn lookup_name(conn: &Connection, table: &str, id: Option<i64>) -> Option<String> {
+    let id = id?;
+    let column = if table == "users" {
+        "full_name"
+    } else {
+        "name"
+    };
+    let sql = format!("SELECT {column} FROM {table} WHERE id=?1");
+    conn.query_row(&sql, params![id], |r| r.get::<_, String>(0))
+        .optional()
+        .ok()
+        .flatten()
+}
+
+/// Поля карточки, которые может менять заявка: ключ, подпись и справочник,
+/// через который идентификатор разворачивается в название.
+const CHANGEABLE_FIELDS: [(&str, &str, Option<&str>); 13] = [
+    ("title", "Наименование", None),
+    ("categoryId", "Категория", Some("categories")),
+    ("brandId", "Бренд", Some("brands")),
+    ("statusId", "Статус", Some("statuses")),
+    ("responsibleUserId", "Ответственный", Some("users")),
+    ("buildingSiteId", "Объект", Some("building_sites")),
+    ("storageId", "Место хранения", Some("storages")),
+    ("serialNumber", "Серийный номер", None),
+    ("cost", "Стоимость", None),
+    ("comment", "Комментарий", None),
+    ("qrCode", "QR-код", None),
+    ("calibratedUntil", "Поверка до", None),
+    ("minQuantity", "Мин. остаток", None),
+];
+
+/// Приводит значение поля к строке для показа администратору.
+fn display_value(conn: &Connection, raw: &Value, dictionary: Option<&str>) -> Option<String> {
+    if raw.is_null() {
+        return None;
+    }
+    if let Some(table) = dictionary {
+        let id = raw.as_i64().or_else(|| raw.as_f64().map(|v| v as i64));
+        return lookup_name(conn, table, id);
+    }
+    match raw {
+        Value::String(v) if v.is_empty() => None,
+        Value::String(v) => Some(v.clone()),
+        Value::Number(n) => Some(n.to_string()),
+        Value::Bool(b) => Some(if *b { "да".into() } else { "нет".into() }),
+        _ => Some(raw.to_string()),
+    }
+}
+
+/// Сравнение «было / предлагается» (ТЗ §4): администратор должен видеть
+/// разницу, а не сырой JSON заявки.
+fn describe_change(conn: &Connection, item_id: i64, payload: &Value) -> Value {
+    let Some(before) = jsn::item_json(conn, item_id, false) else {
+        return Value::Array(vec![]);
+    };
+    let mut rows = Vec::new();
+    for (key, label, dictionary) in CHANGEABLE_FIELDS {
+        let Some(proposed) = payload.get(key) else {
+            continue;
+        };
+        let after = display_value(conn, proposed, dictionary);
+        let before_raw = before.get(key).cloned().unwrap_or(Value::Null);
+        let before_text = display_value(conn, &before_raw, dictionary);
+        if before_text == after {
+            continue; // поле в заявке есть, но значение то же — не шумим
+        }
+        rows.push(json!({
+            "field": key,
+            "label": label,
+            "before": before_text,
+            "after": after,
+        }));
+    }
+    Value::Array(rows)
+}
+
+fn list_changes(conn: &Connection, input: &Value) -> ApiResult {
+    let ws = i64v(input, "workspaceId").unwrap_or_else(|| ws_fallback(conn));
+    let mut stmt = conn.prepare("SELECT id, item_id, workspace_id, author_id, payload, comment, status, reason, decided_by, created_at, decided_at FROM change_requests WHERE workspace_id=?1 ORDER BY id DESC LIMIT 200")?;
+    let rows: Vec<Value> = stmt.query_map(params![ws], |r| {
+        let author: i64 = r.get(3)?;
+        let payload: String = r.get(4)?;
+        Ok(json!({
+            "id": r.get::<_, i64>(0)?, "itemId": r.get::<_, i64>(1)?, "workspaceId": r.get::<_, i64>(2)?,
+            "authorId": author, "payload": serde_json::from_str::<Value>(&payload).unwrap_or(json!({})),
+            "comment": r.get::<_, Option<String>>(5)?, "status": r.get::<_, String>(6)?,
+            "reason": r.get::<_, Option<String>>(7)?, "decidedBy": r.get::<_, Option<i64>>(8)?,
+            "createdAt": r.get::<_, String>(9)?, "decidedAt": r.get::<_, Option<String>>(10)?,
+            "author": jsn::user_public(conn, author),
+            "item": jsn::item_json(conn, r.get(1)?, false),
+            "changes": describe_change(conn, r.get(1)?, &serde_json::from_str::<Value>(&payload).unwrap_or(json!({})))
+        }))
+    })?.filter_map(|x| x.ok()).collect();
+    Ok(Value::Array(rows))
+}
+
+fn decide_change(conn: &mut Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
+    atomic(conn, |conn| decide_change_atomic(conn, input, user_id))
+}
+
+fn decide_change_atomic(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
+    let uid = require_user(conn, user_id)?;
+    let id = i64v(input, "id").ok_or_else(|| ApiError::bad("id"))?;
+    let (item_id, ws, payload, request_comment): (i64, i64, String, Option<String>) = conn
+        .query_row(
+            "SELECT item_id, workspace_id, payload, comment FROM change_requests WHERE id=?1",
+            params![id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .optional()?
+        .ok_or_else(|| ApiError::not_found("Заявка не найдена"))?;
+    require_member(conn, uid, ws)?;
+    require_can_in_workspace(conn, uid, ws, "editItems")?;
+    let already: String = conn.query_row(
+        "SELECT status FROM change_requests WHERE id=?1",
+        params![id],
+        |r| r.get(0),
+    )?;
+    if already != "pending" {
+        return Err(ApiError::conflict("Решение по заявке уже принято"));
+    }
+    let accept = b(input, "accept").unwrap_or(false);
+    let status = if accept { "accepted" } else { "rejected" };
+    if accept {
+        // Правку применяем ДО отметки «принято»: если она не проходит проверки
+        // (например, смена статуса без причины), заявка остаётся в работе,
+        // а не «принятой», но не применённой.
+        let mut patch = serde_json::from_str::<Value>(&payload)
+            .map_err(|_| ApiError::bad("Заявка содержит некорректные данные"))?;
+        if let Value::Object(ref mut o) = patch {
+            o.insert("id".into(), json!(item_id));
+            if !o.contains_key("reason") {
+                let reason = s(input, "reason")
+                    .or(request_comment)
+                    .unwrap_or_else(|| "Принята заявка на правку".into());
+                o.insert("reason".into(), json!(reason));
+            }
+        }
+        items_update_atomic(conn, &patch, Some(uid))?;
+    }
+    conn.execute(
+        "UPDATE change_requests SET status=?1, reason=?2, decided_by=?3, decided_at=?4 WHERE id=?5 AND status='pending'",
+        params![status, s(input, "reason"), uid, now(), id],
+    )?;
+    Ok(json!({"ok": true, "id": id, "itemId": item_id, "status": status}))
+}
+
+fn chat_list(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
+    let _ = require_user(conn, user_id)?;
+    let ws = i64v(input, "workspaceId").unwrap_or_else(|| ws_fallback(conn));
+    let mut stmt = conn.prepare("SELECT id, workspace_id, user_id, text, created_at FROM chat_messages WHERE workspace_id=?1 ORDER BY id DESC LIMIT 200")?;
+    let mut rows: Vec<Value> = stmt
+        .query_map(params![ws], |r| {
+            let uid: i64 = r.get(2)?;
+            Ok(json!({
+                "id": r.get::<_, i64>(0)?, "workspaceId": r.get::<_, i64>(1)?, "userId": uid,
+                "text": r.get::<_, String>(3)?, "createdAt": r.get::<_, String>(4)?,
+                "user": jsn::user_public(conn, uid)
+            }))
+        })?
+        .filter_map(|x| x.ok())
+        .collect();
+    rows.reverse();
+    Ok(Value::Array(rows))
+}
+
+fn chat_send(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
+    let uid = require_user(conn, user_id)?;
+    let text = s(input, "text").ok_or_else(|| ApiError::bad("Пустое сообщение"))?;
+    let ws = i64v(input, "workspaceId").unwrap_or_else(|| ws_fallback(conn));
+    conn.execute(
+        "INSERT INTO chat_messages (workspace_id, user_id, text, created_at) VALUES (?1,?2,?3,?4)",
+        params![ws, uid, text, now()],
+    )?;
+    Ok(json!({
+        "id": conn.last_insert_rowid(),
+        "workspaceId": ws,
+        "userId": uid,
+        "text": text,
+        "createdAt": now(),
+        "user": jsn::user_public(conn, uid)
+    }))
+}
+
+fn backup_export(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
+    let uid = require_user(conn, user_id)?;
+    require_can(conn, uid, "manageWorkspaces")?;
+    let password = s(input, "password").ok_or_else(|| ApiError::bad("Пароль архива обязателен"))?;
+    let journal = crate::sync::export_journal(conn);
+    crate::sync::encrypt_backup(&password, &journal.to_string())
+        .map_err(|e| ApiError::bad(e.to_string()))
+}
+
+fn backup_import(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
+    let uid = require_user(conn, user_id)?;
+    require_can(conn, uid, "manageWorkspaces")?;
+    let password = s(input, "password").ok_or_else(|| ApiError::bad("Пароль архива обязателен"))?;
+    let blob = input
+        .get("blob")
+        .cloned()
+        .ok_or_else(|| ApiError::bad("Нет архива"))?;
+    let plain =
+        crate::sync::decrypt_backup(&password, &blob).map_err(|e| ApiError::bad(e.to_string()))?;
+    let journal: Value = serde_json::from_str(&plain).map_err(|e| ApiError::bad(e.to_string()))?;
+    Ok(crate::sync::import_journal(conn, &journal))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn test_db() -> (Connection, PathBuf, [i64; 3], i64) {
+        let path = std::env::temp_dir().join(format!("meshkeeper-api-{}.db", Uuid::new_v4()));
+        let conn = db::open(&path).expect("test database");
+        conn.execute(
+            "INSERT INTO workspaces (name, timezone, internal_id_prefix, created_at) VALUES ('Test','UTC','T-',?1)",
+            params![now()],
+        )
+        .unwrap();
+        let ws = conn.last_insert_rowid();
+        let mut users = [0; 3];
+        for (index, slot) in users.iter_mut().enumerate() {
+            let rights = if index == 0 {
+                db::owner_rights()
+            } else {
+                db::default_rights()
+            };
+            conn.execute(
+                "INSERT INTO users (full_name, phone, status, role_rights, created_at)
+                 VALUES (?1,?2,'active',?3,?4)",
+                params![
+                    format!("User {index}"),
+                    format!("+7000000000{index}"),
+                    rights.to_string(),
+                    now()
+                ],
+            )
+            .unwrap();
+            *slot = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO user_workspaces (user_id, workspace_id) VALUES (?1,?2)",
+                params![*slot, ws],
+            )
+            .unwrap();
+        }
+        (conn, path, users, ws)
+    }
+
+    fn insert_item(
+        conn: &Connection,
+        ws: i64,
+        responsible: Option<i64>,
+        quantitative: bool,
+        quantity: Option<f64>,
+    ) -> i64 {
+        conn.execute(
+            "INSERT INTO items (internal_id, title, responsible_user_id, workspace_id, quantitative, quantity, comment, qr_code, created_at)
+             VALUES (?1,'Test item',?2,?3,?4,?5,'keep','QR-KEEP',?6)",
+            params![
+                format!("T-{}", Uuid::new_v4()),
+                responsible,
+                ws,
+                quantitative as i64,
+                quantity,
+                now()
+            ],
+        )
+        .unwrap();
+        conn.last_insert_rowid()
+    }
+
+    /// Делает запись в журнал невозможной, чтобы проверить откат мутации.
+    fn break_ledger(conn: &Connection) {
+        conn.execute_batch(
+            "CREATE TRIGGER block_ledger BEFORE INSERT ON history_entries
+             BEGIN SELECT RAISE(ABORT, 'ledger unavailable'); END;",
+        )
+        .unwrap();
+    }
+
+    fn cleanup(conn: Connection, path: PathBuf) {
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    #[test]
+    fn item_patch_preserves_absent_nullable_fields_and_clears_explicit_null() {
+        let (mut conn, path, users, ws) = test_db();
+        let item_id = insert_item(&conn, ws, Some(users[0]), false, None);
+
+        items_update(
+            &mut conn,
+            &json!({"id": item_id, "title": "Renamed"}),
+            Some(users[0]),
+        )
+        .unwrap();
+        let preserved: (Option<i64>, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT responsible_user_id, comment, qr_code FROM items WHERE id=?1",
+                params![item_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            preserved,
+            (Some(users[0]), Some("keep".into()), Some("QR-KEEP".into()))
+        );
+
+        items_update(
+            &mut conn,
+            &json!({"id": item_id, "responsibleUserId": null, "comment": null}),
+            Some(users[0]),
+        )
+        .unwrap();
+        let cleared: (Option<i64>, Option<String>) = conn
+            .query_row(
+                "SELECT responsible_user_id, comment FROM items WHERE id=?1",
+                params![item_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(cleared, (None, None));
+        cleanup(conn, path);
+    }
+
+    #[test]
+    fn quantity_writeoff_rejects_underflow_without_mutation_or_ledger_entry() {
+        let (mut conn, path, users, ws) = test_db();
+        let item_id = insert_item(&conn, ws, None, true, Some(5.0));
+        let error = history_write_off(
+            &mut conn,
+            &json!({"itemId": item_id, "quantity": 6.0, "comment": "damage"}),
+            Some(users[0]),
+        )
+        .unwrap_err();
+        assert_eq!(error.http, 400);
+        let quantity: f64 = conn
+            .query_row(
+                "SELECT quantity FROM items WHERE id=?1",
+                params![item_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let events: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM history_entries WHERE item_id=?1",
+                params![item_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(quantity, 5.0);
+        assert_eq!(events, 0);
+        cleanup(conn, path);
+    }
+
+    #[test]
+    fn item_update_rolls_back_when_ledger_append_fails() {
+        let (mut conn, path, users, ws) = test_db();
+        let item_id = insert_item(&conn, ws, Some(users[0]), false, None);
+        break_ledger(&conn);
+
+        let error = items_update(
+            &mut conn,
+            &json!({"id": item_id, "title": "Must roll back"}),
+            Some(users[0]),
+        )
+        .unwrap_err();
+        assert_eq!(error.http, 500);
+        let title: String = conn
+            .query_row(
+                "SELECT title FROM items WHERE id=?1",
+                params![item_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(title, "Test item");
+        cleanup(conn, path);
+    }
+
+    #[test]
+    fn transfer_can_only_be_accepted_by_recipient() {
+        let (mut conn, path, users, ws) = test_db();
+        let item_id = insert_item(&conn, ws, Some(users[0]), false, None);
+        conn.execute(
+            "INSERT INTO transfers (code, item_id, from_user_id, to_user_id, workspace_id, status, no_confirmation, created_at)
+             VALUES ('P-1',?1,?2,?3,?4,'pending',0,?5)",
+            params![item_id, users[0], users[1], ws, now()],
+        )
+        .unwrap();
+        let transfer_id = conn.last_insert_rowid();
+
+        let error = transfers_accept(&mut conn, &json!({"id": transfer_id}), Some(users[0]), true)
+            .unwrap_err();
+        assert_eq!(error.http, 403);
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM transfers WHERE id=?1",
+                params![transfer_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "pending");
+
+        transfers_accept(&mut conn, &json!({"id": transfer_id}), Some(users[1]), true).unwrap();
+        let responsible: Option<i64> = conn
+            .query_row(
+                "SELECT responsible_user_id FROM items WHERE id=?1",
+                params![item_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(responsible, Some(users[1]));
+        cleanup(conn, path);
+    }
+
+    #[test]
+    fn inventory_completion_is_atomic_and_idempotent() {
+        let (mut conn, path, users, ws) = test_db();
+        conn.execute(
+            "INSERT INTO inventory_sessions (number, workspace_id, status, started_by, created_at)
+             VALUES ('INV-1',?1,'in_progress',?2,?3)",
+            params![ws, users[0], now()],
+        )
+        .unwrap();
+        let session_id = conn.last_insert_rowid();
+
+        inv_complete(&mut conn, &json!({"sessionId": session_id}), Some(users[0])).unwrap();
+        let error =
+            inv_complete(&mut conn, &json!({"sessionId": session_id}), Some(users[0])).unwrap_err();
+        assert_eq!(error.http, 409);
+        let events: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM history_entries WHERE workspace_id=?1 AND type='inventory'",
+                params![ws],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(events, 1);
+        cleanup(conn, path);
+    }
+
+    #[test]
+    fn id_only_item_route_rejects_cross_workspace_access() {
+        let (mut conn, path, users, _ws) = test_db();
+        conn.execute(
+            "INSERT INTO workspaces (name, timezone, internal_id_prefix, created_at) VALUES ('Other','UTC','O-',?1)",
+            params![now()],
+        ).unwrap();
+        let other_ws = conn.last_insert_rowid();
+        let item = insert_item(&conn, other_ws, None, false, None);
+        let error = dispatch(
+            &mut conn,
+            "items.byId",
+            &json!({"id": item}),
+            Some(users[0]),
+        )
+        .unwrap_err();
+        assert_eq!(error.http, 403);
+        cleanup(conn, path);
+    }
+
+    #[test]
+    fn passwordless_account_cannot_log_in() {
+        let (conn, path, users, _ws) = test_db();
+        let error = auth_login(
+            &conn,
+            &json!({"phone": "+70000000000", "password": "anything"}),
+        )
+        .unwrap_err();
+        assert_eq!(error.http, 401);
+        let hash: Option<String> = conn
+            .query_row(
+                "SELECT password_hash FROM users WHERE id=?1",
+                params![users[0]],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(hash.is_none());
+        cleanup(conn, path);
+    }
+
+    #[test]
+    fn expired_invite_is_rejected_everywhere() {
+        let (mut conn, path, users, ws) = test_db();
+        let past = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+        conn.execute(
+            "INSERT INTO invites (workspace_id, token, role, created_by, max_uses, expires_at, created_at)
+             VALUES (?1,'expired-token','member',?2,20,?3,?4)",
+            params![ws, users[0], past, now()],
+        )
+        .unwrap();
+
+        let info = invite_info(&conn, &json!({"token": "expired-token"})).unwrap_err();
+        assert_eq!(info.http, 400);
+
+        let joined = dispatch(
+            &mut conn,
+            "auth.joinRegister",
+            &json!({"token": "expired-token", "fullName": "Поздний", "phone": "+79995550000", "password": "LongEnoughPass1"}),
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(joined.http, 400);
+
+        let users_after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM users", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(users_after, users.len() as i64);
+        cleanup(conn, path);
+    }
+
+    #[test]
+    fn fresh_invite_carries_expiry_and_role() {
+        let (mut conn, path, users, ws) = test_db();
+        let created = dispatch(
+            &mut conn,
+            "admin.workspaces.createInvite",
+            &json!({"workspaceId": ws, "role": "viewer", "maxUses": 5}),
+            Some(users[0]),
+        )
+        .unwrap();
+        let expires = created["expiresAt"].as_str().expect("expiresAt");
+        assert!(chrono::DateTime::parse_from_rfc3339(expires).unwrap() > chrono::Utc::now());
+        assert_eq!(created["role"].as_str(), Some("viewer"));
+        assert_eq!(created["payload"]["role"].as_str(), Some("viewer"));
+        cleanup(conn, path);
+    }
+
+    #[test]
+    fn viewer_invite_grants_read_only_membership() {
+        let (mut conn, path, users, ws) = test_db();
+        let item = insert_item(&conn, ws, None, false, None);
+        let created = dispatch(
+            &mut conn,
+            "admin.workspaces.createInvite",
+            &json!({"workspaceId": ws, "role": "viewer", "maxUses": 5}),
+            Some(users[0]),
+        )
+        .unwrap();
+        let token = created["token"].as_str().unwrap().to_string();
+        let joined = dispatch(
+            &mut conn,
+            "auth.joinRegister",
+            &json!({"token": token, "fullName": "Наблюдатель", "phone": "+79995551111", "password": "LongEnoughPass1"}),
+            None,
+        )
+        .unwrap();
+        let viewer = joined["id"].as_i64().unwrap();
+
+        let stored: String = conn
+            .query_row(
+                "SELECT rights_json FROM user_workspaces WHERE user_id=?1 AND workspace_id=?2",
+                params![viewer, ws],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let rights: Value = serde_json::from_str(&stored).unwrap();
+        assert_eq!(rights["viewItems"].as_bool(), Some(true));
+        assert_eq!(rights["createItems"].as_bool(), Some(false));
+
+        // Наблюдатель читает каталог, но не создаёт и не берёт предметы —
+        // даже если не передаёт workspaceId в запросе.
+        dispatch(&mut conn, "items.byId", &json!({"id": item}), Some(viewer)).unwrap();
+        let create = dispatch(
+            &mut conn,
+            "items.create",
+            &json!({"title": "Чужой предмет"}),
+            Some(viewer),
+        )
+        .unwrap_err();
+        assert_eq!(create.http, 403);
+        let take = dispatch(
+            &mut conn,
+            "transfers.take",
+            &json!({"itemId": item}),
+            Some(viewer),
+        )
+        .unwrap_err();
+        assert_eq!(take.http, 403);
+        cleanup(conn, path);
+    }
+
+    #[test]
+    fn workspace_right_applies_when_request_omits_workspace_id() {
+        let (mut conn, path, users, ws) = test_db();
+        let limited = json!({"viewItems": true, "createItems": false});
+        conn.execute(
+            "UPDATE user_workspaces SET rights_json=?1 WHERE user_id=?2 AND workspace_id=?3",
+            params![limited.to_string(), users[1], ws],
+        )
+        .unwrap();
+        let error = dispatch(
+            &mut conn,
+            "items.create",
+            &json!({"title": "Без workspaceId"}),
+            Some(users[1]),
+        )
+        .unwrap_err();
+        assert_eq!(error.http, 403);
+        let items: i64 = conn
+            .query_row("SELECT COUNT(*) FROM items", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(items, 0);
+        cleanup(conn, path);
+    }
+
+    #[test]
+    fn status_change_to_repair_requires_a_reason() {
+        let (mut conn, path, users, ws) = test_db();
+        let item = insert_item(&conn, ws, None, false, None);
+        conn.execute(
+            "INSERT INTO statuses (name, workspace_id, type, slug) VALUES ('В ремонте',?1,'status','in-repair')",
+            params![ws],
+        )
+        .unwrap();
+        let repair = conn.last_insert_rowid();
+
+        let refused = dispatch(
+            &mut conn,
+            "items.update",
+            &json!({"id": item, "statusId": repair}),
+            Some(users[0]),
+        )
+        .unwrap_err();
+        assert_eq!(refused.http, 400);
+        let unchanged: Option<i64> = conn
+            .query_row(
+                "SELECT status_id FROM items WHERE id=?1",
+                params![item],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(unchanged, None);
+
+        dispatch(
+            &mut conn,
+            "items.update",
+            &json!({"id": item, "statusId": repair, "reason": "Сгорел якорь"}),
+            Some(users[0]),
+        )
+        .unwrap();
+        let applied: Option<i64> = conn
+            .query_row(
+                "SELECT status_id FROM items WHERE id=?1",
+                params![item],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(applied, Some(repair));
+
+        let note: String = conn
+            .query_row(
+                "SELECT comment FROM history_entries WHERE item_id=?1 ORDER BY id DESC LIMIT 1",
+                params![item],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(note.contains("В ремонте"), "{note}");
+        assert!(note.contains("Сгорел якорь"), "{note}");
+        cleanup(conn, path);
+    }
+
+    #[test]
+    fn new_workspace_gets_statuses_and_a_storage() {
+        let (mut conn, path, users, _ws) = test_db();
+        let created = dispatch(
+            &mut conn,
+            "admin.workspaces.create",
+            &json!({"name": "Второй объект"}),
+            Some(users[0]),
+        )
+        .unwrap();
+        let ws = created["id"].as_i64().unwrap();
+
+        let mut stmt = conn
+            .prepare("SELECT slug FROM statuses WHERE workspace_id=?1 ORDER BY slug")
+            .unwrap();
+        let slugs: Vec<String> = stmt
+            .query_map(params![ws], |r| r.get(0))
+            .unwrap()
+            .filter_map(|x| x.ok())
+            .collect();
+        drop(stmt);
+        for expected in [
+            "in-work",
+            "in-repair",
+            "in-stock",
+            "needs-check",
+            "written-off",
+        ] {
+            assert!(
+                slugs.iter().any(|s| s == expected),
+                "{expected} missing from {slugs:?}"
+            );
+        }
+
+        let storages: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM storages WHERE workspace_id=?1",
+                params![ws],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(storages, 1);
+
+        // Предмет, взятый в новом пространстве, получает статус «В работе».
+        let item = dispatch(
+            &mut conn,
+            "items.create",
+            &json!({"workspaceId": ws, "title": "Новый предмет"}),
+            Some(users[0]),
+        )
+        .unwrap();
+        let taken = dispatch(
+            &mut conn,
+            "transfers.take",
+            &json!({"itemId": item["id"].as_i64().unwrap()}),
+            Some(users[0]),
+        )
+        .unwrap();
+        assert_eq!(taken["status"]["slug"].as_str(), Some("in-work"));
+        cleanup(conn, path);
+    }
+
+    #[test]
+    fn return_rolls_back_when_ledger_append_fails() {
+        let (mut conn, path, users, ws) = test_db();
+        let item_id = insert_item(&conn, ws, Some(users[0]), false, None);
+        break_ledger(&conn);
+
+        let error =
+            transfers_return(&mut conn, &json!({"itemId": item_id}), Some(users[0])).unwrap_err();
+        assert_eq!(error.http, 500);
+
+        // Предмет остался у сотрудника: возврат без записи в журнал не считается.
+        let responsible: Option<i64> = conn
+            .query_row(
+                "SELECT responsible_user_id FROM items WHERE id=?1",
+                params![item_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(responsible, Some(users[0]));
+        cleanup(conn, path);
+    }
+
+    #[test]
+    fn quantity_return_adds_stock_back_and_journals_it() {
+        let (mut conn, path, users, ws) = test_db();
+        let item_id = insert_item(&conn, ws, None, true, Some(10.0));
+        dispatch(
+            &mut conn,
+            "transfers.take",
+            &json!({"itemId": item_id, "quantity": 4.0}),
+            Some(users[1]),
+        )
+        .unwrap();
+        let after_take: f64 = conn
+            .query_row(
+                "SELECT quantity FROM items WHERE id=?1",
+                params![item_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!((after_take - 6.0).abs() < 1e-9, "{after_take}");
+
+        dispatch(
+            &mut conn,
+            "transfers.returnItem",
+            &json!({"itemId": item_id, "quantity": 4.0}),
+            Some(users[1]),
+        )
+        .unwrap();
+        let after_return: f64 = conn
+            .query_row(
+                "SELECT quantity FROM items WHERE id=?1",
+                params![item_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!((after_return - 10.0).abs() < 1e-9, "{after_return}");
+
+        let journaled: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM history_entries WHERE item_id=?1 AND type='transfer_send'",
+                params![item_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(journaled, 1);
+        cleanup(conn, path);
+    }
+
+    #[test]
+    fn inventory_discrepancy_becomes_a_correcting_ledger_entry() {
+        let (mut conn, path, users, ws) = test_db();
+        let item = insert_item(&conn, ws, None, true, Some(10.0));
+        let session = dispatch(
+            &mut conn,
+            "inventory.create",
+            &json!({"workspaceId": ws}),
+            Some(users[0]),
+        )
+        .unwrap();
+        let sid = session["id"].as_i64().unwrap();
+
+        dispatch(
+            &mut conn,
+            "inventory.checkItem",
+            &json!({"sessionId": sid, "itemId": item, "checked": true, "actualQty": 7.0}),
+            Some(users[0]),
+        )
+        .unwrap();
+        let done = dispatch(
+            &mut conn,
+            "inventory.complete",
+            &json!({"sessionId": sid}),
+            Some(users[0]),
+        )
+        .unwrap();
+        assert_eq!(done["corrections"].as_u64(), Some(1));
+
+        // Остаток приведён к фактическому.
+        let qty: f64 = conn
+            .query_row(
+                "SELECT quantity FROM items WHERE id=?1",
+                params![item],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!((qty - 7.0).abs() < 1e-9, "{qty}");
+
+        // История сохранила корректировку с дельтой, а не переписала прошлое.
+        let (delta, comment): (f64, String) = conn
+            .query_row(
+                "SELECT quantity_delta, comment FROM history_entries
+                 WHERE item_id=?1 AND type='inventory' ORDER BY id DESC LIMIT 1",
+                params![item],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert!((delta + 3.0).abs() < 1e-9, "{delta}");
+        assert!(comment.contains("фактически 7"), "{comment}");
+        cleanup(conn, path);
+    }
+
+    #[test]
+    fn auth_options_opens_registration_only_until_bootstrap() {
+        let path = std::env::temp_dir().join(format!("meshkeeper-boot-{}.db", Uuid::new_v4()));
+        let mut conn = db::open(&path).expect("test database");
+
+        let empty = dispatch(&mut conn, "auth.options", &Value::Null, None).unwrap();
+        assert_eq!(empty["registrationOpen"].as_bool(), Some(true));
+        assert_eq!(empty["bootstrap"].as_bool(), Some(true));
+
+        dispatch(
+            &mut conn,
+            "auth.register",
+            &json!({"fullName": "Владелец", "phone": "+79990000000", "password": "LongEnoughPass1", "workspaceName": "Объект"}),
+            None,
+        )
+        .unwrap();
+
+        let after = dispatch(&mut conn, "auth.options", &Value::Null, None).unwrap();
+        assert_eq!(after["registrationOpen"].as_bool(), Some(false));
+        assert_eq!(after["bootstrap"].as_bool(), Some(false));
+        cleanup(conn, path);
+    }
+
+    #[test]
+    fn fault_and_change_requests_stay_inside_their_workspace() {
+        let (mut conn, path, users, _ws) = test_db();
+        // Второе пространство с собственным предметом и заявками.
+        conn.execute(
+            "INSERT INTO workspaces (name, timezone, internal_id_prefix, created_at) VALUES ('Other','UTC','O-',?1)",
+            params![now()],
+        )
+        .unwrap();
+        let other_ws = conn.last_insert_rowid();
+        let other_item = insert_item(&conn, other_ws, None, false, None);
+        conn.execute(
+            "INSERT INTO faults (item_id, workspace_id, author_id, severity, description, created_at)
+             VALUES (?1,?2,?3,'high','Чужая поломка',?4)",
+            params![other_item, other_ws, users[0], now()],
+        )
+        .unwrap();
+        let fault_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO change_requests (item_id, workspace_id, author_id, payload, created_at)
+             VALUES (?1,?2,?3,'{\"title\":\"Взлом\"}',?4)",
+            params![other_item, other_ws, users[0], now()],
+        )
+        .unwrap();
+        let change_id = conn.last_insert_rowid();
+
+        // users[0] состоит только в `ws`, но не в `other_ws`.
+        let fault_err = dispatch(
+            &mut conn,
+            "items.resolveFault",
+            &json!({"id": fault_id, "status": "resolved"}),
+            Some(users[0]),
+        )
+        .unwrap_err();
+        assert_eq!(fault_err.http, 403);
+
+        let change_err = dispatch(
+            &mut conn,
+            "items.decideChange",
+            &json!({"id": change_id, "accept": true}),
+            Some(users[0]),
+        )
+        .unwrap_err();
+        assert_eq!(change_err.http, 403);
+
+        let title: String = conn
+            .query_row(
+                "SELECT title FROM items WHERE id=?1",
+                params![other_item],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(title, "Test item");
+        cleanup(conn, path);
+    }
+
+    #[test]
+    fn reported_fault_puts_item_under_review_and_blocks_checkout() {
+        let (mut conn, path, users, ws) = test_db();
+        seed_workspace_defaults(&conn, ws, users[0]).unwrap();
+        let item = insert_item(&conn, ws, None, false, None);
+        dispatch(
+            &mut conn,
+            "items.reportFault",
+            &json!({"itemId": item, "severity": "high", "description": "Не держит патрон"}),
+            Some(users[1]),
+        )
+        .unwrap();
+
+        let slug: String = conn
+            .query_row(
+                "SELECT s.slug FROM items i JOIN statuses s ON s.id=i.status_id WHERE i.id=?1",
+                params![item],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(slug, "needs-check");
+
+        let blocked = dispatch(
+            &mut conn,
+            "transfers.take",
+            &json!({"itemId": item}),
+            Some(users[1]),
+        )
+        .unwrap_err();
+        assert_eq!(blocked.http, 400);
+
+        let journaled: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM history_entries WHERE item_id=?1",
+                params![item],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(journaled, 1);
+        cleanup(conn, path);
+    }
+
+    #[test]
+    fn accepted_change_request_that_cannot_apply_is_not_marked_accepted() {
+        let (mut conn, path, users, ws) = test_db();
+        seed_workspace_defaults(&conn, ws, users[0]).unwrap();
+        let item = insert_item(&conn, ws, None, false, None);
+        let written_off: i64 = conn
+            .query_row(
+                "SELECT id FROM statuses WHERE workspace_id=?1 AND slug='written-off'",
+                params![ws],
+                |r| r.get(0),
+            )
+            .unwrap();
+        // Заявка меняет статус на «Списан», но причины в ней нет.
+        conn.execute(
+            "INSERT INTO change_requests (item_id, workspace_id, author_id, payload, created_at)
+             VALUES (?1,?2,?3,?4,?5)",
+            params![
+                item,
+                ws,
+                users[1],
+                json!({"statusId": written_off}).to_string(),
+                now()
+            ],
+        )
+        .unwrap();
+        let change_id = conn.last_insert_rowid();
+
+        // Причина берётся из решения администратора — заявка применяется.
+        dispatch(
+            &mut conn,
+            "items.decideChange",
+            &json!({"id": change_id, "accept": true, "reason": "Утилизирован по акту"}),
+            Some(users[0]),
+        )
+        .unwrap();
+        let status_id: Option<i64> = conn
+            .query_row(
+                "SELECT status_id FROM items WHERE id=?1",
+                params![item],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(status_id, Some(written_off));
+
+        // Повторное решение по той же заявке отклоняется.
+        let again = dispatch(
+            &mut conn,
+            "items.decideChange",
+            &json!({"id": change_id, "accept": false}),
+            Some(users[0]),
+        )
+        .unwrap_err();
+        assert_eq!(again.http, 409);
+        cleanup(conn, path);
+    }
+
+    #[test]
+    fn written_off_item_cannot_be_transferred() {
+        let (mut conn, path, users, ws) = test_db();
+        seed_workspace_defaults(&conn, ws, users[0]).unwrap();
+        let item = insert_item(&conn, ws, Some(users[0]), false, None);
+        let written_off: i64 = conn
+            .query_row(
+                "SELECT id FROM statuses WHERE workspace_id=?1 AND slug='written-off'",
+                params![ws],
+                |r| r.get(0),
+            )
+            .unwrap();
+        conn.execute(
+            "UPDATE items SET status_id=?1 WHERE id=?2",
+            params![written_off, item],
+        )
+        .unwrap();
+
+        let error = dispatch(
+            &mut conn,
+            "transfers.prepare",
+            &json!({"itemId": item, "toUserId": users[1]}),
+            Some(users[0]),
+        )
+        .unwrap_err();
+        assert_eq!(error.http, 400);
+        let transfers: i64 = conn
+            .query_row("SELECT COUNT(*) FROM transfers", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(transfers, 0);
+        cleanup(conn, path);
+    }
+
+    #[test]
+    fn removing_a_member_keeps_their_history() {
+        let (mut conn, path, users, ws) = test_db();
+        seed_workspace_defaults(&conn, ws, users[0]).unwrap();
+        let item = insert_item(&conn, ws, None, false, None);
+        dispatch(
+            &mut conn,
+            "transfers.take",
+            &json!({"itemId": item}),
+            Some(users[1]),
+        )
+        .unwrap();
+
+        // Себя удалить нельзя.
+        let self_remove = dispatch(
+            &mut conn,
+            "admin.users.remove",
+            &json!({"id": users[0], "workspaceId": ws}),
+            Some(users[0]),
+        )
+        .unwrap_err();
+        assert_eq!(self_remove.http, 400);
+
+        let result = dispatch(
+            &mut conn,
+            "admin.users.remove",
+            &json!({"id": users[1], "workspaceId": ws}),
+            Some(users[0]),
+        )
+        .unwrap();
+        assert_eq!(result["deleted"].as_bool(), Some(false));
+
+        // Учётная запись заблокирована и выведена из пространства…
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM users WHERE id=?1",
+                params![users[1]],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "disabled");
+        let member: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM user_workspaces WHERE user_id=?1 AND workspace_id=?2",
+                params![users[1], ws],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(member, 0);
+
+        // …но записи журнала остались на месте.
+        let entries: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM history_entries WHERE actor_user_id=?1",
+                params![users[1]],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(entries > 0);
+        cleanup(conn, path);
+    }
+
+    #[test]
+    fn repeated_bad_passwords_lock_the_account_out() {
+        let (conn, path, users, _ws) = test_db();
+        conn.execute(
+            "UPDATE users SET password_hash=?1, phone='+79001234567' WHERE id=?2",
+            params![hash_password("CorrectHorse1"), users[0]],
+        )
+        .unwrap();
+
+        // Первые попытки просто отклоняются.
+        for _ in 0..LOGIN_FREE_ATTEMPTS {
+            let e = auth_login(
+                &conn,
+                &json!({"phone": "+7 900 123-45-67", "password": "wrong"}),
+            )
+            .unwrap_err();
+            assert_eq!(e.http, 401, "{}", e.message);
+        }
+
+        // Дальше включается пауза.
+        let locked = auth_login(
+            &conn,
+            &json!({"phone": "+7 900 123-45-67", "password": "wrong"}),
+        )
+        .unwrap_err();
+        assert_eq!(locked.http, 429, "{}", locked.message);
+
+        // Верный пароль в этот момент тоже не проходит — иначе паузу
+        // можно было бы обойти, угадав с шестого раза.
+        let blocked = auth_login(
+            &conn,
+            &json!({"phone": "+7 900 123-45-67", "password": "CorrectHorse1"}),
+        )
+        .unwrap_err();
+        assert_eq!(blocked.http, 429);
+
+        // После снятия блокировки вход работает и счётчик обнуляется.
+        conn.execute("UPDATE login_throttle SET locked_until=NULL", [])
+            .unwrap();
+        auth_login(
+            &conn,
+            &json!({"phone": "+7 900 123-45-67", "password": "CorrectHorse1"}),
+        )
+        .unwrap();
+        let left: i64 = conn
+            .query_row("SELECT COUNT(*) FROM login_throttle", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(left, 0);
+        cleanup(conn, path);
+    }
+
+    #[test]
+    fn change_request_shows_before_and_after() {
+        let (mut conn, path, users, ws) = test_db();
+        seed_workspace_defaults(&conn, ws, users[0]).unwrap();
+        let item = insert_item(&conn, ws, None, false, None);
+        conn.execute(
+            "INSERT INTO categories (name, workspace_id, type) VALUES ('Электроинструмент',?1,'category')",
+            params![ws],
+        )
+        .unwrap();
+        let category = conn.last_insert_rowid();
+
+        dispatch(
+            &mut conn,
+            "items.requestChange",
+            &json!({
+                "itemId": item,
+                "payload": {"title": "Перфоратор Bosch", "categoryId": category},
+                "comment": "уточнил модель"
+            }),
+            Some(users[1]),
+        )
+        .unwrap();
+
+        let list = dispatch(
+            &mut conn,
+            "items.changeRequests",
+            &json!({"workspaceId": ws}),
+            Some(users[0]),
+        )
+        .unwrap();
+        let changes = list[0]["changes"].as_array().expect("changes");
+        assert_eq!(changes.len(), 2, "{changes:?}");
+
+        let title = changes.iter().find(|c| c["field"] == "title").unwrap();
+        assert_eq!(title["label"].as_str(), Some("Наименование"));
+        assert_eq!(title["before"].as_str(), Some("Test item"));
+        assert_eq!(title["after"].as_str(), Some("Перфоратор Bosch"));
+
+        // Идентификатор категории развёрнут в название, а не показан числом.
+        let cat = changes.iter().find(|c| c["field"] == "categoryId").unwrap();
+        assert!(cat["before"].is_null());
+        assert_eq!(cat["after"].as_str(), Some("Электроинструмент"));
+        cleanup(conn, path);
+    }
+
+    #[test]
+    fn change_request_hides_fields_that_do_not_change() {
+        let (mut conn, path, users, ws) = test_db();
+        let item = insert_item(&conn, ws, None, false, None);
+        dispatch(
+            &mut conn,
+            "items.requestChange",
+            &json!({"itemId": item, "payload": {"title": "Test item"}}),
+            Some(users[1]),
+        )
+        .unwrap();
+        let list = dispatch(
+            &mut conn,
+            "items.changeRequests",
+            &json!({"workspaceId": ws}),
+            Some(users[0]),
+        )
+        .unwrap();
+        assert!(list[0]["changes"].as_array().unwrap().is_empty());
+        cleanup(conn, path);
+    }
+
+    #[test]
+    fn photo_and_location_rights_hide_fields_in_every_shape() {
+        let (mut conn, path, users, ws) = test_db();
+        seed_workspace_defaults(&conn, ws, users[0]).unwrap();
+        let item = insert_item(&conn, ws, None, false, None);
+        conn.execute(
+            "INSERT INTO item_photos (item_id, url, is_title) VALUES (?1,'data:image/png;base64,AAA',1)",
+            params![item],
+        )
+        .unwrap();
+        let storage: i64 = conn
+            .query_row(
+                "SELECT id FROM storages WHERE workspace_id=?1",
+                params![ws],
+                |r| r.get(0),
+            )
+            .unwrap();
+        conn.execute(
+            "UPDATE items SET storage_id=?1 WHERE id=?2",
+            params![storage, item],
+        )
+        .unwrap();
+
+        // Владелец видит всё.
+        let full = dispatch(
+            &mut conn,
+            "items.byId",
+            &json!({"id": item}),
+            Some(users[0]),
+        )
+        .unwrap();
+        assert!(!full["photos"].as_array().unwrap().is_empty());
+        assert!(!full["storage"].is_null());
+
+        // У второго пользователя оба права сняты.
+        let limited = json!({"viewItems": true, "viewPhotos": false, "viewLocation": false});
+        conn.execute(
+            "UPDATE user_workspaces SET rights_json=?1 WHERE user_id=?2 AND workspace_id=?3",
+            params![limited.to_string(), users[1], ws],
+        )
+        .unwrap();
+
+        let hidden = dispatch(
+            &mut conn,
+            "items.byId",
+            &json!({"id": item}),
+            Some(users[1]),
+        )
+        .unwrap();
+        assert!(hidden.get("photos").is_none(), "{hidden}");
+        assert!(hidden.get("storage").is_none(), "{hidden}");
+        assert!(hidden.get("storageId").is_none(), "{hidden}");
+        // Само название и статус остаются — каталог смотреть можно.
+        assert_eq!(hidden["title"].as_str(), Some("Test item"));
+
+        // И во вложенных формах: список тоже вычищен.
+        let list = dispatch(
+            &mut conn,
+            "reports.allItems",
+            &json!({"workspaceId": ws}),
+            Some(users[1]),
+        )
+        .unwrap();
+        assert!(list[0].get("storage").is_none(), "{list}");
+        cleanup(conn, path);
+    }
+
+    #[test]
+    fn rights_saved_before_a_new_permission_existed_keep_working() {
+        let (mut conn, path, users, ws) = test_db();
+        let item = insert_item(&conn, ws, None, false, None);
+        // Старая запись прав: про viewPhotos/viewLocation она ничего не знает.
+        let legacy = json!({"viewItems": true, "createItems": true});
+        conn.execute(
+            "UPDATE user_workspaces SET rights_json=?1 WHERE user_id=?2 AND workspace_id=?3",
+            params![legacy.to_string(), users[1], ws],
+        )
+        .unwrap();
+
+        let seen = dispatch(
+            &mut conn,
+            "items.byId",
+            &json!({"id": item}),
+            Some(users[1]),
+        )
+        .unwrap();
+        assert!(
+            seen.get("photos").is_some(),
+            "поле фото пропало у старой записи прав"
+        );
+        cleanup(conn, path);
+    }
+
+    #[test]
+    fn write_off_photo_can_be_required_by_the_group() {
+        let (mut conn, path, users, ws) = test_db();
+        seed_workspace_defaults(&conn, ws, users[0]).unwrap();
+        let first = insert_item(&conn, ws, None, false, None);
+        let second = insert_item(&conn, ws, None, false, None);
+
+        // По умолчанию фото не требуется — достаточно причины.
+        dispatch(
+            &mut conn,
+            "history.writeOff",
+            &json!({"itemId": first, "comment": "Сломан безвозвратно"}),
+            Some(users[0]),
+        )
+        .unwrap();
+
+        dispatch(
+            &mut conn,
+            "admin.workspaces.update",
+            &json!({"id": ws, "requireWriteoffPhoto": true}),
+            Some(users[0]),
+        )
+        .unwrap();
+
+        let refused = dispatch(
+            &mut conn,
+            "history.writeOff",
+            &json!({"itemId": second, "comment": "Утилизирован"}),
+            Some(users[0]),
+        )
+        .unwrap_err();
+        assert_eq!(refused.http, 400, "{}", refused.message);
+
+        dispatch(
+            &mut conn,
+            "history.writeOff",
+            &json!({
+                "itemId": second,
+                "comment": "Утилизирован по акту",
+                "photoUrl": "data:image/png;base64,AAAA"
+            }),
+            Some(users[0]),
+        )
+        .unwrap();
+
+        // Фото сохранено при записи журнала, а не потеряно.
+        let stored: Option<String> = conn
+            .query_row(
+                "SELECT photo_url FROM history_entries WHERE item_id=?1 AND type='write_off'",
+                params![second],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored.as_deref(), Some("data:image/png;base64,AAAA"));
+        cleanup(conn, path);
+    }
+
+    #[test]
+    fn photos_get_a_thumbnail_and_a_checksum() {
+        let (mut conn, path, users, ws) = test_db();
+        let full = "data:image/jpeg;base64,QQQQQQQQQQQQ";
+        let thumb = "data:image/jpeg;base64,VGh1bWI=";
+
+        let created = dispatch(
+            &mut conn,
+            "items.create",
+            &json!({
+                "workspaceId": ws,
+                "title": "Перфоратор",
+                "photos": [{"url": full, "thumbUrl": thumb}]
+            }),
+            Some(users[0]),
+        )
+        .unwrap();
+        let item = created["id"].as_i64().unwrap();
+
+        let photo = &created["photos"][0];
+        assert_eq!(photo["url"].as_str(), Some(full));
+        assert_eq!(photo["thumbUrl"].as_str(), Some(thumb));
+        // Контрольная сумма считается сервером, а не приходит от клиента.
+        let expected = photo_checksum(full);
+        assert_eq!(photo["sha256"].as_str(), Some(expected.as_str()));
+        assert_eq!(expected.len(), 64);
+
+        // В списке каталога оригинал не отдаётся — только миниатюра.
+        let list = dispatch(
+            &mut conn,
+            "items.list",
+            &json!({"workspaceId": ws}),
+            Some(users[0]),
+        )
+        .unwrap();
+        let listed = &list["rows"][0]["photos"][0];
+        assert_eq!(
+            listed["url"].as_str(),
+            Some(thumb),
+            "в списке уехал оригинал"
+        );
+        assert_eq!(listed["thumbUrl"].as_str(), Some(thumb));
+
+        // В карточке оригинал по-прежнему доступен.
+        let card = dispatch(
+            &mut conn,
+            "items.byId",
+            &json!({"id": item}),
+            Some(users[0]),
+        )
+        .unwrap();
+        assert_eq!(card["photos"][0]["url"].as_str(), Some(full));
+        cleanup(conn, path);
+    }
+
+    #[test]
+    fn photos_added_as_plain_strings_still_work() {
+        let (mut conn, path, users, ws) = test_db();
+        let url = "data:image/png;base64,AAAA";
+        let created = dispatch(
+            &mut conn,
+            "items.create",
+            &json!({"workspaceId": ws, "title": "Дрель", "photos": [url]}),
+            Some(users[0]),
+        )
+        .unwrap();
+        let photo = &created["photos"][0];
+        assert_eq!(photo["url"].as_str(), Some(url));
+        // Миниатюры нет — подставляется оригинал, карточка не остаётся пустой.
+        assert_eq!(photo["thumbUrl"].as_str(), Some(url));
+        assert!(photo["sha256"].as_str().is_some());
+        cleanup(conn, path);
+    }
+}

@@ -1,0 +1,33 @@
+<svg width="480" height="360" viewBox="0 0 480 360" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <rect width="480" height="360" rx="16" fill="#EDEDF7"/>
+  <!-- pillow of mesh nodes -->
+  <g stroke-linecap="round" opacity="0.9">
+    <line x1="150" y1="252" x2="200" y2="230" stroke="#66C6BE" stroke-width="1.6"/>
+    <line x1="200" y1="230" x2="260" y2="238" stroke="#5E629B" stroke-width="1.6"/>
+    <line x1="260" y1="238" x2="320" y2="228" stroke="#66C6BE" stroke-width="1.6"/>
+    <line x1="320" y1="228" x2="350" y2="256" stroke="#5E629B" stroke-width="1.6"/>
+    <line x1="150" y1="252" x2="240" y2="268" stroke="#5E629B" stroke-width="1.4" opacity="0.6"/>
+    <line x1="240" y1="268" x2="350" y2="256" stroke="#66C6BE" stroke-width="1.4" opacity="0.6"/>
+    <line x1="200" y1="230" x2="240" y2="268" stroke="#66C6BE" stroke-width="1.4" opacity="0.6"/>
+    <line x1="320" y1="228" x2="240" y2="268" stroke="#5E629B" stroke-width="1.4" opacity="0.6"/>
+  </g>
+  <circle cx="150" cy="252" r="5.5" fill="#5E629B"/>
+  <circle cx="200" cy="230" r="5" fill="#66C6BE"/>
+  <circle cx="260" cy="238" r="5.5" fill="#5E629B"/>
+  <circle cx="320" cy="228" r="5" fill="#66C6BE"/>
+  <circle cx="350" cy="256" r="5.5" fill="#5E629B"/>
+  <circle cx="240" cy="268" r="5" fill="#66C6BE"/>
+  <!-- sleeping bell -->
+  <g transform="rotate(18 250 180)">
+    <path d="M250 116 C206 116 186 152 186 192 L186 208 L314 208 L314 192 C314 152 294 116 250 116 Z" fill="#5E629B"/>
+    <path d="M176 208 L324 208 Q324 222 310 222 L190 222 Q176 222 176 208 Z" fill="#4C4F82"/>
+    <circle cx="250" cy="238" r="14" fill="#66C6BE"/>
+    <rect x="240" y="100" width="20" height="14" rx="7" fill="#7A7EC4"/>
+  </g>
+  <!-- zzz -->
+  <g fill="#9B9EC4" font-family="Arial, sans-serif" font-weight="700">
+    <text x="330" y="120" font-size="34">z</text>
+    <text x="356" y="96" font-size="26">z</text>
+    <text x="376" y="76" font-size="19">z</text>
+  </g>
+</svg>

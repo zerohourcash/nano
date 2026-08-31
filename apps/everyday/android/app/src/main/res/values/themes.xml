@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.MeshKeeper" parent="Theme.MaterialComponents.DayNight.NoActionBar">
+        <item name="colorPrimary">#5E629B</item>
+        <item name="colorPrimaryVariant">#2E3160</item>
+        <item name="colorAccent">#E0235B</item>
+        <item name="android:statusBarColor">#2E3160</item>
+        <item name="android:navigationBarColor">#FFFFFF</item>
+        <item name="android:windowBackground">#ECECF3</item>
+        <item name="android:fontFamily">sans-serif</item>
+        <item name="buttonStyle">@style/Widget.AppCompat.Button.Borderless</item>
+    </style>
+</resources>

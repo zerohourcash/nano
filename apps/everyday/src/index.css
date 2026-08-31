@@ -1,0 +1,87 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 240 23% 94%;
+    --foreground: 236 36% 29%;
+    --card: 0 0% 100%;
+    --card-foreground: 236 36% 29%;
+    --popover: 0 0% 100%;
+    --popover-foreground: 236 36% 29%;
+    --primary: 236 24% 49%;
+    --primary-foreground: 0 0% 100%;
+    --secondary: 240 38% 95%;
+    --secondary-foreground: 236 36% 29%;
+    --muted: 240 38% 95%;
+    --muted-foreground: 236 21% 52%;
+    --accent: 342 75% 51%;
+    --accent-foreground: 0 0% 100%;
+    --destructive: 0 64% 55%;
+    --destructive-foreground: 0 0% 100%;
+    --border: 240 57% 86%;
+    --input: 240 57% 86%;
+    --ring: 236 24% 49%;
+    --radius: 0.75rem;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  html {
+    font-family: 'Segoe UI', Roboto, system-ui, -apple-system, sans-serif;
+    -webkit-text-size-adjust: 100%;
+  }
+  body {
+    @apply bg-app text-ink-900 antialiased;
+    min-width: 320px;
+    overscroll-behavior-y: none;
+  }
+  ::selection {
+    background: #5e629b33;
+  }
+  /* Тонкие скроллбары (design.md §7) */
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: #c9c9f0 transparent;
+  }
+  *::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+  *::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  *::-webkit-scrollbar-thumb {
+    background: #c9c9f0;
+    border-radius: 999px;
+  }
+  *::-webkit-scrollbar-thumb:hover {
+    background: #5e629b;
+  }
+  input:focus-visible,
+  button:focus-visible,
+  select:focus-visible,
+  a:focus-visible {
+    outline: none;
+  }
+}
+
+@layer utilities {
+  .font-mono-num {
+    font-family: ui-monospace, 'SFMono-Regular', Consolas, 'Liberation Mono', monospace;
+    font-weight: 600;
+    font-size: 13px;
+    line-height: 18px;
+  }
+  .text-caption {
+    font-size: 12px;
+    line-height: 16px;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+  }
+}

@@ -1,0 +1,81 @@
+plugins {
+    id 'com.android.application'
+}
+
+def releaseStorePath = providers.environmentVariable('MESHKEEPER_ANDROID_KEYSTORE').orNull
+def releaseStorePassword = providers.environmentVariable('MESHKEEPER_ANDROID_STORE_PASSWORD').orNull
+def releaseKeyAlias = providers.environmentVariable('MESHKEEPER_ANDROID_KEY_ALIAS').orNull
+def releaseKeyPassword = providers.environmentVariable('MESHKEEPER_ANDROID_KEY_PASSWORD').orNull
+def releaseSigningConfigured = releaseStorePath && releaseStorePassword && releaseKeyAlias && releaseKeyPassword
+
+android {
+    namespace 'ru.meshkeeper.app'
+    compileSdk 34
+    defaultConfig {
+        applicationId 'ru.meshkeeper.app'
+        minSdk 24
+        targetSdk 34
+        versionCode 1
+        versionName '1.0'
+    }
+    signingConfigs {
+        if (releaseSigningConfigured) {
+            release {
+                storeFile file(releaseStorePath)
+                storePassword releaseStorePassword
+                keyAlias releaseKeyAlias
+                keyPassword releaseKeyPassword
+            }
+        }
+    }
+    buildTypes {
+        release {
+            minifyEnabled true
+            shrinkResources true
+            debuggable false
+            if (releaseSigningConfigured) signingConfig signingConfigs.release
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+        debug {
+            minifyEnabled false
+        }
+    }
+    buildFeatures {
+        // В AGP 8 генерация BuildConfig выключена по умолчанию, а код к нему
+        // обращается (WebView.setWebContentsDebuggingEnabled).
+        buildConfig true
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+}
+dependencies {
+    implementation 'androidx.appcompat:appcompat:1.7.0'
+    implementation 'com.google.android.material:material:1.12.0'
+    implementation 'org.nanohttpd:nanohttpd:2.3.1'
+    implementation 'com.journeyapps:zxing-android-embedded:4.3.0'
+}
+
+def wwwSrc = new File(rootProject.projectDir.parentFile, 'dist/public')
+def wwwDst = file('src/main/assets/www')
+tasks.register('copyWww', Sync) {
+    doFirst {
+        if (!new File(wwwSrc, 'index.html').isFile()) {
+            throw new GradleException("Web build not found at ${wwwSrc}. Run the Vite production build first.")
+        }
+    }
+    from wwwSrc
+    into wwwDst
+    include '**/*'
+}
+preBuild.dependsOn copyWww
+
+gradle.taskGraph.whenReady { graph ->
+    def packagesRelease = graph.allTasks.any { task ->
+        task.project == project && task.name in ['assembleRelease', 'bundleRelease', 'packageRelease']
+    }
+    if (packagesRelease && !releaseSigningConfigured) {
+        throw new GradleException('Release signing is not configured. Set MESHKEEPER_ANDROID_KEYSTORE, MESHKEEPER_ANDROID_STORE_PASSWORD, MESHKEEPER_ANDROID_KEY_ALIAS and MESHKEEPER_ANDROID_KEY_PASSWORD.')
+    }
+}

@@ -1,0 +1,26 @@
+<svg width="480" height="360" viewBox="0 0 480 360" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <rect width="480" height="360" rx="16" fill="#EDEDF7"/>
+  <ellipse cx="240" cy="308" rx="150" ry="14" fill="#C9C9F0" opacity="0.5"/>
+  <!-- left arm/hand -->
+  <path d="M40 220 Q60 206 92 202 L168 196 Q184 195 188 206 L190 214 Q192 226 178 230 L100 244 Q64 250 48 240 Q36 232 40 220 Z" fill="#5E629B"/>
+  <circle cx="182" cy="212" r="14" fill="#F0C8A8"/>
+  <!-- right arm/hand -->
+  <path d="M440 172 Q420 158 388 154 L312 148 Q296 147 292 158 L290 166 Q288 178 302 182 L380 196 Q416 202 432 192 Q444 184 440 172 Z" fill="#7A7EC4"/>
+  <circle cx="298" cy="164" r="14" fill="#E8B48C"/>
+  <!-- box being passed -->
+  <g>
+    <path d="M196 176 L240 160 L284 176 L284 216 Q284 224 276 226 L204 226 Q196 224 196 216 Z" fill="#FFFFFF" stroke="#C9C9F0" stroke-width="2"/>
+    <path d="M196 176 L240 160 L284 176 L240 192 Z" fill="#EDEDF7" stroke="#C9C9F0" stroke-width="2"/>
+    <path d="M240 192 L240 226" stroke="#C9C9F0" stroke-width="2"/>
+    <rect x="228" y="182" width="24" height="8" rx="4" fill="#66C6BE"/>
+  </g>
+  <!-- dashed route with nodes above -->
+  <path d="M120 120 Q240 56 360 110" stroke="#5E629B" stroke-width="2" stroke-dasharray="8 8" stroke-linecap="round" fill="none"/>
+  <circle cx="120" cy="120" r="6" fill="#5E629B"/>
+  <circle cx="186" cy="88" r="4.5" fill="#66C6BE"/>
+  <circle cx="240" cy="80" r="6" fill="#5E629B"/>
+  <circle cx="298" cy="88" r="4.5" fill="#66C6BE"/>
+  <circle cx="360" cy="110" r="6" fill="#5E629B"/>
+  <!-- arrow head at destination -->
+  <path d="M352 100 L368 112 L350 118 Z" fill="#5E629B"/>
+</svg>

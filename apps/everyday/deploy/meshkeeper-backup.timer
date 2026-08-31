@@ -1,0 +1,12 @@
+[Unit]
+Description=Ежедневная резервная копия MeshKeeper
+
+[Timer]
+# Ночью, со случайным разбросом, чтобы не совпадать с другими задачами.
+OnCalendar=*-*-* 03:30:00
+RandomizedDelaySec=30m
+# Если сервер был выключен в назначенное время — сделать копию после включения.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

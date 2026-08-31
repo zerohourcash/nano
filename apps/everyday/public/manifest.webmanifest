@@ -1,0 +1,29 @@
+{
+  "id": "/",
+  "name": "Everyday — учёт оборудования",
+  "short_name": "Everyday",
+  "description": "Инвентаризация, выдача, приёмка и контроль оборудования",
+  "lang": "ru-RU",
+  "dir": "ltr",
+  "start_url": "/?source=pwa",
+  "scope": "/",
+  "display": "standalone",
+  "display_override": ["window-controls-overlay", "standalone", "minimal-ui"],
+  "orientation": "any",
+  "background_color": "#ECECF3",
+  "theme_color": "#5E629B",
+  "categories": ["business", "productivity", "utilities"],
+  "launch_handler": { "client_mode": ["navigate-existing", "auto"] },
+  "icons": [
+    { "src": "/icons/everyday-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "/icons/everyday-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "/icons/everyday-maskable-192.png", "sizes": "192x192", "type": "image/png", "purpose": "maskable" },
+    { "src": "/icons/everyday-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ],
+  "shortcuts": [
+    { "name": "Сканировать QR", "short_name": "Сканер", "url": "/scan?source=shortcut", "icons": [{ "src": "/icons/everyday-192.png", "sizes": "192x192" }] },
+    { "name": "Создать ТМЦ", "short_name": "Новая ТМЦ", "url": "/create?source=shortcut", "icons": [{ "src": "/icons/everyday-192.png", "sizes": "192x192" }] },
+    { "name": "Инвентаризация", "short_name": "Инвентаризация", "url": "/inventory?source=shortcut", "icons": [{ "src": "/icons/everyday-192.png", "sizes": "192x192" }] },
+    { "name": "Приём-передача", "short_name": "Передачи", "url": "/transfers?source=shortcut", "icons": [{ "src": "/icons/everyday-192.png", "sizes": "192x192" }] }
+  ]
+}

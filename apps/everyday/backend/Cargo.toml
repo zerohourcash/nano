@@ -1,0 +1,33 @@
+[workspace]
+
+[package]
+name = "meshkeeper-node"
+version = "0.1.0"
+edition = "2021"
+description = "Локальный узел учёта: подписанный журнал, без обязательного центрального сервера"
+
+[features]
+# Шифрование базы на диске (SQLCipher). Выключено по умолчанию: сборке нужен
+# OpenSSL, которого нет в типовом окружении Windows. Включать так:
+#   cargo build --release --no-default-features --features encrypted-db
+default = []
+encrypted-db = ["rusqlite/bundled-sqlcipher"]
+
+[dependencies]
+axum = { version = "0.8", features = ["json"] }
+tokio = { version = "1", features = ["full"] }
+tower-http = { version = "0.6", features = ["fs"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rand = "0.8"
+sha2 = "0.10"
+hex = "0.4"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4"] }
+anyhow = "1"
+parking_lot = "0.12"
+base64 = "0.22"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+chacha20poly1305 = "0.10"
+argon2 = "0.5"

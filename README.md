@@ -11,11 +11,36 @@ Offline-first платформа для автономной организац�
 - `bit-knowledge`: подписанная локальная база знаний с revision DAG, offline-конфликтами, merge и ссылками на изображения/blobs.
 - `bit-agent`: безопасная граница локальной нейросети: структурированные предложения, capability-политики, preview и запрет автономной подписи критических действий.
 - `bit-node`: HTTP/LAN-нода и SQLite WAL с полной перепроверкой ledger при старте.
+- `apps/everyday`: основное React/PWA-приложение, production Rust/Axum API, SQLite,
+  Android-оболочка и готовые процессы склада, QR, ролей, отчётов, чата и
+  синхронизации. Импортировано из `Everyday-project-2026-08-31.zip` и принято
+  как новая прикладная основа.
 - `src`, `public`, `test`: ранний JavaScript/PWA-прототип, сохранённый для регрессии UX и сетевых сценариев.
 
 Один телефон может состоять в нескольких организациях. Данные, роли, балансы и ключи-псевдонимы разделяются по `community_id`, чтобы профили нельзя было связать между организациями.
 
 Подробнее: [product scope](docs/PRODUCT-SCOPE.md), [Rust architecture](docs/ADR-001-rust-architecture.md), [mesh chat](docs/ADR-002-chat.md), [resilience references](docs/ADR-003-resilience-and-references.md), [local AI](docs/ADR-004-local-ai.md), [transport contract](docs/TRANSPORT.md).
+
+Решение по объединению Everyday и криптографического ядра описано в
+[ADR-005](docs/ADR-005-everyday-application-shell.md).
+
+## Основное приложение Everyday
+
+```bash
+cd apps/everyday
+npm ci --ignore-scripts
+npm run check
+npm test
+npm run build
+npm run smoke
+npm run sync:test
+```
+
+Пока интеграция подписанного `bit-core` с Everyday не завершена, журнал
+Everyday является проверяемым прикладным аудитом, но не криптографически
+неизменяемой истиной. Поэтому эту сборку можно тестировать как продукт, однако
+финансовые и имущественные доказательства ещё нельзя считать готовыми к
+production без внешнего аудита.
 
 ## Требования
 
