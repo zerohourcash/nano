@@ -25,9 +25,12 @@ import android.widget.TextView;
 import android.widget.Toast;
 
 import java.util.Arrays;
+import java.io.ByteArrayOutputStream;
+import java.io.InputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.security.SecureRandom;
+import java.nio.charset.StandardCharsets;
 
 import androidx.activity.result.ActivityResultLauncher;
 import androidx.activity.result.contract.ActivityResultContracts;
@@ -55,6 +58,8 @@ public class MainActivity extends AppCompatActivity {
     private String serverOrigin = "";
     private PermissionRequest pendingWebPermission;
     private ValueCallback<Uri[]> fileCallback;
+    private volatile String pendingSyncBundle;
+    private static final int MAX_SYNC_BUNDLE_BYTES = 30 * 1024 * 1024;
 
     private final ActivityResultLauncher<ScanOptions> qrLauncher = registerForActivityResult(
             new ScanContract(),
@@ -173,6 +178,7 @@ public class MainActivity extends AppCompatActivity {
 
         showSetupHint();
         askNotify();
+        captureIncomingBundle(getIntent());
     }
 
     private void grantWebCamera(PermissionRequest request) {
@@ -221,6 +227,58 @@ public class MainActivity extends AppCompatActivity {
         public void scanQr() {
             runOnUiThread(MainActivity.this::startNativeScan);
         }
+
+        @android.webkit.JavascriptInterface
+        public String takePendingSyncBundle() {
+            String bundle = pendingSyncBundle;
+            pendingSyncBundle = null;
+            return bundle == null ? "" : bundle;
+        }
+    }
+
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        captureIncomingBundle(intent);
+    }
+
+    @SuppressWarnings("deprecation")
+    private void captureIncomingBundle(Intent intent) {
+        if (intent == null) return;
+        Uri uri = Intent.ACTION_SEND.equals(intent.getAction())
+                ? intent.getParcelableExtra(Intent.EXTRA_STREAM)
+                : Intent.ACTION_VIEW.equals(intent.getAction()) ? intent.getData() : null;
+        if (uri == null || !"content".equalsIgnoreCase(uri.getScheme())) return;
+        new Thread(() -> {
+            try (InputStream input = getContentResolver().openInputStream(uri);
+                 ByteArrayOutputStream output = new ByteArrayOutputStream()) {
+                if (input == null) throw new IllegalArgumentException("Файл недоступен");
+                byte[] buffer = new byte[64 * 1024];
+                int total = 0;
+                int read;
+                while ((read = input.read(buffer)) >= 0) {
+                    total += read;
+                    if (total > MAX_SYNC_BUNDLE_BYTES) {
+                        throw new IllegalArgumentException("Пакет превышает лимит 30 МБ");
+                    }
+                    output.write(buffer, 0, read);
+                }
+                String json = output.toString(StandardCharsets.UTF_8.name());
+                org.json.JSONObject parsed = new org.json.JSONObject(json);
+                if (!"everyday-sync-bundle".equals(parsed.optString("format"))) {
+                    throw new IllegalArgumentException("Это не пакет Everyday");
+                }
+                pendingSyncBundle = json;
+                runOnUiThread(() -> {
+                    Toast.makeText(this, "Пакет принят — откройте «Офлайн-узлы» для проверки", Toast.LENGTH_LONG).show();
+                    web.evaluateJavascript("window.dispatchEvent(new Event('meshkeeper-native-bundle'));", null);
+                });
+            } catch (Exception error) {
+                runOnUiThread(() -> Toast.makeText(this,
+                        "Не удалось принять пакет: " + error.getMessage(), Toast.LENGTH_LONG).show());
+            }
+        }, "meshkeeper-shared-bundle").start();
     }
 
     private void showSetupHint() {

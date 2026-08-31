@@ -69,6 +69,9 @@
   XChaCha20-Poly1305 с новым 192-битным nonce, фиксированным AAD и ключом
   HKDF-SHA256, доменно отделённым от bearer/CAS. Wrong-key и tampering
   отклоняются AEAD до разбора journal; затем отдельно проверяется Ed25519.
+- Android Share receiver принимает только `content://`, потоково применяет лимит
+  30 МБ и передаёт ciphertext в авторизованный frontend. Он не обладает API для
+  прямой мутации SQLite; импорт сохраняет ACL и обязательный device proof.
 
 ## Production checklist
 

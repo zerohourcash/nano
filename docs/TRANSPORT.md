@@ -95,6 +95,12 @@ URL из переносимого файла не добавляется в peer
 поля ciphertext обнаруживается AEAD, а подмена journal — его подписью.
 CAS-бинарники в bundle не включаются.
 
+Android регистрирует `ACTION_SEND` и `ACTION_VIEW` для JSON MIME. Полученный через
+Bluetooth/Wi‑Fi Direct `content://` поток читается в отдельном thread с жёстким
+лимитом 30 МБ и предварительной проверкой `format`. Ciphertext остаётся pending
+до входа пользователя и открытия «Офлайн-узлов», после чего импорт проходит
+обычный API, ACL и Ed25519 device proof. Native-слой не может напрямую изменить БД.
+
 ## CAS transport
 
 Файл адресуется как `cas:<sha256>`. Manifest содержит hash, MIME и размер.

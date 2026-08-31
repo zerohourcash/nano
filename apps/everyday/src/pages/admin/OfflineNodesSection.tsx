@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { GitBranch, Network, Radio, RefreshCw, ShieldAlert, ShieldCheck, Download, Upload, Trash2 } from 'lucide-react'
 import { trpc } from '@/providers/trpc'
 import { cn } from '@/lib/utils'
@@ -66,6 +66,24 @@ export default function OfflineNodesSection() {
     },
     onError: (e) => toast(e.message, 'error'),
   })
+
+  useEffect(() => {
+    const consumeNativeBundle = () => {
+      const bridge = (window as Window & {
+        MeshKeeperNative?: { takePendingSyncBundle?: () => string }
+      }).MeshKeeperNative
+      const raw = bridge?.takePendingSyncBundle?.()
+      if (!raw) return
+      try {
+        importBundle.mutate({ bundle: JSON.parse(raw) })
+      } catch {
+        toast('Android передал некорректный пакет Everyday', 'error')
+      }
+    }
+    consumeNativeBundle()
+    window.addEventListener('meshkeeper-native-bundle', consumeNativeBundle)
+    return () => window.removeEventListener('meshkeeper-native-bundle', consumeNativeBundle)
+  }, [importBundle, toast])
   const exp = trpc.backup.export.useMutation({
     onSuccess: (blob) => {
       const a = document.createElement('a')

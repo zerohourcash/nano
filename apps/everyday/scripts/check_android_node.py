@@ -9,6 +9,7 @@ service = (android / "src/main/java/ru/meshkeeper/app/NodeService.java").read_te
 activity = (android / "src/main/java/ru/meshkeeper/app/MainActivity.java").read_text(encoding="utf-8")
 secrets = (android / "src/main/java/ru/meshkeeper/app/SecretStore.java").read_text(encoding="utf-8")
 gradle = (android / "build.gradle").read_text(encoding="utf-8")
+manifest = (android / "src/main/AndroidManifest.xml").read_text(encoding="utf-8")
 
 required = {
     "Rust JNI symbol": "Java_ru_meshkeeper_app_RustNode_startNode" in lib,
@@ -28,6 +29,8 @@ required = {
     "authenticated LAN discovery": "MESHKEEPER_DISCOVERY_BIND" in lib and "discovery::run" in lib,
     "token absent from service Intent": "EXTRA_TOKEN" not in service and "EXTRA_TOKEN" not in activity,
     "token not restored into UI": "syncToken.setText(SecretStore.loadSyncToken" not in activity,
+    "system Share receive": "android.intent.action.SEND" in manifest and "takePendingSyncBundle" in activity,
+    "incoming bundle bounded": "MAX_SYNC_BUNDLE_BYTES" in activity and "content\".equalsIgnoreCase" in activity,
 }
 missing = [name for name, present in required.items() if not present]
 if missing:
