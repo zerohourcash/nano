@@ -68,4 +68,13 @@ test('browser signs a real custody transaction and ledger retains its proof', as
   expect(event?.requestDeviceId).toBeTruthy()
   expect(event?.requestNonce).toBeTruthy()
   expect(event?.requestHash).toMatch(/^[a-f0-9]{64}$/)
+
+  await page.goto('/admin')
+  await page.getByRole('button', { name: 'Офлайн-узлы' }).first().click()
+  await expect(page.getByRole('heading', { name: 'Целостность локальной копии' })).toBeVisible()
+  await expect(
+    page.getByText('Локальная история и текущее состояние криптографически согласованы'),
+  ).toBeVisible({ timeout: 10_000 })
+  await expect(page.getByText(/Проверено подписей:/)).toBeVisible()
+  await expect(page.getByText(/Snapshot:/)).toContainText(/[a-f0-9]{64}/)
 })

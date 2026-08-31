@@ -25,6 +25,22 @@ export const syncRouter = createRouter({
     bytesReceived: 0,
     syncSuccesses: 0,
   })),
+  audit: publicQuery.query(async () => ({
+    healthy: true,
+    checkedAt: "",
+    database: "ok",
+    ledgerVerified: 0,
+    chatVerified: 0,
+    ledgerError: null as string | null,
+    chatError: null as string | null,
+    snapshotError: null as string | null,
+    snapshotHash: null as string | null,
+    lastEventAt: null as string | null,
+    orphanHistory: 0,
+    missingGuids: 0,
+    counts: { workspaces: 0, users: 0, items: 0, history: 0, messages: 0, organizationNodes: 0 },
+    ledgerHeads: [] as Array<{ workspaceGuid: string; publicKey: string; head: string; createdAt: string }>,
+  })),
   peers: publicQuery.query(async () => [] as Array<{
     id: number;
     nodeId: string | null;

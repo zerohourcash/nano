@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { GitBranch, Network, Radio, RefreshCw, ShieldAlert, Download, Upload, Trash2 } from 'lucide-react'
+import { GitBranch, Network, Radio, RefreshCw, ShieldAlert, ShieldCheck, Download, Upload, Trash2 } from 'lucide-react'
 import { trpc } from '@/providers/trpc'
 import { cn } from '@/lib/utils'
 import { SectionHeader, btnPrimaryCls, btnSecondaryCls, cardCls, inputCls, useToast } from './ui'
@@ -15,6 +15,7 @@ export default function OfflineNodesSection() {
   const toast = useToast()
   const utils = trpc.useUtils()
   const statusQ = trpc.sync.status.useQuery(undefined, { refetchInterval: 8000 })
+  const auditQ = trpc.sync.audit.useQuery(undefined, { refetchInterval: 30000 })
   const conflictsQ = trpc.sync.conflicts.useQuery(undefined, { refetchInterval: 8000 })
   const [peerUrl, setPeerUrl] = useState('')
   const [password, setPassword] = useState('')
@@ -138,6 +139,52 @@ export default function OfflineNodesSection() {
               </p>
             )}
           </div>
+        )}
+      </section>
+
+      <section className={cardCls + ' p-5 space-y-3'}>
+        <div className="flex items-center gap-2">
+          {auditQ.data?.healthy ? (
+            <ShieldCheck size={18} className="text-teal-dark" />
+          ) : (
+            <ShieldAlert size={18} className="text-danger" />
+          )}
+          <h3 className="text-[17px] font-semibold text-ink-900">Целостность локальной копии</h3>
+        </div>
+        {auditQ.isPending ? (
+          <p className="text-sm text-ink-500">Проверяем базу, подписи и полноту связей…</p>
+        ) : (
+          <>
+            <p className={cn('text-sm font-semibold', auditQ.data?.healthy ? 'text-teal-dark' : 'text-danger')}>
+              {auditQ.data?.healthy
+                ? 'Локальная история и текущее состояние криптографически согласованы'
+                : 'Обнаружена ошибка целостности — не используйте эту ноду для окончательного учёта'}
+            </p>
+            <div className="grid sm:grid-cols-3 gap-2 text-sm">
+              <div>Операций: <b>{auditQ.data?.counts.history ?? 0}</b></div>
+              <div>Предметов: <b>{auditQ.data?.counts.items ?? 0}</b></div>
+              <div>Сообщений: <b>{auditQ.data?.counts.messages ?? 0}</b></div>
+              <div>Проверено подписей: <b>{auditQ.data?.ledgerVerified ?? 0}</b></div>
+              <div>Глав цепочек: <b>{auditQ.data?.ledgerHeads.length ?? 0}</b></div>
+              <div>Потерянных связей: <b>{auditQ.data?.orphanHistory ?? 0}</b></div>
+            </div>
+            {(auditQ.data?.ledgerError || auditQ.data?.chatError || auditQ.data?.snapshotError) && (
+              <p className="text-sm text-danger break-all">
+                {auditQ.data.ledgerError || auditQ.data.chatError || auditQ.data.snapshotError}
+              </p>
+            )}
+            <div className="flex items-center gap-2">
+              <button className={btnSecondaryCls} onClick={() => auditQ.refetch()} disabled={auditQ.isFetching}>
+                <RefreshCw size={14} /> Проверить снова
+              </button>
+              <span className="text-[12px] text-ink-300">
+                {auditQ.data?.checkedAt ? `проверено ${fmtMoment(auditQ.data.checkedAt)}` : ''}
+              </span>
+            </div>
+            <p className="font-mono-num text-[11px] text-ink-300 break-all">
+              Snapshot: {auditQ.data?.snapshotHash || 'нет'}
+            </p>
+          </>
         )}
       </section>
 

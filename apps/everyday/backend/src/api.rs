@@ -89,6 +89,7 @@ pub fn is_mutation(procedure: &str) -> bool {
             | "items.changeRequests"
             | "chat.list"
             | "sync.status"
+            | "sync.audit"
             | "sync.peers"
             | "sync.conflicts"
             | "transfers.outgoing"
@@ -751,6 +752,7 @@ fn dispatch_inner(
         "chat.list" => chat_list(conn, input, user_id),
         "chat.send" => chat_send(conn, input, user_id),
         "sync.status" => Ok(crate::sync::status(conn)),
+        "sync.audit" => Ok(crate::sync::integrity_audit(conn)),
         "sync.peers" => Ok(crate::sync::list_peers(conn)),
         "sync.addPeer" => {
             let url = s(input, "url").ok_or_else(|| ApiError::bad("Укажите адрес узла"))?;

@@ -1181,6 +1181,103 @@ pub fn status(conn: &Connection) -> Value {
     })
 }
 
+/// Полная локальная самопроверка для владельца узла. В отличие от `/health`
+/// она читает весь криптографический журнал и строит подписанный снимок, поэтому
+/// предназначена для явного аудита/редкого фонового запуска, а не для probe.
+pub fn integrity_audit(conn: &Connection) -> Value {
+    let database_check: String = conn
+        .query_row("PRAGMA quick_check", [], |row| row.get(0))
+        .unwrap_or_else(|error| format!("error: {error}"));
+    let ledger_result = ledger::verify_all(conn);
+    let chat_result = ledger::verify_chat_links(conn);
+    let snapshot = export_journal(conn);
+    let snapshot_result = ledger::verify_journal(&snapshot);
+
+    let count = |table: &str| -> i64 {
+        conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row.get(0))
+            .unwrap_or(-1)
+    };
+    let orphan_history: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM history_entries h
+             LEFT JOIN workspaces w ON w.id=h.workspace_id
+             LEFT JOIN users u ON u.id=h.actor_user_id
+             WHERE w.id IS NULL OR u.id IS NULL",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(-1);
+    let missing_guids: i64 = conn
+        .query_row(
+            "SELECT
+               (SELECT COUNT(*) FROM workspaces WHERE guid IS NULL OR guid='') +
+               (SELECT COUNT(*) FROM users WHERE guid IS NULL OR guid='') +
+               (SELECT COUNT(*) FROM items WHERE guid IS NULL OR guid='') +
+               (SELECT COUNT(*) FROM history_entries WHERE guid IS NULL OR guid='') +
+               (SELECT COUNT(*) FROM chat_messages WHERE guid IS NULL OR guid='')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(-1);
+    let last_event_at: Option<String> = conn
+        .query_row("SELECT MAX(created_at) FROM history_entries", [], |row| row.get(0))
+        .ok()
+        .flatten();
+    let mut heads = Vec::new();
+    if let Ok(mut statement) = conn.prepare(
+        "SELECT w.guid,h.pubkey,h.hash,h.created_at
+         FROM history_entries h JOIN workspaces w ON w.id=h.workspace_id
+         WHERE h.pubkey IS NOT NULL AND h.id=(
+           SELECT MAX(h2.id) FROM history_entries h2
+           WHERE h2.workspace_id=h.workspace_id AND h2.pubkey=h.pubkey)
+         ORDER BY w.guid,h.pubkey",
+    ) {
+        if let Ok(rows) = statement.query_map([], |row| {
+            Ok(json!({
+                "workspaceGuid": row.get::<_, Option<String>>(0)?,
+                "publicKey": row.get::<_, String>(1)?,
+                "head": row.get::<_, String>(2)?,
+                "createdAt": row.get::<_, String>(3)?,
+            }))
+        }) {
+            heads.extend(rows.flatten());
+        }
+    }
+
+    let ledger_error = ledger_result.as_ref().err().map(ToString::to_string);
+    let chat_error = chat_result.as_ref().err().map(ToString::to_string);
+    let snapshot_error = snapshot_result.as_ref().err().map(ToString::to_string);
+    let healthy = database_check == "ok"
+        && ledger_result.is_ok()
+        && chat_result.is_ok()
+        && snapshot_result.is_ok()
+        && orphan_history == 0
+        && missing_guids == 0;
+    json!({
+        "healthy": healthy,
+        "checkedAt": chrono::Utc::now().to_rfc3339(),
+        "database": database_check,
+        "ledgerVerified": ledger_result.unwrap_or(0),
+        "chatVerified": chat_result.unwrap_or(0),
+        "ledgerError": ledger_error,
+        "chatError": chat_error,
+        "snapshotError": snapshot_error,
+        "snapshotHash": snapshot.get("journalHash"),
+        "lastEventAt": last_event_at,
+        "orphanHistory": orphan_history,
+        "missingGuids": missing_guids,
+        "counts": {
+            "workspaces": count("workspaces"),
+            "users": count("users"),
+            "items": count("items"),
+            "history": count("history_entries"),
+            "messages": count("chat_messages"),
+            "organizationNodes": count("organization_nodes"),
+        },
+        "ledgerHeads": heads,
+    })
+}
+
 /// Used from api.rs without making find_user_phone public — thin wrapper filled in api.
 pub fn touch_peer_error(conn: &Connection, url: &str, err: &str) {
     let _ = conn.execute(

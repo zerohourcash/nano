@@ -123,6 +123,7 @@ def main() -> int:
         restored_tool = item_named(recovery, recovery_ws, "Контрольная дрель") or {}
         restored_history = recovery.call("history.all", {"workspaceId": recovery_ws}, mutation=False)
         restored_chat = recovery.call("chat.list", {"workspaceId": recovery_ws}, mutation=False)
+        restored_audit = recovery.call("sync.audit", None, mutation=False)
         check("чистое устройство приняло проверенный snapshot", restored.get("ok") is True)
         check("владелец может войти на восстановленном устройстве офлайн", isinstance(login, dict) and "id" in login)
         check(
@@ -136,6 +137,16 @@ def main() -> int:
             isinstance(restored_history, list)
             and len(restored_history) == len(signed.get("history", []))
             and any(row.get("guid") == message.get("guid") for row in restored_chat),
+        )
+        check(
+            "восстановленная нода сама доказывает целостность и полноту связей",
+            restored_audit.get("healthy") is True
+            and restored_audit.get("ledgerVerified") == len(signed.get("history", []))
+            and restored_audit.get("counts", {}).get("history") == len(signed.get("history", []))
+            and restored_audit.get("orphanHistory") == 0
+            and restored_audit.get("missingGuids") == 0
+            and bool(restored_audit.get("snapshotHash")),
+            str(restored_audit)[:300],
         )
 
         # Replay старого, но корректно подписанного snapshot не должен откатить
