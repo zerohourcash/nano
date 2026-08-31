@@ -17,6 +17,7 @@ use std::collections::HashMap;
 const KEY_NAME: &str = "ledger.node-signing-key.v1";
 const DOMAIN_V1: &str = "everyday/ledger-event/v1";
 const DOMAIN_V2: &str = "everyday/ledger-event/v2";
+const JOURNAL_DOMAIN: &str = "everyday/sync-journal/v1";
 
 #[derive(Debug, Serialize)]
 struct EventV1<'a> {
@@ -130,6 +131,62 @@ fn pending_proof(conn: &Connection, actor_id: i64) -> RequestProof {
 
 fn digest(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
+}
+
+fn journal_bytes(journal: &Value) -> anyhow::Result<Vec<u8>> {
+    let mut payload = journal.clone();
+    let object = payload
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("sync journal must be an object"))?;
+    object.remove("journalHash");
+    object.remove("journalSignature");
+    object.remove("journalPublicKey");
+    let encoded = serde_json::to_vec(&payload)?;
+    let mut bytes = JOURNAL_DOMAIN.as_bytes().to_vec();
+    bytes.push(b'\n');
+    bytes.extend(encoded);
+    Ok(bytes)
+}
+
+/// Подписывает весь снимок: и неизменяемую историю, и производное текущее
+/// состояние. Это не позволяет посреднику с одним sync-токеном незаметно
+/// изменить карточки, права или чат в пути.
+pub fn sign_journal(conn: &Connection, journal: &mut Value) -> anyhow::Result<()> {
+    let key = signing_key(conn)?;
+    let bytes = journal_bytes(journal)?;
+    let hash = digest(&bytes);
+    let signature = STANDARD_NO_PAD.encode(key.sign(&bytes).to_bytes());
+    let object = journal
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("sync journal must be an object"))?;
+    object.insert("journalHash".into(), Value::String(hash));
+    object.insert(
+        "journalPublicKey".into(),
+        Value::String(STANDARD_NO_PAD.encode(key.verifying_key().to_bytes())),
+    );
+    object.insert("journalSignature".into(), Value::String(signature));
+    Ok(())
+}
+
+pub fn verify_journal(journal: &Value) -> anyhow::Result<()> {
+    let hash = journal
+        .get("journalHash")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("missing journal hash"))?;
+    let pubkey = journal
+        .get("journalPublicKey")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("missing journal public key"))?;
+    let signature = journal
+        .get("journalSignature")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("missing journal signature"))?;
+    let bytes = journal_bytes(journal)?;
+    if digest(&bytes) != hash {
+        bail!("sync journal hash mismatch");
+    }
+    verify_node_signature(pubkey, signature, &bytes)
+        .context("invalid sync journal signature")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -475,5 +532,40 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("broken ledger link"));
+    }
+
+    #[test]
+    fn signed_journal_detects_state_history_and_signature_tampering() {
+        let db = database();
+        let mut journal = json!({
+            "v": 1,
+            "nodeId": "node-a",
+            "items": [{"guid":"tool-1","title":"Дрель","statusSlug":"in-stock"}],
+            "history": []
+        });
+        sign_journal(&db, &mut journal).unwrap();
+        verify_journal(&journal).unwrap();
+
+        let mut state_tamper = journal.clone();
+        state_tamper["items"][0]["statusSlug"] = json!("in-work");
+        assert!(verify_journal(&state_tamper)
+            .unwrap_err()
+            .to_string()
+            .contains("hash mismatch"));
+
+        let mut history_tamper = journal.clone();
+        history_tamper["history"] = json!([{"opId":"forged"}]);
+        assert!(verify_journal(&history_tamper).is_err());
+
+        let mut signature_tamper = journal.clone();
+        signature_tamper["journalSignature"] = json!("AAAA");
+        assert!(verify_journal(&signature_tamper).is_err());
+
+        let mut unsigned = journal;
+        unsigned.as_object_mut().unwrap().remove("journalSignature");
+        assert!(verify_journal(&unsigned)
+            .unwrap_err()
+            .to_string()
+            .contains("missing journal signature"));
     }
 }

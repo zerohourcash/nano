@@ -303,7 +303,7 @@ pub fn export_journal(conn: &Connection) -> Value {
             messages.push(row);
         }
     }
-    json!({
+    let mut journal = json!({
         "v": 1,
         "nodeId": node_id,
         "nodeName": name,
@@ -317,7 +317,11 @@ pub fn export_journal(conn: &Connection) -> Value {
         "invites": invites,
         "memberships": memberships,
         "messages": messages,
-    })
+    });
+    if let Err(error) = ledger::sign_journal(conn, &mut journal) {
+        return json!({"ok": false, "error": format!("Не удалось подписать журнал: {error}")});
+    }
+    journal
 }
 
 fn upsert_workspace(conn: &Connection, w: &Value) -> i64 {
@@ -559,6 +563,27 @@ pub fn import_journal(conn: &Connection, journal: &Value) -> Value {
                             let _ = conn.execute(
                                 "UPDATE items SET responsible_user_id=NULL, status_id=?1 WHERE id=?2",
                                 params![st_id, local_id],
+                            );
+                        }
+                        // Конфликт — самостоятельный факт истории, а не только
+                        // локальная строка в UI. За счёт нового подписанного
+                        // события карантинное состояние становится новее обеих
+                        // конкурирующих выдач и распространяется всем peers.
+                        if let Ok(conflict_actor) = conn.query_row(
+                            "SELECT user_id FROM user_workspaces WHERE workspace_id=?1 ORDER BY id LIMIT 1",
+                            params![ws],
+                            |row| row.get::<_, i64>(0),
+                        ) {
+                            let _ = ledger::append(
+                                conn,
+                                ws,
+                                conflict_actor,
+                                Some(local_id),
+                                "conflict_detected",
+                                Some(&format!("user:{:?}", local_resp)),
+                                Some(&format!("user:{:?}", resp)),
+                                None,
+                                Some(&desc),
                             );
                         }
                         notify_conflict(conn, ws, local_id, &desc);
@@ -997,6 +1022,9 @@ pub fn guess_lan_base() -> String {
 }
 
 pub fn apply_remote_journal(conn: &Connection, journal: &Value, peer_url: &str) -> Value {
+    if let Err(error) = ledger::verify_journal(journal) {
+        return json!({"ok":false,"error":format!("Криптографическая проверка снимка: {error}")});
+    }
     if let Err(error) = conn.execute_batch("SAVEPOINT verified_sync") {
         return json!({"ok":false,"error":error.to_string()});
     }
