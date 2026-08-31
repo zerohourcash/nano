@@ -11,6 +11,7 @@ import { metaRouter } from "./metaRouter";
 import { authRouter } from "./authRouter";
 import { chatRouter } from "./chatRouter";
 import { backupRouter, syncRouter } from "./syncRouter";
+import { knowledgeRouter } from "./knowledgeRouter";
 
 export const appRouter = createRouter({
   ping: publicQuery.query(() => ({ ok: true, ts: Date.now() })),
@@ -27,6 +28,7 @@ export const appRouter = createRouter({
   meta: metaRouter,
   chat: chatRouter,
   sync: syncRouter,
+  knowledge: knowledgeRouter,
   backup: backupRouter,
 });
 

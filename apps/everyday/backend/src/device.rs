@@ -39,6 +39,7 @@ pub fn requires_signature(procedure: &str) -> bool {
             | "bit.transfer"
             | "bit.sale"
             | "bit.mint"
+            | "knowledge.save"
     )
 }
 

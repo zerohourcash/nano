@@ -188,6 +188,19 @@ fn migrate(conn: &Connection) -> Result<()> {
            CHECK(debit>=0 AND credit>=0 AND (debit=0 OR credit=0))
          );",
     )?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS knowledge_pages(
+           guid TEXT PRIMARY KEY,workspace_id INTEGER NOT NULL,slug TEXT NOT NULL,
+           title TEXT NOT NULL,visibility TEXT NOT NULL,current_revision_guid TEXT,
+           created_at TEXT NOT NULL,UNIQUE(workspace_id,slug)
+         );
+         CREATE TABLE IF NOT EXISTS knowledge_revisions(
+           guid TEXT PRIMARY KEY,page_guid TEXT NOT NULL,parent_guid TEXT,
+           author_user_id INTEGER NOT NULL,title TEXT NOT NULL,visibility TEXT NOT NULL,
+           content TEXT NOT NULL,attachments_json TEXT NOT NULL,
+           revision_hash TEXT NOT NULL UNIQUE,created_at TEXT NOT NULL
+         );",
+    )?;
     // ТЗ §8: группа может требовать фото-подтверждение при списании.
     let _ = conn.execute(
         "ALTER TABLE workspaces ADD COLUMN require_writeoff_photo INTEGER NOT NULL DEFAULT 0",
@@ -448,7 +461,7 @@ pub fn viewer_rights() -> serde_json::Value {
         "manageWorkspaces": false, "manageStorages": false, "manageSites": false, "manageDictionaries": false,
         "reportFaults": false, "requestChanges": false,
         "viewPhotos": true, "viewDocuments": false, "manageDocuments": false,
-        "useBit": false, "viewAccounting": false, "manageAccounting": false, "viewLocation": false,
+        "useBit": false, "viewKnowledge": true, "editKnowledge": false, "viewAccounting": false, "manageAccounting": false, "viewLocation": false,
         "checkoutPolicy": default_checkout_policy()
     })
 }
@@ -463,7 +476,7 @@ pub fn admin_rights() -> serde_json::Value {
         "manageWorkspaces": false, "manageStorages": true, "manageSites": true, "manageDictionaries": true,
         "reportFaults": true, "requestChanges": true,
         "viewPhotos": true, "viewDocuments": true, "manageDocuments": true,
-        "useBit": true, "viewAccounting": false, "manageAccounting": false, "viewLocation": true,
+        "useBit": true, "viewKnowledge": true, "editKnowledge": true, "viewAccounting": false, "manageAccounting": false, "viewLocation": true,
         "checkoutPolicy": default_checkout_policy()
     })
 }
@@ -692,7 +705,7 @@ pub fn default_rights() -> serde_json::Value {
         "manageWorkspaces": false, "manageStorages": false, "manageSites": false, "manageDictionaries": false,
         "reportFaults": true, "requestChanges": true,
         "viewPhotos": true, "viewDocuments": true, "manageDocuments": false,
-        "useBit": true, "viewAccounting": false, "manageAccounting": false, "viewLocation": true,
+        "useBit": true, "viewKnowledge": true, "editKnowledge": true, "viewAccounting": false, "manageAccounting": false, "viewLocation": true,
         "checkoutPolicy": {
             "allowedCategoryIds": null,
             "maxHours": null,
@@ -710,7 +723,7 @@ pub fn owner_rights() -> serde_json::Value {
         "manageWorkspaces": true, "manageStorages": true, "manageSites": true, "manageDictionaries": true,
         "reportFaults": true, "requestChanges": true,
         "viewPhotos": true, "viewDocuments": true, "manageDocuments": true,
-        "useBit": true, "viewAccounting": true, "manageAccounting": true, "viewLocation": true,
+        "useBit": true, "viewKnowledge": true, "editKnowledge": true, "viewAccounting": true, "manageAccounting": true, "viewLocation": true,
         "checkoutPolicy": {
             "allowedCategoryIds": null,
             "maxHours": null,

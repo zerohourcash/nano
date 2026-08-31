@@ -207,7 +207,13 @@ def main() -> int:
         return 2
 
     server_port = free_port()
-    server = Node("server", server_port, {"MESHKEEPER_SYNC_TOKEN": TOKEN})
+    # Архивный узел добровольно хранит все обнаруженные CAS-объекты. Обычные
+    # телефоны остаются metadata/smart-узлами и не обязаны копировать файлы.
+    server = Node(
+        "server",
+        server_port,
+        {"MESHKEEPER_SYNC_TOKEN": TOKEN, "MESHKEEPER_CONTENT_MODE": "full"},
+    )
     node = Node(
         "node",
         free_port(),
@@ -391,6 +397,17 @@ def main() -> int:
             {"workspaceId": node_ws_id, "recipientUserId": node_me["id"], "amount": 100, "memo": "Офлайн-эмиссия"},
         )
         check("офлайн-эмиссия Bit записана двойной проводкой", minted.get("status") == "posted", str(minted))
+        knowledge = node.call(
+            "knowledge.save",
+            {
+                "workspaceId": node_ws_id,
+                "slug": "offline/safety",
+                "title": "Офлайн-инструкция",
+                "content": "# Безопасность\nПроверить инструмент перед работой.",
+                "attachments": [{"name": "Памятка", "url": "data:text/plain;base64,0J/RgNC+0LLQtdGA0LrQsA=="}],
+            },
+        )
+        check("ревизия локальной базы знаний подписана", bool(knowledge.get("savedRevisionHash")), str(knowledge)[:180])
         node.call("sync.pullNow", {})
         back = wait_for(lambda: "Шуруповёрт с узла" in titles(server, ws_id))
         check("предмет с узла доехал до сервера", back, str(titles(server, ws_id))[:160])
@@ -406,6 +423,27 @@ def main() -> int:
             lambda: server.call("bit.balance", {"workspaceId": ws_id, "userId": owner["id"]}, mutation=False).get("balance") == 100
         )
         check("подписанная бухгалтерская проводка Bit дошла до сервера", bit_synced)
+        synced_knowledge: dict = {}
+
+        def knowledge_arrived() -> bool:
+            nonlocal synced_knowledge
+            synced_knowledge = server.call(
+                "knowledge.bySlug",
+                {"workspaceId": ws_id, "slug": "offline/safety"},
+                mutation=False,
+            )
+            attachments = synced_knowledge.get("current", {}).get("attachments", [])
+            return (
+                synced_knowledge.get("current", {}).get("content", "").startswith("# Безопасность")
+                and bool(attachments)
+                and attachments[0].get("url", "").startswith("data:text/plain")
+            )
+
+        check(
+            "текст и CAS-вложение базы знаний дошли до сервера",
+            wait_for(knowledge_arrived, timeout=30),
+            str(synced_knowledge)[:220],
+        )
 
         print("\n== 6. Статус синхронизации ==")
         status = node.call("sync.status", None, mutation=False)

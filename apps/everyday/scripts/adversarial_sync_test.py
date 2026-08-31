@@ -233,6 +233,67 @@ def main() -> int:
             str(converged_tool)[:240],
         )
 
+        # Wiki-летопись не перезаписывает одну офлайн-версию другой: обе
+        # подписанные дочерние ревизии остаются в DAG, а одинаковый hash-order
+        # даёт всем узлам один текущий head и явный признак конфликта.
+        base_page = source.call(
+            "knowledge.save",
+            {
+                "workspaceId": ws,
+                "slug": "safety/offline",
+                "title": "Техника безопасности",
+                "content": "Исходная согласованная инструкция",
+            },
+        )
+        submit(target, journal(source))
+        base_revision = base_page["savedRevisionGuid"]
+        left_page = source.call(
+            "knowledge.save",
+            {
+                "workspaceId": ws,
+                "slug": "safety/offline",
+                "title": "Техника безопасности",
+                "content": "Изменение начальника на левой офлайн-ноде",
+                "parentRevisionGuid": base_revision,
+            },
+        )
+        right_page = target.call(
+            "knowledge.save",
+            {
+                "workspaceId": target_ws,
+                "slug": "safety/offline",
+                "title": "Техника безопасности",
+                "content": "Изменение кладовщика на правой офлайн-ноде",
+                "parentRevisionGuid": base_revision,
+            },
+        )
+        check(
+            "две офлайн-ветки базы знаний независимо подписаны",
+            bool(left_page.get("savedRevisionHash"))
+            and bool(right_page.get("savedRevisionHash")),
+        )
+        submit(source, journal(target))
+        submit(target, journal(source))
+        submit(source, journal(target))
+        source_page = source.call(
+            "knowledge.bySlug", {"workspaceId": ws, "slug": "safety/offline"}, mutation=False
+        )
+        target_page = target.call(
+            "knowledge.bySlug",
+            {"workspaceId": target_ws, "slug": "safety/offline"},
+            mutation=False,
+        )
+        check(
+            "DAG сохранил обе ветки и детерминированно сошёлся",
+            source_page.get("hasConflict") is True
+            and target_page.get("hasConflict") is True
+            and source_page.get("headGuids") == target_page.get("headGuids")
+            and source_page.get("currentRevisionGuid")
+            == target_page.get("currentRevisionGuid")
+            and len(source_page.get("headGuids", [])) == 2,
+            f"source={source_page} target={target_page}",
+        )
+
         # Двойная трата Bit одним владельцем с двух офлайн-устройств.
         minted = source.call(
             "bit.mint",

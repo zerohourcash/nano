@@ -448,6 +448,7 @@ pub fn export_journal_since(conn: &Connection, recipient_frontier: Option<&Value
         "contentCatalog": crate::content::catalog(conn),
         "contentProviders": crate::content::provider_manifest(conn),
         "accounting": crate::accounting::export(conn),
+        "knowledge": crate::knowledge::export(conn),
     });
     if let Err(error) = ledger::sign_journal(conn, &mut journal) {
         return json!({"ok": false, "error": format!("Не удалось подписать журнал: {error}")});
@@ -1233,6 +1234,14 @@ pub fn guess_lan_base() -> String {
         }
     }
     let bind = std::env::var("MESHKEEPER_BIND").unwrap_or_else(|_| "0.0.0.0:8080".into());
+    // Явная bind-точка уже является лучшим обратным маршрутом. Это особенно
+    // важно для loopback/LAN-only узлов: нельзя рекламировать адрес другого
+    // интерфейса, на котором процесс фактически не слушает.
+    if let Ok(address) = bind.parse::<std::net::SocketAddr>() {
+        if !address.ip().is_unspecified() {
+            return format!("http://{address}");
+        }
+    }
     let port = bind.rsplit(':').next().unwrap_or("8080");
     if let Ok(sock) = std::net::UdpSocket::bind("0.0.0.0:0") {
         let _ = sock.connect("8.8.8.8:80");
@@ -1254,6 +1263,12 @@ pub fn apply_remote_journal(conn: &Connection, journal: &Value, peer_url: &str) 
         return json!({"ok":false,"error":error.to_string()});
     }
     let result = import_journal(conn, journal);
+    if let Some(knowledge) = journal.get("knowledge") {
+        if let Err(error) = crate::knowledge::import(conn, knowledge) {
+            let _ = conn.execute_batch("ROLLBACK TO verified_sync; RELEASE verified_sync");
+            return json!({"ok":false,"error":format!("База знаний отклонена: {error}")});
+        }
+    }
     if let Some(accounting) = journal.get("accounting") {
         if let Err(error) = crate::accounting::import(conn, accounting) {
             let _ = conn.execute_batch("ROLLBACK TO verified_sync; RELEASE verified_sync");
@@ -1275,6 +1290,10 @@ pub fn apply_remote_journal(conn: &Connection, journal: &Value, peer_url: &str) 
     if let Err(error) = crate::accounting::verify(conn) {
         let _ = conn.execute_batch("ROLLBACK TO verified_sync; RELEASE verified_sync");
         return json!({"ok":false,"error":format!("Проверка бухгалтерской летописи: {error}")});
+    }
+    if let Err(error) = crate::knowledge::verify(conn) {
+        let _ = conn.execute_batch("ROLLBACK TO verified_sync; RELEASE verified_sync");
+        return json!({"ok":false,"error":format!("Проверка базы знаний: {error}")});
     }
     if let Err(error) = conn.execute_batch("RELEASE verified_sync") {
         return json!({"ok":false,"error":error.to_string()});
@@ -1514,6 +1533,7 @@ pub fn integrity_audit(conn: &Connection) -> Value {
     let ledger_result = ledger::verify_all(conn);
     let chat_result = ledger::verify_chat_links(conn);
     let accounting_result = crate::accounting::verify(conn);
+    let knowledge_result = crate::knowledge::verify(conn);
     let snapshot = export_journal(conn);
     let snapshot_result = ledger::verify_journal(&snapshot);
 
@@ -1586,11 +1606,13 @@ pub fn integrity_audit(conn: &Connection) -> Value {
     let ledger_error = ledger_result.as_ref().err().map(ToString::to_string);
     let chat_error = chat_result.as_ref().err().map(ToString::to_string);
     let accounting_error = accounting_result.as_ref().err().map(ToString::to_string);
+    let knowledge_error = knowledge_result.as_ref().err().map(ToString::to_string);
     let snapshot_error = snapshot_result.as_ref().err().map(ToString::to_string);
     let healthy = database_check == "ok"
         && ledger_result.is_ok()
         && chat_result.is_ok()
         && accounting_result.is_ok()
+        && knowledge_result.is_ok()
         && snapshot_result.is_ok()
         && orphan_history == 0
         && missing_guids == 0
@@ -1606,6 +1628,8 @@ pub fn integrity_audit(conn: &Connection) -> Value {
         "chatError": chat_error,
         "accountingError": accounting_error,
         "accountingVerified": accounting_result.is_ok(),
+        "knowledgeError": knowledge_error,
+        "knowledgeVerified": knowledge_result.is_ok(),
         "snapshotError": snapshot_error,
         "snapshotHash": snapshot.get("journalHash"),
         "lastEventAt": last_event_at,
@@ -1624,6 +1648,8 @@ pub fn integrity_audit(conn: &Connection) -> Value {
             "blobs": count("content_blobs"),
             "accountingTransactions": count("accounting_transactions"),
             "accountingLines": count("accounting_lines"),
+            "knowledgePages": count("knowledge_pages"),
+            "knowledgeRevisions": count("knowledge_revisions"),
         },
         "ledgerHeads": heads,
     })

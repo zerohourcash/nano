@@ -95,6 +95,8 @@ pub fn is_mutation(procedure: &str) -> bool {
             | "sync.nodeKeys"
             | "bit.balance"
             | "bit.transactions"
+            | "knowledge.list"
+            | "knowledge.bySlug"
             | "transfers.outgoing"
             | "transfers.incoming"
             | "transfers.byId"
@@ -492,6 +494,10 @@ fn required_right(procedure: &str) -> Option<&'static str> {
         Some("useBit")
     } else if procedure == "bit.transactions" {
         Some("viewAccounting")
+    } else if procedure == "knowledge.save" {
+        Some("editKnowledge")
+    } else if procedure.starts_with("knowledge.") {
+        Some("viewKnowledge")
     } else if matches!(
         procedure,
         "transfers.accept" | "transfers.reject" | "transfers.acceptAll"
@@ -867,6 +873,9 @@ fn dispatch_inner(
         "bit.transfer" => bit_transfer(conn, input, user_id),
         "bit.sale" => bit_sale(conn, input, user_id),
         "bit.mint" => bit_mint(conn, input, user_id),
+        "knowledge.list" => knowledge_list(conn, input, user_id),
+        "knowledge.bySlug" => knowledge_by_slug(conn, input, user_id),
+        "knowledge.save" => knowledge_save(conn, input, user_id),
         "sync.addPeer" => {
             let url = s(input, "url").ok_or_else(|| ApiError::bad("Укажите адрес узла"))?;
             crate::validate_peer_url(&url).map_err(ApiError::bad)?;
@@ -3354,6 +3363,91 @@ fn bit_sale(conn: &mut Connection, input: &Value, user_id: Option<i64>) -> ApiRe
         Ok(posted)
     })
 }
+
+fn knowledge_visible(rights: &Value, page: &Value) -> bool {
+    match page
+        .get("visibility")
+        .and_then(Value::as_str)
+        .unwrap_or("members")
+    {
+        "accounting" => rights
+            .get("viewAccounting")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        "managers" => rights
+            .get("editKnowledge")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        _ => true,
+    }
+}
+
+fn knowledge_list(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
+    let uid = require_user(conn, user_id)?;
+    let ws = i64v(input, "workspaceId").unwrap_or_else(|| ws_fallback(conn));
+    let rights = merged_rights(conn, uid, ws);
+    let mut pages = crate::knowledge::list(conn, ws);
+    if let Some(items) = pages.as_array_mut() {
+        items.retain(|page| knowledge_visible(&rights, page));
+    }
+    Ok(pages)
+}
+
+fn knowledge_by_slug(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
+    let uid = require_user(conn, user_id)?;
+    let ws = i64v(input, "workspaceId").unwrap_or_else(|| ws_fallback(conn));
+    let slug = s(input, "slug").ok_or_else(|| ApiError::bad("slug"))?;
+    let page = crate::knowledge::page(conn, ws, &slug)
+        .ok_or_else(|| ApiError::not_found("Страница не найдена"))?;
+    if !knowledge_visible(&merged_rights(conn, uid, ws), &page) {
+        return Err(ApiError::not_found("Страница не найдена"));
+    }
+    Ok(page)
+}
+
+fn knowledge_save(conn: &mut Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
+    atomic(conn, |conn| {
+        let uid = require_user(conn, user_id)?;
+        let ws = i64v(input, "workspaceId").unwrap_or_else(|| ws_fallback(conn));
+        require_can_in_workspace(conn, uid, ws, "editKnowledge")?;
+        db::fill_guids(conn).map_err(|e| ApiError::internal(e.to_string()))?;
+        let slug = s(input, "slug").ok_or_else(|| ApiError::bad("slug"))?;
+        let title = s(input, "title").ok_or_else(|| ApiError::bad("title"))?;
+        let content = s(input, "content").unwrap_or_default();
+        let visibility = s(input, "visibility").unwrap_or_else(|| "members".into());
+        let page = crate::knowledge::save(
+            conn,
+            ws,
+            uid,
+            &slug,
+            &title,
+            &content,
+            &visibility,
+            s(input, "parentRevisionGuid").as_deref(),
+            input.get("attachments").unwrap_or(&Value::Null),
+        )
+        .map_err(|e| ApiError::bad(e.to_string()))?;
+        let page_guid = page["guid"]
+            .as_str()
+            .ok_or_else(|| ApiError::internal("нет GUID страницы"))?;
+        let revision_hash = page["savedRevisionHash"]
+            .as_str()
+            .ok_or_else(|| ApiError::internal("нет hash ревизии"))?;
+        ledger::append(
+            conn,
+            ws,
+            uid,
+            None,
+            "knowledge_revision",
+            Some(page_guid),
+            Some(revision_hash),
+            None,
+            Some(&format!("База знаний: {title}")),
+        )
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+        Ok(page)
+    })
+}
 fn profile_update(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
     let uid = require_user(conn, user_id)?;
     if let Some(phone) = s(input, "phone") {
@@ -5733,6 +5827,59 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(denied.http, 403);
+        cleanup(conn, path);
+    }
+
+    #[test]
+    fn knowledge_revisions_use_cas_acl_and_tamper_evidence() {
+        let (mut conn, path, users, ws) = test_db();
+        let page=dispatch(&mut conn,"knowledge.save",&json!({"workspaceId":ws,"slug":"safety/drill","title":"Работа с дрелью","content":"# Инструкция\nОтключить питание.","attachments":[{"name":"Схема","url":"data:image/png;base64,QUJD"}]}),Some(users[0])).unwrap();
+        assert_eq!(page["hasConflict"], false);
+        assert!(page["current"]["attachments"][0]["url"]
+            .as_str()
+            .unwrap()
+            .starts_with("data:image/png"));
+        crate::knowledge::verify(&conn).unwrap();
+        let limited = json!({"viewKnowledge":true,"editKnowledge":false,"viewAccounting":false});
+        conn.execute(
+            "UPDATE user_workspaces SET rights_json=?1 WHERE user_id=?2 AND workspace_id=?3",
+            params![limited.to_string(), users[1], ws],
+        )
+        .unwrap();
+        let list = dispatch(
+            &mut conn,
+            "knowledge.list",
+            &json!({"workspaceId":ws}),
+            Some(users[1]),
+        )
+        .unwrap();
+        assert_eq!(list.as_array().unwrap().len(), 1);
+        assert_eq!(
+            dispatch(
+                &mut conn,
+                "knowledge.save",
+                &json!({"workspaceId":ws,"slug":"forbidden","title":"Нет","content":"x"}),
+                Some(users[1])
+            )
+            .unwrap_err()
+            .http,
+            403
+        );
+        dispatch(&mut conn,"knowledge.save",&json!({"workspaceId":ws,"slug":"finance","title":"Бюджет","content":"Закрыто","visibility":"accounting"}),Some(users[0])).unwrap();
+        let filtered = dispatch(
+            &mut conn,
+            "knowledge.list",
+            &json!({"workspaceId":ws}),
+            Some(users[1]),
+        )
+        .unwrap();
+        assert_eq!(filtered.as_array().unwrap().len(), 1);
+        conn.execute(
+            "UPDATE knowledge_revisions SET content='подмена' WHERE guid=?1",
+            [page["savedRevisionGuid"].as_str().unwrap()],
+        )
+        .unwrap();
+        assert!(crate::knowledge::verify(&conn).is_err());
         cleanup(conn, path);
     }
 

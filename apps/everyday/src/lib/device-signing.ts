@@ -88,6 +88,7 @@ const CRITICAL = [
   'bit.transfer',
   'bit.sale',
   'bit.mint',
+  'knowledge.save',
 ]
 
 export function requiresDeviceSignature(url: string): boolean {

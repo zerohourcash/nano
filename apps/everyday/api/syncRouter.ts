@@ -32,7 +32,9 @@ export const syncRouter = createRouter({
     ledgerVerified: 0,
     chatVerified: 0,
     accountingVerified: true,
+    knowledgeVerified: true,
     accountingError: null as string | null,
+    knowledgeError: null as string | null,
     ledgerError: null as string | null,
     chatError: null as string | null,
     snapshotError: null as string | null,
@@ -43,7 +45,7 @@ export const syncRouter = createRouter({
     missingBlobs: 0,
     missingReferencedBlobs: 0,
     pendingDownloads: 0,
-    counts: { workspaces: 0, users: 0, items: 0, history: 0, messages: 0, organizationNodes: 0, blobs: 0, accountingTransactions: 0, accountingLines: 0 },
+    counts: { workspaces: 0, users: 0, items: 0, history: 0, messages: 0, organizationNodes: 0, blobs: 0, accountingTransactions: 0, accountingLines: 0, knowledgePages: 0, knowledgeRevisions: 0 },
     ledgerHeads: [] as Array<{ workspaceGuid: string; publicKey: string; head: string; createdAt: string }>,
   })),
   peers: publicQuery.query(async () => [] as Array<{

@@ -5,6 +5,7 @@ mod content;
 mod db;
 mod device;
 mod json;
+mod knowledge;
 mod ledger;
 mod sync;
 
