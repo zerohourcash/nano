@@ -30,6 +30,7 @@
     "docs:check": "python3 scripts/check_docs.py",
     "mobile:node:test": "python3 scripts/mobile_node_test.py",
     "android:check": "python3 scripts/check_android_node.py",
+    "android:apk:verify": "python3 scripts/verify_android_apk.py",
     "verify": "npm run check && npm run lint && npm test && npm run docs:check && npm run android:check && cargo test --manifest-path backend/Cargo.toml"
   },
   "dependencies": {

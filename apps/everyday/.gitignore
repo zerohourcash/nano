@@ -37,6 +37,7 @@ db/migrations/*.sql
 # ─── Android ────────────────────────────────────────────────────────────────
 android/.gradle/
 android/app/build/
+android/app/src/main/jniLibs/
 # Каталог собирается задачей copyWww из dist/public — в репозитории не нужен
 # и вдобавок тянет за собой устаревшую копию фронтенда.
 android/app/src/main/assets/www/

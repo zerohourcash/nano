@@ -67,8 +67,8 @@ def nativeOut = file('src/main/jniLibs')
 tasks.register('buildRustNode', Exec) {
     workingDir rootProject.projectDir.parentFile
     executable System.getProperty('os.name').toLowerCase().contains('windows') ? 'cargo.exe' : 'cargo'
-    args 'ndk', '-p', '24', '-t', 'arm64-v8a', '-t', 'x86_64', '-o', nativeOut.absolutePath,
-            'build', '--release', '--lib', '--manifest-path', rustManifest.absolutePath
+    args 'ndk', '-P', '24', '-t', 'arm64-v8a', '-t', 'x86_64', '-o', nativeOut.absolutePath,
+            '--manifest-path', rustManifest.absolutePath, 'build', '--release', '--lib'
     inputs.files(fileTree(new File(rootProject.projectDir.parentFile, 'backend/src')))
     inputs.file(rustManifest)
     outputs.files(
