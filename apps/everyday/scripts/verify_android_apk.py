@@ -9,7 +9,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_APK = ROOT / "android/app/build/outputs/apk/debug/app-debug.apk"
 ABIS = ("arm64-v8a", "x86_64")
-JNI_SYMBOL = "Java_ru_meshkeeper_app_RustNode_startNode"
+JNI_SYMBOLS = (
+    "Java_ru_meshkeeper_app_RustNode_startNode",
+    "Java_ru_meshkeeper_app_RustNode_provisionNodeKey",
+)
 
 
 def main() -> None:
@@ -33,8 +36,9 @@ def main() -> None:
             symbols = subprocess.run(
                 ["readelf", "-Ws", output], check=True, capture_output=True, text=True
             ).stdout
-            if JNI_SYMBOL not in symbols:
-                raise SystemExit(f"JNI entry point is missing from {member}")
+            for symbol in JNI_SYMBOLS:
+                if symbol not in symbols:
+                    raise SystemExit(f"JNI entry point {symbol} is missing from {member}")
 
     print(f"Android APK verified: offline UI and Rust JNI node for {', '.join(ABIS)} ({apk.stat().st_size} bytes).")
 

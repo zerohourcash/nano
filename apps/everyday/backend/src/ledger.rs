@@ -15,6 +15,7 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 
 const KEY_NAME: &str = "ledger.node-signing-key.v1";
+const EXTERNAL_KEY_ENV: &str = "MESHKEEPER_NODE_SIGNING_KEY";
 const DOMAIN_V1: &str = "everyday/ledger-event/v1";
 const DOMAIN_V2: &str = "everyday/ledger-event/v2";
 const JOURNAL_DOMAIN: &str = "everyday/sync-journal/v1";
@@ -69,18 +70,42 @@ struct RequestProof {
     path: Option<String>,
 }
 
+fn decode_signing_key(encoded: &str) -> anyhow::Result<SigningKey> {
+    let raw = STANDARD_NO_PAD
+        .decode(encoded)
+        .context("invalid ledger key encoding")?;
+    Ok(SigningKey::from_bytes(&raw.try_into().map_err(|_| {
+        anyhow!("invalid ledger signing key length")
+    })?))
+}
+
 fn signing_key(conn: &Connection) -> anyhow::Result<SigningKey> {
+    let external = std::env::var(EXTERNAL_KEY_ENV).ok();
+    signing_key_with_external(conn, external.as_deref())
+}
+
+fn signing_key_with_external(
+    conn: &Connection,
+    external: Option<&str>,
+) -> anyhow::Result<SigningKey> {
     let saved: Option<String> = conn
         .query_row("SELECT v FROM kv WHERE k=?1", [KEY_NAME], |r| r.get(0))
         .optional()?;
+    if let Some(external) = external {
+        let key = decode_signing_key(external).context("invalid external ledger key")?;
+        if let Some(encoded) = saved {
+            let legacy = decode_signing_key(&encoded)?;
+            if legacy.to_bytes() != key.to_bytes() {
+                bail!("external ledger key does not match this node database");
+            }
+            // Delete only after exact comparison: a crash before this point leaves
+            // the old recoverable copy, never an identity-changing half-migration.
+            conn.execute("DELETE FROM kv WHERE k=?1", [KEY_NAME])?;
+        }
+        return Ok(key);
+    }
     if let Some(encoded) = saved {
-        let raw = STANDARD_NO_PAD
-            .decode(encoded)
-            .context("invalid ledger key encoding")?;
-        return Ok(SigningKey::from_bytes(
-            &raw.try_into()
-                .map_err(|_| anyhow!("invalid ledger signing key length"))?,
-        ));
+        return decode_signing_key(&encoded);
     }
     let key = SigningKey::generate(&mut OsRng);
     conn.execute(
@@ -88,6 +113,13 @@ fn signing_key(conn: &Connection) -> anyhow::Result<SigningKey> {
         params![KEY_NAME, STANDARD_NO_PAD.encode(key.to_bytes())],
     )?;
     Ok(key)
+}
+
+/// Bootstrap/migration hook for platform secure storage. The caller must save
+/// this value durably before starting the node with MESHKEEPER_NODE_SIGNING_KEY.
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+pub fn provision_node_signing_key(conn: &Connection) -> anyhow::Result<String> {
+    Ok(STANDARD_NO_PAD.encode(signing_key(conn)?.to_bytes()))
 }
 
 pub fn node_public_key(conn: &Connection) -> anyhow::Result<String> {
@@ -459,6 +491,47 @@ mod tests {
              CREATE TABLE history_entries(id INTEGER PRIMARY KEY,workspace_id INTEGER NOT NULL,item_id INTEGER,type TEXT NOT NULL,actor_user_id INTEGER NOT NULL,from_label TEXT,to_label TEXT,quantity_delta REAL,comment TEXT,prev_hash TEXT,hash TEXT NOT NULL UNIQUE,signature TEXT,pubkey TEXT,event_version INTEGER NOT NULL DEFAULT 1,request_device_id TEXT,request_public_key TEXT,request_nonce TEXT,request_signature TEXT,request_hash TEXT,request_timestamp TEXT,request_path TEXT,created_at TEXT NOT NULL,guid TEXT);"
         ).unwrap();
         db
+    }
+
+    #[test]
+    fn external_node_key_migration_is_identity_safe_and_removes_plaintext() {
+        let db = database();
+        let provisioned = provision_node_signing_key(&db).unwrap();
+        assert_eq!(
+            db.query_row("SELECT COUNT(*) FROM kv WHERE k=?1", [KEY_NAME], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+            1
+        );
+        let before = decode_signing_key(&provisioned).unwrap().verifying_key();
+        let migrated = signing_key_with_external(&db, Some(&provisioned)).unwrap();
+        assert_eq!(migrated.verifying_key(), before);
+        assert_eq!(
+            db.query_row("SELECT COUNT(*) FROM kv WHERE k=?1", [KEY_NAME], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn mismatched_external_node_key_fails_without_deleting_recovery_copy() {
+        let db = database();
+        let _ = provision_node_signing_key(&db).unwrap();
+        let other = STANDARD_NO_PAD.encode(SigningKey::generate(&mut OsRng).to_bytes());
+        assert!(signing_key_with_external(&db, Some(&other))
+            .unwrap_err()
+            .to_string()
+            .contains("does not match"));
+        assert_eq!(
+            db.query_row("SELECT COUNT(*) FROM kv WHERE k=?1", [KEY_NAME], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+            1
+        );
     }
 
     #[test]

@@ -15,66 +15,93 @@ import javax.crypto.KeyGenerator;
 import javax.crypto.SecretKey;
 import javax.crypto.spec.GCMParameterSpec;
 
-/** Hardware-backed where available, non-exportable storage for the mesh bearer secret. */
+/** Hardware-backed where available, non-exportable storage for Android node secrets. */
 final class SecretStore {
     private static final String PREFS = "meshkeeper";
     private static final String LEGACY_TOKEN = "sync_token";
     private static final String TOKEN_CIPHERTEXT = "sync_token_ciphertext_v1";
     private static final String TOKEN_IV = "sync_token_iv_v1";
+    private static final String NODE_KEY_CIPHERTEXT = "node_signing_key_ciphertext_v1";
+    private static final String NODE_KEY_IV = "node_signing_key_iv_v1";
     private static final String KEY_ALIAS = "meshkeeper.sync-token.v1";
     private static final String KEYSTORE = "AndroidKeyStore";
-    private static final byte[] AAD = "ru.meshkeeper.app/sync-token/v1"
-            .getBytes(StandardCharsets.UTF_8);
+    private static final byte[] TOKEN_AAD = aad("sync-token/v1");
+    private static final byte[] NODE_KEY_AAD = aad("node-signing-key/v1");
 
     private SecretStore() {}
 
     static void saveSyncToken(Context context, String token) throws GeneralSecurityException {
-        if (token == null || token.isEmpty()) {
-            if (!preferences(context).edit()
-                    .remove(TOKEN_CIPHERTEXT).remove(TOKEN_IV).remove(LEGACY_TOKEN).commit()) {
-                throw new GeneralSecurityException("Не удалось очистить mesh-токен");
-            }
-            return;
-        }
-        Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
-        cipher.init(Cipher.ENCRYPT_MODE, getOrCreateKey());
-        cipher.updateAAD(AAD);
-        byte[] encrypted = cipher.doFinal(token.getBytes(StandardCharsets.UTF_8));
-        boolean stored = preferences(context).edit()
-                .putString(TOKEN_CIPHERTEXT, Base64.encodeToString(encrypted, Base64.NO_WRAP))
-                .putString(TOKEN_IV, Base64.encodeToString(cipher.getIV(), Base64.NO_WRAP))
-                .remove(LEGACY_TOKEN)
-                .commit();
-        if (!stored) throw new GeneralSecurityException("Не удалось сохранить mesh-токен");
+        save(context, TOKEN_CIPHERTEXT, TOKEN_IV, LEGACY_TOKEN, TOKEN_AAD, token);
     }
 
     static String loadSyncToken(Context context) throws GeneralSecurityException {
-        SharedPreferences preferences = preferences(context);
-        String encrypted = preferences.getString(TOKEN_CIPHERTEXT, "");
-        String iv = preferences.getString(TOKEN_IV, "");
-        if (!encrypted.isEmpty() || !iv.isEmpty()) {
-            if (encrypted.isEmpty() || iv.isEmpty()) {
-                throw new GeneralSecurityException("Повреждено защищённое хранилище mesh-токена");
-            }
-            try {
-                Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
-                cipher.init(Cipher.DECRYPT_MODE, getOrCreateKey(),
-                        new GCMParameterSpec(128, Base64.decode(iv, Base64.NO_WRAP)));
-                cipher.updateAAD(AAD);
-                return new String(cipher.doFinal(Base64.decode(encrypted, Base64.NO_WRAP)),
-                        StandardCharsets.UTF_8);
-            } catch (IllegalArgumentException error) {
-                throw new GeneralSecurityException("Повреждена кодировка mesh-токена", error);
-            }
-        }
-
+        String encrypted = load(context, TOKEN_CIPHERTEXT, TOKEN_IV, TOKEN_AAD);
+        if (!encrypted.isEmpty()) return encrypted;
         // One-time migration from builds that used private but plaintext preferences.
-        String legacy = preferences.getString(LEGACY_TOKEN, "");
+        String legacy = preferences(context).getString(LEGACY_TOKEN, "");
         if (!legacy.isEmpty()) {
             saveSyncToken(context, legacy);
             return legacy;
         }
         return "";
+    }
+
+    static void saveNodeSigningKey(Context context, String key) throws GeneralSecurityException {
+        save(context, NODE_KEY_CIPHERTEXT, NODE_KEY_IV, null, NODE_KEY_AAD, key);
+    }
+
+    static String loadNodeSigningKey(Context context) throws GeneralSecurityException {
+        return load(context, NODE_KEY_CIPHERTEXT, NODE_KEY_IV, NODE_KEY_AAD);
+    }
+
+    private static void save(Context context, String ciphertextName, String ivName,
+                             String legacyName, byte[] aad, String value)
+            throws GeneralSecurityException {
+        if (value == null || value.isEmpty()) {
+            SharedPreferences.Editor editor = preferences(context).edit()
+                    .remove(ciphertextName).remove(ivName);
+            if (legacyName != null) editor.remove(legacyName);
+            if (!editor.commit()) {
+                throw new GeneralSecurityException("Не удалось очистить защищённый секрет");
+            }
+            return;
+        }
+        Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
+        cipher.init(Cipher.ENCRYPT_MODE, getOrCreateKey());
+        cipher.updateAAD(aad);
+        byte[] encrypted = cipher.doFinal(value.getBytes(StandardCharsets.UTF_8));
+        SharedPreferences.Editor editor = preferences(context).edit()
+                .putString(ciphertextName, Base64.encodeToString(encrypted, Base64.NO_WRAP))
+                .putString(ivName, Base64.encodeToString(cipher.getIV(), Base64.NO_WRAP));
+        if (legacyName != null) editor.remove(legacyName);
+        if (!editor.commit()) throw new GeneralSecurityException("Не удалось сохранить защищённый секрет");
+    }
+
+    private static String load(Context context, String ciphertextName, String ivName, byte[] aad)
+            throws GeneralSecurityException {
+        SharedPreferences preferences = preferences(context);
+        String encrypted = preferences.getString(ciphertextName, "");
+        String iv = preferences.getString(ivName, "");
+        if (!encrypted.isEmpty() || !iv.isEmpty()) {
+            if (encrypted.isEmpty() || iv.isEmpty()) {
+                throw new GeneralSecurityException("Повреждено защищённое хранилище");
+            }
+            try {
+                Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
+                cipher.init(Cipher.DECRYPT_MODE, getOrCreateKey(),
+                        new GCMParameterSpec(128, Base64.decode(iv, Base64.NO_WRAP)));
+                cipher.updateAAD(aad);
+                return new String(cipher.doFinal(Base64.decode(encrypted, Base64.NO_WRAP)),
+                        StandardCharsets.UTF_8);
+            } catch (IllegalArgumentException error) {
+                throw new GeneralSecurityException("Повреждена кодировка защищённого секрета", error);
+            }
+        }
+        return "";
+    }
+
+    private static byte[] aad(String purpose) {
+        return ("ru.meshkeeper.app/" + purpose).getBytes(StandardCharsets.UTF_8);
     }
 
     private static SharedPreferences preferences(Context context) {

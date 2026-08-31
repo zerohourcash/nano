@@ -918,7 +918,7 @@ pub async fn run() -> anyhow::Result<()> {
 #[cfg(target_os = "android")]
 mod android_jni {
     use jni::objects::{JClass, JString};
-    use jni::sys::jint;
+    use jni::sys::{jint, jstring};
     use jni::JNIEnv;
 
     fn string(env: &mut JNIEnv<'_>, value: JString<'_>) -> Result<String, String> {
@@ -936,6 +936,7 @@ mod android_jni {
         web_root: JString<'_>,
         upstream: JString<'_>,
         sync_token: JString<'_>,
+        node_signing_key: JString<'_>,
         advertise_url: JString<'_>,
     ) -> jint {
         let result = (|| -> Result<(), String> {
@@ -943,6 +944,7 @@ mod android_jni {
             let web_root = string(&mut env, web_root)?;
             let upstream = string(&mut env, upstream)?;
             let sync_token = string(&mut env, sync_token)?;
+            let node_signing_key = string(&mut env, node_signing_key)?;
             let advertise_url = string(&mut env, advertise_url)?;
             std::env::set_var("MESHKEEPER_DB", db_path);
             std::env::set_var("MESHKEEPER_WEB_ROOT", web_root);
@@ -960,6 +962,10 @@ mod android_jni {
             } else {
                 std::env::set_var("MESHKEEPER_SYNC_TOKEN", sync_token);
             }
+            if node_signing_key.is_empty() {
+                return Err("Android node signing key is empty".into());
+            }
+            std::env::set_var("MESHKEEPER_NODE_SIGNING_KEY", node_signing_key);
             if advertise_url.is_empty() {
                 std::env::remove_var("MESHKEEPER_ADVERTISE_URL");
             } else {
@@ -979,6 +985,38 @@ mod android_jni {
             Err(message) => {
                 let _ = env.throw_new("java/lang/IllegalStateException", message);
                 -1
+            }
+        }
+    }
+
+    /// Crash-safe first half of the SQLite → AndroidKeyStore migration. This
+    /// only reads/creates the seed; startNode validates it and then removes the
+    /// plaintext SQLite copy through ledger::signing_key.
+    #[no_mangle]
+    pub extern "system" fn Java_ru_meshkeeper_app_RustNode_provisionNodeKey(
+        mut env: JNIEnv<'_>,
+        _class: JClass<'_>,
+        db_path: JString<'_>,
+    ) -> jstring {
+        let result = (|| -> Result<String, String> {
+            let path = string(&mut env, db_path)?;
+            let conn = crate::db::open(std::path::Path::new(&path)).map_err(|error| {
+                format!("Не удалось открыть базу для миграции ключа: {error:#}")
+            })?;
+            crate::ledger::provision_node_signing_key(&conn)
+                .map_err(|error| format!("Не удалось получить ключ подписи ноды: {error:#}"))
+        })();
+        match result {
+            Ok(value) => match env.new_string(value) {
+                Ok(value) => value.into_raw(),
+                Err(error) => {
+                    let _ = env.throw_new("java/lang/IllegalStateException", error.to_string());
+                    std::ptr::null_mut()
+                }
+            },
+            Err(message) => {
+                let _ = env.throw_new("java/lang/IllegalStateException", message);
+                std::ptr::null_mut()
             }
         }
     }

@@ -12,6 +12,7 @@ gradle = (android / "build.gradle").read_text(encoding="utf-8")
 
 required = {
     "Rust JNI symbol": "Java_ru_meshkeeper_app_RustNode_startNode" in lib,
+    "node key migration JNI": "Java_ru_meshkeeper_app_RustNode_provisionNodeKey" in lib,
     "private UI bind": 'MESHKEEPER_BIND", "127.0.0.1:8765' in lib,
     "sync-only LAN bind": 'MESHKEEPER_SYNC_BIND", "0.0.0.0:8766' in lib,
     "foreground Rust launch": "RustNode.startNode" in service,
@@ -20,8 +21,10 @@ required = {
     "two supported ABIs": "arm64-v8a" in gradle and "x86_64" in gradle,
     "Android Keystore": 'KEYSTORE = "AndroidKeyStore"' in secrets,
     "authenticated token encryption": 'AES/GCM/NoPadding' in secrets and "updateAAD" in secrets,
-    "legacy plaintext migration": ".remove(LEGACY_TOKEN)" in secrets,
+    "legacy plaintext migration": "saveSyncToken(context, legacy)" in secrets and "editor.remove(legacyName)" in secrets,
     "service decrypts token": "SecretStore.loadSyncToken(this)" in service,
+    "service seals node key": "SecretStore.saveNodeSigningKey(this" in service,
+    "Rust receives sealed node key": "MESHKEEPER_NODE_SIGNING_KEY" in lib,
     "token absent from service Intent": "EXTRA_TOKEN" not in service and "EXTRA_TOKEN" not in activity,
     "token not restored into UI": "syncToken.setText(SecretStore.loadSyncToken" not in activity,
 }

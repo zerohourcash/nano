@@ -26,8 +26,12 @@ public final class RustNode {
             String webRoot,
             String upstream,
             String syncToken,
+            String nodeSigningKey,
             String advertiseUrl
     );
+
+    /** Returns the existing/new node seed so Java can seal it before Rust removes SQLite plaintext. */
+    public static native String provisionNodeKey(String dbPath);
 
     public static String localOrigin() { return "http://localhost:" + UI_PORT; }
 }

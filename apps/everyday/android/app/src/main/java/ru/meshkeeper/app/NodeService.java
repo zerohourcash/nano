@@ -60,9 +60,17 @@ public class NodeService extends Service {
             File webRoot = new File(getFilesDir(), "www");
             extractAssets("www", webRoot);
             File db = new File(getNoBackupFilesDir(), "meshkeeper-rs.db");
+            String nodeSigningKey = SecretStore.loadNodeSigningKey(this);
+            if (nodeSigningKey.isEmpty()) {
+                // Migration is crash-safe: Rust leaves the SQLite copy intact here.
+                // It removes it only on startNode after comparing the sealed value.
+                nodeSigningKey = RustNode.provisionNodeKey(db.getAbsolutePath());
+                SecretStore.saveNodeSigningKey(this, nodeSigningKey);
+            }
             String lan = lanIpv4();
             String advertised = lan.isEmpty() ? "" : "http://" + lan + ":" + RustNode.SYNC_PORT;
-            RustNode.startNode(db.getAbsolutePath(), webRoot.getAbsolutePath(), upstream, token, advertised);
+            RustNode.startNode(db.getAbsolutePath(), webRoot.getAbsolutePath(), upstream, token,
+                    nodeSigningKey, advertised);
         } catch (Throwable error) {
             Log.e(TAG, "Rust-узел остановлен", error);
             stopSelf();
