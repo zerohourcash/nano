@@ -1572,9 +1572,23 @@ fn items_by_id(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiRes
 fn items_by_code(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
     let uid = require_user(conn, user_id)?;
     let code = s(input, "code").ok_or_else(|| ApiError::bad("code"))?;
+    let canonical_guid = code
+        .trim()
+        .strip_prefix("everyday:item:")
+        .filter(|guid| Uuid::parse_str(guid).is_ok());
+    if code.trim().starts_with("everyday:item:") && canonical_guid.is_none() {
+        return Err(ApiError::bad("Некорректный GUID в QR-коде Everyday"));
+    }
     let id: Option<i64> = conn.query_row(
-        "SELECT id FROM items WHERE qr_code=?1 OR internal_id=?1 OR UPPER(qr_code)=UPPER(?1) OR UPPER(internal_id)=UPPER(?1) LIMIT 1",
-        params![code], |r| r.get(0),
+        "SELECT i.id
+         FROM items i
+         JOIN user_workspaces m ON m.workspace_id=i.workspace_id
+         JOIN users u ON u.id=m.user_id
+         WHERE m.user_id=?2 AND u.status='active'
+           AND ((?3 IS NOT NULL AND i.guid=?3) OR (?3 IS NULL AND (i.qr_code=?1 OR i.internal_id=?1 OR UPPER(i.qr_code)=UPPER(?1) OR UPPER(i.internal_id)=UPPER(?1))))
+         ORDER BY CASE WHEN ?3 IS NOT NULL THEN 0 WHEN i.qr_code=?1 THEN 1 WHEN i.internal_id=?1 THEN 2 ELSE 3 END, i.id
+         LIMIT 1",
+        params![code, uid, canonical_guid], |r| r.get(0),
     ).optional().ok().flatten();
     let id = id.ok_or_else(|| ApiError::not_found("Инструмент с таким QR/номером не найден"))?;
     require_item_access(conn, uid, id)?;
@@ -4856,6 +4870,50 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error.http, 403);
+        cleanup(conn, path);
+    }
+
+    #[test]
+    fn qr_lookup_selects_only_items_from_active_memberships() {
+        let (mut conn, path, users, ws) = test_db();
+        conn.execute(
+            "INSERT INTO workspaces (name, timezone, internal_id_prefix, created_at) VALUES ('Foreign','UTC','F-',?1)",
+            params![now()],
+        )
+        .unwrap();
+        let foreign_ws = conn.last_insert_rowid();
+        let foreign = insert_item(&conn, foreign_ws, None, false, None);
+        let own = insert_item(&conn, ws, None, false, None);
+        assert!(foreign < own, "регрессия требует более ранний чужой дубль");
+
+        let found = dispatch(
+            &mut conn,
+            "items.byCode",
+            &json!({"code":"qr-keep"}),
+            Some(users[0]),
+        )
+        .unwrap();
+        assert_eq!(found["id"], own);
+        assert_eq!(found["workspaceId"], ws);
+        let guid = Uuid::new_v4().to_string();
+        conn.execute("UPDATE items SET guid=?1 WHERE id=?2", params![guid, own])
+            .unwrap();
+        let canonical = dispatch(
+            &mut conn,
+            "items.byCode",
+            &json!({"code":format!("everyday:item:{guid}")}),
+            Some(users[0]),
+        )
+        .unwrap();
+        assert_eq!(canonical["id"], own);
+        let malformed = dispatch(
+            &mut conn,
+            "items.byCode",
+            &json!({"code":"everyday:item:not-a-guid"}),
+            Some(users[0]),
+        )
+        .unwrap_err();
+        assert_eq!(malformed.http, 400);
         cleanup(conn, path);
     }
 

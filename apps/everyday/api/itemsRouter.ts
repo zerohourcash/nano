@@ -65,7 +65,9 @@ export const itemsRouter = createRouter({
       const item = await findItemById(input.id);
       if (!item) throw new TRPCError({ code: "NOT_FOUND", message: "Инструмент не найден" });
       const history = await findItemHistory(input.id);
-      return { ...item, history };
+      // Rust node supplies the globally stable GUID used by canonical QR tags.
+      // The legacy TypeScript fallback has no GUID column and keeps old tags.
+      return { ...item, guid: null as string | null, history };
     }),
 
   byCode: publicQuery

@@ -592,7 +592,9 @@ function TransferModal({
 }
 
 function QrModal({ open, onClose, item }: { open: boolean; onClose: () => void; item: ItemFull }) {
-  const value = item.qrCode ?? item.internalId
+  // GUID делает бирку однозначной между организациями и после P2P-слияния.
+  // Backend продолжает принимать старые бирки с qrCode/internalId.
+  const value = item.guid ? `everyday:item:${item.guid}` : (item.qrCode ?? item.internalId)
 
   const downloadPng = () => {
     const canvas = document.getElementById('item-qr-canvas') as HTMLCanvasElement | null

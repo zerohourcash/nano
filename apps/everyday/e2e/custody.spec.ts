@@ -69,6 +69,33 @@ test('browser signs a real custody transaction and ledger retains its proof', as
   expect(event?.requestNonce).toBeTruthy()
   expect(event?.requestHash).toMatch(/^[a-f0-9]{64}$/)
 
+  const qrItem = await trpc<{ id: number; internalId: string; guid: string }>(page, 'items.create', {
+    workspaceId: workspaces[0].id,
+    title: 'Шуруповёрт QR E2E',
+    categoryId: category.id,
+    qrCode: 'E2E-QR-SECOND',
+  })
+  await page.goto('/scan')
+  const manualCode = page.getByPlaceholder('Или вставьте ссылку / токен')
+  await manualCode.fill('everyday:item:00000000-0000-4000-8000-000000000000')
+  await page.getByRole('button', { name: 'Далее' }).click()
+  await expect(page.getByText('Инструмент не найден. Проверьте номер.')).toBeVisible()
+  await manualCode.fill(`everyday:item:${qrItem.guid}`)
+  await page.getByRole('button', { name: 'Далее' }).click()
+  await expect(page.getByText('Шуруповёрт QR E2E', { exact: true }).first()).toBeVisible()
+  page.once('dialog', (dialog) => dialog.accept(''))
+  await page.getByRole('button', { name: 'Взять все (1)' }).click()
+  await expect(page.getByText('Взято 1 шт.')).toBeVisible({ timeout: 10_000 })
+  const qrItemAfterTake = await trpc<{
+    responsibleUserId: number | null
+    history: Array<{ type: string; eventVersion?: number; requestDeviceId?: string; requestHash?: string }>
+  }>(page, 'items.byId', { id: qrItem.id }, false)
+  const qrEvent = qrItemAfterTake.history.find((entry) => entry.type === 'transfer_receive')
+  expect(qrItemAfterTake.responsibleUserId).toBeTruthy()
+  expect(qrEvent).toMatchObject({ eventVersion: 2 })
+  expect(qrEvent?.requestDeviceId).toBeTruthy()
+  expect(qrEvent?.requestHash).toMatch(/^[a-f0-9]{64}$/)
+
   await page.goto('/knowledge')
   await expect(page.getByRole('heading', { name: 'База знаний' })).toBeVisible()
   await page.getByRole('button', { name: 'Новая страница' }).click()
