@@ -18,6 +18,7 @@ export default function OfflineNodesSection() {
   const auditQ = trpc.sync.audit.useQuery(undefined, { refetchInterval: 30000 })
   const conflictsQ = trpc.sync.conflicts.useQuery(undefined, { refetchInterval: 8000 })
   const keysQ = trpc.sync.nodeKeys.useQuery(undefined, { refetchInterval: 8000 })
+  const bundleQ = trpc.sync.exportBundle.useQuery(undefined, { enabled: false })
   const [peerUrl, setPeerUrl] = useState('')
   const [password, setPassword] = useState('')
   const addPeer = trpc.sync.addPeer.useMutation({
@@ -58,6 +59,13 @@ export default function OfflineNodesSection() {
     onSuccess: () => { utils.sync.nodeKeys.invalidate(); toast('Доверие к ключу отозвано') },
     onError: (e) => toast(e.message, 'error'),
   })
+  const importBundle = trpc.sync.importBundle.useMutation({
+    onSuccess: (result) => {
+      utils.invalidate()
+      toast(`Пакет проверен: импортировано ${result.imported ?? 0}, конфликтов ${result.conflicts ?? 0}`)
+    },
+    onError: (e) => toast(e.message, 'error'),
+  })
   const exp = trpc.backup.export.useMutation({
     onSuccess: (blob) => {
       const a = document.createElement('a')
@@ -86,6 +94,47 @@ export default function OfflineNodesSection() {
     const text = await file.text()
     const blob = JSON.parse(text)
     imp.mutate({ password, blob })
+  }
+
+  const exportTransportBundle = async () => {
+    const result = await bundleQ.refetch()
+    if (!result.data) {
+      toast(result.error?.message ?? 'Не удалось собрать пакет', 'error')
+      return
+    }
+    const file = new File(
+      [JSON.stringify(result.data)],
+      `everyday-sync-${new Date().toISOString().replace(/[:.]/g, '-')}.json`,
+      { type: 'application/vnd.everyday.sync+json' },
+    )
+    if (navigator.canShare?.({ files: [file] })) {
+      try {
+        await navigator.share({ files: [file], title: 'Everyday: подписанный пакет синхронизации' })
+        toast('Пакет передан системному меню обмена')
+        return
+      } catch (error) {
+        if (error instanceof DOMException && error.name === 'AbortError') return
+      }
+    }
+    const url = URL.createObjectURL(file)
+    const anchor = document.createElement('a')
+    anchor.href = url
+    anchor.download = file.name
+    anchor.click()
+    URL.revokeObjectURL(url)
+    toast('Пакет скачан — передайте его Bluetooth, Wi‑Fi Direct или USB')
+  }
+
+  const importTransportFile = async (file: File) => {
+    if (file.size > 30 * 1024 * 1024) {
+      toast('Пакет превышает лимит 30 МБ', 'error')
+      return
+    }
+    try {
+      importBundle.mutate({ bundle: JSON.parse(await file.text()) })
+    } catch {
+      toast('Файл не является корректным JSON-пакетом Everyday', 'error')
+    }
   }
 
   return (
@@ -268,6 +317,30 @@ export default function OfflineNodesSection() {
             </li>
           ))}
         </ul>
+      </section>
+
+      <section className={cardCls + ' p-5 space-y-3'}>
+        <div className="flex items-center gap-2">
+          <Upload size={18} className="text-brand-600" />
+          <h3 className="text-[17px] font-semibold text-ink-900">Обмен без прямого соединения</h3>
+        </div>
+        <p className="text-sm text-ink-500">
+          Подписанный пакет содержит транзакции, текст и CAS-manifests, но не тяжёлые файлы. Передайте его через системный Bluetooth Share, Wi‑Fi Direct, AirDrop, USB или любой доступный канал.
+        </p>
+        <div className="flex flex-wrap gap-2">
+          <button className={btnPrimaryCls} disabled={bundleQ.isFetching} onClick={() => void exportTransportBundle()}>
+            <Download size={16} /> Передать пакет
+          </button>
+          <label className={btnSecondaryCls + ' cursor-pointer'}>
+            <Upload size={16} /> Принять пакет
+            <input type="file" accept=".json,application/json,application/vnd.everyday.sync+json" className="hidden" onChange={(event) => {
+              const file = event.target.files?.[0]
+              if (file) void importTransportFile(file)
+              event.target.value = ''
+            }} />
+          </label>
+        </div>
+        <p className="text-[12px] text-ink-300">Повторы безопасны; подпись и хэш проверяются до изменения локальной базы.</p>
       </section>
 
       <section className={cardCls + ' p-5 space-y-3'}>

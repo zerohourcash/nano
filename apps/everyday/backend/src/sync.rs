@@ -460,6 +460,42 @@ pub fn export_journal(conn: &Connection) -> Value {
     export_journal_since(conn, None)
 }
 
+/// Транспортно-независимый пакет: его можно передать файлом, Bluetooth Share,
+/// Wi-Fi Direct, USB или любым store-and-forward каналом. Бинарные CAS-объекты
+/// сюда намеренно не входят; journal содержит только manifests и ссылки.
+pub fn export_transport_bundle(conn: &Connection) -> Value {
+    if let Ok(public_key) = ledger::node_public_key(conn) {
+        let _ = conn.execute(
+            "INSERT OR IGNORE INTO trusted_node_keys(public_key,label,source,created_at) VALUES(?1,'Этот узел','local',?2)",
+            params![public_key, chrono::Utc::now().to_rfc3339()],
+        );
+    }
+    json!({
+        "format": "everyday-sync-bundle",
+        "version": 1,
+        "createdAt": chrono::Utc::now().to_rfc3339(),
+        "journal": export_journal(conn),
+    })
+}
+
+pub fn import_transport_bundle(conn: &Connection, bundle: &Value) -> Value {
+    if bundle.get("format").and_then(Value::as_str) != Some("everyday-sync-bundle")
+        || bundle.get("version").and_then(Value::as_u64) != Some(1)
+    {
+        return json!({"ok":false,"error":"Неподдерживаемый формат transport bundle"});
+    }
+    let Some(journal) = bundle.get("journal") else {
+        return json!({"ok":false,"error":"В transport bundle отсутствует journal"});
+    };
+    if serde_json::to_vec(journal).map_or(true, |bytes| bytes.len() > 30 * 1024 * 1024) {
+        return json!({"ok":false,"error":"Transport bundle превышает лимит 30 МБ"});
+    }
+    // Файл не доказывает, что объявленный HTTP-адрес сейчас принадлежит
+    // непосредственному отправителю: не добавляем его автоматически в peers.
+    // Адреса CAS-провайдеров всё равно приходят в подписанном gossip-каталоге.
+    apply_remote_journal(conn, journal, "")
+}
+
 fn upsert_workspace(conn: &Connection, w: &Value) -> i64 {
     let guid = w.get("guid").and_then(|v| v.as_str()).unwrap_or("");
     if !guid.is_empty() {
@@ -1666,6 +1702,40 @@ pub fn touch_peer_error(conn: &Connection, url: &str, err: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transport_bundle_round_trips_and_rejects_tampering() {
+        let source_path =
+            std::env::temp_dir().join(format!("bundle-source-{}.db", uuid::Uuid::new_v4()));
+        let target_path =
+            std::env::temp_dir().join(format!("bundle-target-{}.db", uuid::Uuid::new_v4()));
+        let source = crate::db::open(&source_path).unwrap();
+        let target = crate::db::open(&target_path).unwrap();
+        source.execute("INSERT INTO workspaces(name,internal_id_prefix,created_at,guid) VALUES('Offline org','O-',?1,?2)",params![chrono::Utc::now().to_rfc3339(),uuid::Uuid::new_v4().to_string()]).unwrap();
+        let bundle = export_transport_bundle(&source);
+        assert_eq!(bundle["format"], "everyday-sync-bundle");
+        assert_eq!(import_transport_bundle(&target, &bundle)["ok"], true);
+        assert_eq!(
+            target
+                .query_row("SELECT count(*) FROM workspaces", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+
+        let mut forged = bundle;
+        forged["journal"]["workspaces"][0]["name"] = json!("FORGED");
+        let rejected = import_transport_bundle(&target, &forged);
+        assert_eq!(rejected["ok"], false);
+        assert!(rejected["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("hash mismatch"));
+        drop((source, target));
+        for path in [source_path, target_path] {
+            let _ = std::fs::remove_file(path);
+        }
+    }
 
     #[test]
     fn strict_node_trust_requires_explicit_approval_after_bootstrap() {

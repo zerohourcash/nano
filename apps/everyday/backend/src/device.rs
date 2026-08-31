@@ -40,6 +40,7 @@ pub fn requires_signature(procedure: &str) -> bool {
             | "bit.sale"
             | "bit.mint"
             | "knowledge.save"
+            | "sync.importBundle"
     )
 }
 

@@ -89,6 +89,16 @@ test('browser signs a real custody transaction and ledger retains its proof', as
   expect(knowledge.current.revisionHash).toMatch(/^[a-f0-9]{64}$/)
   expect(knowledge.current.attachments[0]?.url).toMatch(/^data:text\/plain;base64,/)
 
+  const transportBundle = await trpc<{
+    format: string
+    version: number
+    journal: { journalHash: string; workspaces: Array<{ name: string }> }
+  }>(page, 'sync.exportBundle', null, false)
+  expect(transportBundle.format).toBe('everyday-sync-bundle')
+  expect(transportBundle.journal.journalHash).toMatch(/^[a-f0-9]{64}$/)
+  const forgedBundle = structuredClone(transportBundle)
+  forgedBundle.journal.workspaces[0].name = 'Подмена через Bluetooth-файл'
+
   await page.goto('/admin')
   await page.getByRole('button', { name: 'Офлайн-узлы' }).first().click()
   await expect(page.getByRole('heading', { name: 'Целостность локальной копии' })).toBeVisible()
@@ -101,4 +111,23 @@ test('browser signs a real custody transaction and ledger retains its proof', as
   await expect(page.getByText(/Snapshot:/)).toContainText(/[a-f0-9]{64}/)
   await expect(page.getByRole('heading', { name: 'Ключи mesh-нод' })).toBeVisible()
   await expect(page.getByRole('heading', { name: 'Этот узел' })).toBeVisible()
+  await expect(page.getByRole('heading', { name: 'Обмен без прямого соединения' })).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Передать пакет' })).toBeVisible()
+  const transportInput = page.locator('label:has-text("Принять пакет") input[type="file"]')
+  const validImportResponse = page.waitForResponse((response) => response.url().includes('sync.importBundle'))
+  await transportInput.setInputFiles({
+    name: 'valid-everyday-sync.json',
+    mimeType: 'application/json',
+    buffer: Buffer.from(JSON.stringify(transportBundle)),
+  })
+  const validImportPayload = await (await validImportResponse).json()
+  expect(validImportPayload[0]?.error).toBeUndefined()
+  const forgedImportResponse = page.waitForResponse((response) => response.url().includes('sync.importBundle'))
+  await transportInput.setInputFiles({
+    name: 'forged-everyday-sync.json',
+    mimeType: 'application/json',
+    buffer: Buffer.from(JSON.stringify(forgedBundle)),
+  })
+  const forgedImportPayload = await (await forgedImportResponse).json()
+  expect(forgedImportPayload[0]?.error?.json?.message).toMatch(/hash mismatch/)
 })

@@ -62,6 +62,15 @@ export const syncRouter = createRouter({
     trusted: [] as Array<{ publicKey: string; label: string | null; approvedBy: number | null; source: string; createdAt: string }>,
     pending: [] as Array<{ publicKey: string; peerUrl: string | null; nodeName: string | null; firstSeen: string; lastSeen: string }>,
   })),
+  exportBundle: publicQuery.query(async () => ({
+    format: "everyday-sync-bundle" as const,
+    version: 1 as const,
+    createdAt: "",
+    journal: {} as Record<string, unknown>,
+  })),
+  importBundle: publicQuery
+    .input(z.object({ bundle: z.unknown() }))
+    .mutation(async () => ({ ok: true, imported: 0, conflicts: 0 })),
   approveNodeKey: publicQuery.input(z.object({ publicKey: z.string().min(32), label: z.string().max(100).optional() })).mutation(async () => ({ strict: true, trusted: [], pending: [] })),
   revokeNodeKey: publicQuery.input(z.object({ publicKey: z.string().min(32) })).mutation(async () => ({ strict: true, trusted: [], pending: [] })),
   addPeer: publicQuery

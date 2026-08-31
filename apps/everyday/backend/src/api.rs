@@ -93,6 +93,7 @@ pub fn is_mutation(procedure: &str) -> bool {
             | "sync.peers"
             | "sync.conflicts"
             | "sync.nodeKeys"
+            | "sync.exportBundle"
             | "bit.balance"
             | "bit.transactions"
             | "knowledge.list"
@@ -838,6 +839,22 @@ fn dispatch_inner(
         "sync.audit" => Ok(crate::sync::integrity_audit(conn)),
         "sync.peers" => Ok(crate::sync::list_peers(conn)),
         "sync.nodeKeys" => Ok(crate::sync::node_keys(conn)),
+        "sync.exportBundle" => Ok(crate::sync::export_transport_bundle(conn)),
+        "sync.importBundle" => {
+            let bundle = input
+                .get("bundle")
+                .ok_or_else(|| ApiError::bad("Нет transport bundle"))?;
+            let result = crate::sync::import_transport_bundle(conn, bundle);
+            if result.get("ok").and_then(Value::as_bool) == Some(false) {
+                return Err(ApiError::bad(
+                    result
+                        .get("error")
+                        .and_then(Value::as_str)
+                        .unwrap_or("Transport bundle отклонён"),
+                ));
+            }
+            Ok(result)
+        }
         "sync.approveNodeKey" => {
             let uid = require_user(conn, user_id)?;
             let key = s(input, "publicKey").ok_or_else(|| ApiError::bad("publicKey"))?;
