@@ -50,6 +50,34 @@ const roleRightsSchema = z.object({
   manageDictionaries: z.boolean(),
 });
 
+export type OrganizationNodeDto = {
+  id: number
+  guid: string
+  workspaceId: number
+  parentId: number | null
+  kind: string
+  name: string
+  tabLabel: string | null
+  responsibleUserId: number | null
+  displayOrder: number
+  color: string | null
+  icon: string | null
+  archived: boolean
+}
+
+const organizationNodeInput = z.object({
+  workspaceId: z.number().int().positive().optional(),
+  parentId: z.number().int().positive().nullable().optional(),
+  kind: z.string().trim().min(1).max(40),
+  name: z.string().trim().min(1).max(120),
+  tabLabel: z.string().trim().max(60).nullable().optional(),
+  responsibleUserId: z.number().int().positive().nullable().optional(),
+  displayOrder: z.number().int().optional(),
+  color: z.string().max(32).nullable().optional(),
+  icon: z.string().max(40).nullable().optional(),
+  archived: z.boolean().optional(),
+})
+
 const idInput = z.object({ id: z.number().int().positive() });
 const wsInput = z.object({ workspaceId: z.number().int().positive().optional() });
 
@@ -312,6 +340,27 @@ export const adminRouter = createRouter({
       }),
 
     remove: publicQuery.input(idInput).mutation(({ input }) => deleteBuildingSite(input.id)),
+  }),
+
+  organizationNodes: createRouter({
+    list: publicQuery
+      .input(z.object({ workspaceId: z.number().int().positive().optional(), includeArchived: z.boolean().optional() }).optional())
+      .query(async (): Promise<OrganizationNodeDto[]> => []),
+    create: publicQuery.input(organizationNodeInput).mutation(({ input }): OrganizationNodeDto => ({
+      id: 0, guid: '', workspaceId: input.workspaceId ?? 0, parentId: input.parentId ?? null,
+      kind: input.kind, name: input.name, tabLabel: input.tabLabel ?? null,
+      responsibleUserId: input.responsibleUserId ?? null, displayOrder: input.displayOrder ?? 0,
+      color: input.color ?? null, icon: input.icon ?? null, archived: false,
+    })),
+    update: publicQuery
+      .input(organizationNodeInput.partial().extend({ id: z.number().int().positive() }))
+      .mutation(({ input }): OrganizationNodeDto => ({
+        id: input.id, guid: '', workspaceId: input.workspaceId ?? 0, parentId: input.parentId ?? null,
+        kind: input.kind ?? 'section', name: input.name ?? '', tabLabel: input.tabLabel ?? null,
+        responsibleUserId: input.responsibleUserId ?? null, displayOrder: input.displayOrder ?? 0,
+        color: input.color ?? null, icon: input.icon ?? null, archived: input.archived ?? false,
+      })),
+    remove: publicQuery.input(idInput).mutation(({ input }) => ({ ok: true, archived: true, id: input.id })),
   }),
 
   // ─── Справочники (categories / brands / statuses) ──────────────────────────

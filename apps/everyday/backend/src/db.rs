@@ -63,6 +63,10 @@ fn migrate(conn: &Connection) -> Result<()> {
     let _ = conn.execute("ALTER TABLE items ADD COLUMN source_system TEXT", []);
     let _ = conn.execute("ALTER TABLE items ADD COLUMN external_id TEXT", []);
     let _ = conn.execute("ALTER TABLE items ADD COLUMN metadata_json TEXT", []);
+    let _ = conn.execute(
+        "ALTER TABLE items ADD COLUMN organization_node_id INTEGER",
+        [],
+    );
     let _ = conn.execute("ALTER TABLE users ADD COLUMN guid TEXT", []);
     let _ = conn.execute("ALTER TABLE users ADD COLUMN checkout_policy TEXT", []);
     let _ = conn.execute("ALTER TABLE workspaces ADD COLUMN guid TEXT", []);
@@ -126,6 +130,25 @@ fn migrate(conn: &Connection) -> Result<()> {
           text TEXT NOT NULL,
           created_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS organization_nodes (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          guid TEXT NOT NULL UNIQUE,
+          workspace_id INTEGER NOT NULL,
+          parent_id INTEGER,
+          kind TEXT NOT NULL,
+          name TEXT NOT NULL,
+          tab_label TEXT,
+          responsible_user_id INTEGER,
+          display_order INTEGER NOT NULL DEFAULT 0,
+          color TEXT,
+          icon TEXT,
+          archived INTEGER NOT NULL DEFAULT 0,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          FOREIGN KEY(parent_id) REFERENCES organization_nodes(id)
+        );
+        CREATE INDEX IF NOT EXISTS organization_nodes_tree_idx
+          ON organization_nodes(workspace_id,parent_id,display_order,id);
         CREATE TABLE IF NOT EXISTS kv (
           k TEXT PRIMARY KEY,
           v TEXT NOT NULL

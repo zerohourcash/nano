@@ -229,6 +229,24 @@ def main() -> int:
                 "metadata": {"ownerCompany": "ООО ФейсКИТ", "labels": ["mesh"]},
             },
         )
+        division = server.call(
+            "admin.organizationNodes.create",
+            {
+                "workspaceId": ws_id,
+                "kind": "division",
+                "name": "Производство",
+                "tabLabel": "Цеха",
+            },
+        )
+        server.call(
+            "admin.organizationNodes.create",
+            {
+                "workspaceId": ws_id,
+                "parentId": division["id"],
+                "kind": "room",
+                "name": "Кабинет 204",
+            },
+        )
 
         server.call(
             "admin.workspaces.createInvite",
@@ -254,6 +272,18 @@ def main() -> int:
         node_ws = node.call("meta.workspaces", None, mutation=False)
         node_ws_id = node_ws[0]["id"] if isinstance(node_ws, list) and node_ws else None
         check("пространство доехало до узла", bool(node_ws_id), str(node_ws)[:180])
+        structure = node.call(
+            "admin.organizationNodes.list",
+            {"workspaceId": node_ws_id},
+            mutation=False,
+        )
+        check(
+            "настраиваемая структура и родительская связь синхронизировались",
+            isinstance(structure, list)
+            and len(structure) == 2
+            and any(row.get("parentId") for row in structure),
+            str(structure)[:240],
+        )
 
         arrived = wait_for(
             lambda: "Перфоратор с сервера" in titles(node, node_ws_id or 1)

@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { AnimatePresence, motion } from 'framer-motion'
-import { Building2, Layers, ListTree, Radio, ShieldAlert, Users, Warehouse } from 'lucide-react'
+import { Building2, Layers, ListTree, Network, Radio, ShieldAlert, Users, Warehouse } from 'lucide-react'
 import type { LucideIcon } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { ToastProvider } from './admin/ui'
@@ -11,12 +11,14 @@ import SitesSection from './admin/SitesSection'
 import DictionariesSection from './admin/DictionariesSection'
 import OfflineNodesSection from './admin/OfflineNodesSection'
 import RequestsSection from './admin/RequestsSection'
+import OrganizationSection from './admin/OrganizationSection'
 
-type SectionId = 'users' | 'workspaces' | 'storages' | 'sites' | 'dictionaries' | 'requests' | 'offline'
+type SectionId = 'users' | 'workspaces' | 'organization' | 'storages' | 'sites' | 'dictionaries' | 'requests' | 'offline'
 
 const SECTIONS: { id: SectionId; label: string; icon: LucideIcon; soon?: boolean }[] = [
   { id: 'users', label: 'Пользователи', icon: Users },
   { id: 'workspaces', label: 'Пространства', icon: Layers },
+  { id: 'organization', label: 'Структура', icon: Network },
   { id: 'storages', label: 'Склады', icon: Warehouse },
   { id: 'sites', label: 'Объекты', icon: Building2 },
   { id: 'dictionaries', label: 'Справочники', icon: ListTree },
@@ -104,6 +106,7 @@ export default function Admin() {
               >
                 {section === 'users' && <UsersSection />}
                 {section === 'workspaces' && <WorkspacesSection />}
+                {section === 'organization' && <OrganizationSection />}
                 {section === 'storages' && <StoragesSection />}
                 {section === 'sites' && <SitesSection />}
                 {section === 'dictionaries' && <DictionariesSection />}

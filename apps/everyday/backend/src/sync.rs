@@ -72,7 +72,7 @@ pub fn hello(conn: &Connection) -> Value {
         "nodeId": id,
         "name": name,
         "protocol": "meshkeeper-sync/2",
-        "ledger": "audit-log"
+        "ledger": "signed-account-chains"
     })
 }
 
@@ -99,6 +99,29 @@ pub fn export_journal(conn: &Connection) -> Value {
             .flatten()
         {
             workspaces.push(row);
+        }
+    }
+    let mut organization_nodes = Vec::new();
+    if let Ok(mut stmt) = conn.prepare(
+        "SELECT id,guid,workspace_id,parent_id,kind,name,tab_label,responsible_user_id,display_order,color,icon,archived,created_at,updated_at FROM organization_nodes",
+    ) {
+        for row in stmt.query_map([], |r| {
+            let ws: i64 = r.get(2)?;
+            let parent: Option<i64> = r.get(3)?;
+            let responsible: Option<i64> = r.get(7)?;
+            Ok(json!({
+                "guid": r.get::<_,String>(1)?,
+                "workspaceGuid": guid_of(conn,"workspaces",ws),
+                "parentGuid": parent.map(|id| guid_of(conn,"organization_nodes",id)),
+                "kind": r.get::<_,String>(4)?, "name": r.get::<_,String>(5)?,
+                "tabLabel": r.get::<_,Option<String>>(6)?,
+                "responsibleGuid": responsible.map(|id| guid_of(conn,"users",id)),
+                "displayOrder": r.get::<_,i64>(8)?, "color": r.get::<_,Option<String>>(9)?,
+                "icon": r.get::<_,Option<String>>(10)?, "archived": r.get::<_,i64>(11)? != 0,
+                "createdAt": r.get::<_,String>(12)?, "updatedAt": r.get::<_,String>(13)?,
+            }))
+        }).into_iter().flatten().flatten() {
+            organization_nodes.push(row);
         }
     }
     let mut users = Vec::new();
@@ -239,6 +262,7 @@ pub fn export_journal(conn: &Connection) -> Value {
         "exportedAt": chrono::Utc::now().to_rfc3339(),
         "workspaces": workspaces,
         "users": users,
+        "organizationNodes": organization_nodes,
         "items": items,
         "history": history,
         "invites": invites,
@@ -368,6 +392,41 @@ pub fn import_journal(conn: &Connection, journal: &Value) -> Value {
         for u in arr {
             upsert_user(conn, u);
             users += 1;
+        }
+    }
+    if let Some(arr) = journal.get("organizationNodes").and_then(|v| v.as_array()) {
+        // Первый проход создаёт узлы без родителей, чтобы порядок входящего
+        // массива не имел значения. Второй восстанавливает связи по GUID.
+        for node in arr {
+            let guid = node.get("guid").and_then(Value::as_str).unwrap_or("");
+            let ws_guid = node
+                .get("workspaceGuid")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let Some(ws) = id_by_guid(conn, "workspaces", ws_guid) else {
+                continue;
+            };
+            let responsible = node
+                .get("responsibleGuid")
+                .and_then(Value::as_str)
+                .and_then(|g| id_by_guid(conn, "users", g));
+            let _ = conn.execute(
+                "INSERT INTO organization_nodes(guid,workspace_id,parent_id,kind,name,tab_label,responsible_user_id,display_order,color,icon,archived,created_at,updated_at)
+                 VALUES(?1,?2,NULL,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)
+                 ON CONFLICT(guid) DO UPDATE SET kind=excluded.kind,name=excluded.name,tab_label=excluded.tab_label,responsible_user_id=excluded.responsible_user_id,display_order=excluded.display_order,color=excluded.color,icon=excluded.icon,archived=excluded.archived,updated_at=excluded.updated_at",
+                params![guid,ws,node.get("kind").and_then(Value::as_str).unwrap_or("section"),node.get("name").and_then(Value::as_str).unwrap_or("Раздел"),node.get("tabLabel").and_then(Value::as_str),responsible,node.get("displayOrder").and_then(Value::as_i64).unwrap_or(0),node.get("color").and_then(Value::as_str),node.get("icon").and_then(Value::as_str),node.get("archived").and_then(Value::as_bool).unwrap_or(false),node.get("createdAt").and_then(Value::as_str).unwrap_or(""),node.get("updatedAt").and_then(Value::as_str).unwrap_or("")],
+            );
+        }
+        for node in arr {
+            let guid = node.get("guid").and_then(Value::as_str).unwrap_or("");
+            let parent = node
+                .get("parentGuid")
+                .and_then(Value::as_str)
+                .and_then(|g| id_by_guid(conn, "organization_nodes", g));
+            let _ = conn.execute(
+                "UPDATE organization_nodes SET parent_id=?1 WHERE guid=?2",
+                params![parent, guid],
+            );
         }
     }
     if let Some(arr) = journal.get("items").and_then(|v| v.as_array()) {

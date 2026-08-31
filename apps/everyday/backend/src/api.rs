@@ -111,6 +111,7 @@ pub fn is_mutation(procedure: &str) -> bool {
             | "admin.workspaces.invites"
             | "admin.storages.list"
             | "admin.buildingSites.list"
+            | "admin.organizationNodes.list"
             | "admin.dictionaries.list"
     )
 }
@@ -440,6 +441,8 @@ fn required_admin_right(procedure: &str) -> Option<&'static str> {
         Some("manageStorages")
     } else if procedure.starts_with("admin.buildingSites.") {
         Some("manageSites")
+    } else if procedure.starts_with("admin.organizationNodes.") {
+        Some("manageWorkspaces")
     } else if procedure.starts_with("admin.dictionaries.") {
         Some("manageDictionaries")
     } else if procedure.starts_with("sync.") || procedure.starts_with("backup.") {
@@ -532,6 +535,8 @@ fn target_workspace(
         Some("storages")
     } else if procedure.starts_with("admin.buildingSites.") {
         Some("building_sites")
+    } else if procedure.starts_with("admin.organizationNodes.") {
+        Some("organization_nodes")
     } else {
         None
     };
@@ -835,6 +840,10 @@ fn dispatch_inner(
             )?;
             Ok(json!({"ok": true}))
         }
+        "admin.organizationNodes.list" => organization_nodes_list(conn, input),
+        "admin.organizationNodes.create" => organization_node_create(conn, input, user_id),
+        "admin.organizationNodes.update" => organization_node_update(conn, input, user_id),
+        "admin.organizationNodes.remove" => organization_node_remove(conn, input, user_id),
         "admin.dictionaries.list" => dict_list(conn, input),
         "admin.dictionaries.create" => dict_create(conn, input),
         "admin.dictionaries.update" => dict_update(conn, input),
@@ -3280,6 +3289,234 @@ fn site_update(conn: &Connection, input: &Value) -> ApiResult {
     Ok(json!({"id": id, "name": s(input,"name")}))
 }
 
+fn organization_node_json(conn: &Connection, id: i64) -> Option<Value> {
+    conn.query_row(
+        "SELECT id,guid,workspace_id,parent_id,kind,name,tab_label,responsible_user_id,display_order,color,icon,archived,created_at,updated_at
+         FROM organization_nodes WHERE id=?1",
+        [id],
+        |r| {
+            let responsible: Option<i64> = r.get(7)?;
+            Ok(json!({
+                "id": r.get::<_, i64>(0)?, "guid": r.get::<_, String>(1)?,
+                "workspaceId": r.get::<_, i64>(2)?, "parentId": r.get::<_, Option<i64>>(3)?,
+                "kind": r.get::<_, String>(4)?, "name": r.get::<_, String>(5)?,
+                "tabLabel": r.get::<_, Option<String>>(6)?, "responsibleUserId": responsible,
+                "displayOrder": r.get::<_, i64>(8)?, "color": r.get::<_, Option<String>>(9)?,
+                "icon": r.get::<_, Option<String>>(10)?, "archived": r.get::<_, i64>(11)? != 0,
+                "createdAt": r.get::<_, String>(12)?, "updatedAt": r.get::<_, String>(13)?,
+                "responsible": responsible.and_then(|uid| jsn::user_public(conn, uid)),
+            }))
+        },
+    ).optional().ok().flatten()
+}
+
+fn organization_nodes_list(conn: &Connection, input: &Value) -> ApiResult {
+    let ws = i64v(input, "workspaceId").unwrap_or_else(|| ws_fallback(conn));
+    let include_archived = input
+        .get("includeArchived")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let mut stmt = conn.prepare(
+        "SELECT id FROM organization_nodes WHERE workspace_id=?1 AND (?2=1 OR archived=0)
+         ORDER BY COALESCE(parent_id,0),display_order,id",
+    )?;
+    let ids: Vec<i64> = stmt
+        .query_map(params![ws, include_archived], |r| r.get(0))?
+        .filter_map(Result::ok)
+        .collect();
+    Ok(Value::Array(
+        ids.into_iter()
+            .filter_map(|id| organization_node_json(conn, id))
+            .collect(),
+    ))
+}
+
+fn validate_node_text(value: &str, field: &str, max: usize) -> Result<(), ApiError> {
+    let len = value.trim().chars().count();
+    if len == 0 || len > max {
+        return Err(ApiError::bad(format!(
+            "{field}: требуется от 1 до {max} символов"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_node_parent(
+    conn: &Connection,
+    ws: i64,
+    id: Option<i64>,
+    parent: Option<i64>,
+) -> Result<(), ApiError> {
+    let Some(parent) = parent else { return Ok(()) };
+    if id == Some(parent) {
+        return Err(ApiError::bad("Раздел не может быть родителем самого себя"));
+    }
+    let parent_ws: Option<i64> = conn
+        .query_row(
+            "SELECT workspace_id FROM organization_nodes WHERE id=?1 AND archived=0",
+            [parent],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if parent_ws != Some(ws) {
+        return Err(ApiError::bad(
+            "Родительский раздел не найден в этой организации",
+        ));
+    }
+    if let Some(id) = id {
+        let cycle: i64 = conn.query_row(
+            "WITH RECURSIVE descendants(id) AS (
+               SELECT id FROM organization_nodes WHERE parent_id=?1
+               UNION ALL SELECT n.id FROM organization_nodes n JOIN descendants d ON n.parent_id=d.id
+             ) SELECT COUNT(*) FROM descendants WHERE id=?2",
+            params![id, parent], |r| r.get(0),
+        )?;
+        if cycle != 0 {
+            return Err(ApiError::bad(
+                "Нельзя переместить раздел внутрь его дочернего раздела",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn organization_node_create(conn: &mut Connection, input: &Value, actor: Option<i64>) -> ApiResult {
+    atomic(conn, |conn| {
+        organization_node_create_atomic(conn, input, actor)
+    })
+}
+
+fn organization_node_create_atomic(
+    conn: &Connection,
+    input: &Value,
+    actor: Option<i64>,
+) -> ApiResult {
+    let uid = require_user(conn, actor)?;
+    let ws = i64v(input, "workspaceId").unwrap_or_else(|| ws_fallback(conn));
+    let name = s(input, "name").ok_or_else(|| ApiError::bad("name"))?;
+    let kind = s(input, "kind").unwrap_or_else(|| "section".into());
+    validate_node_text(&name, "Название", 120)?;
+    validate_node_text(&kind, "Тип", 40)?;
+    let parent = i64v(input, "parentId");
+    validate_node_parent(conn, ws, None, parent)?;
+    let timestamp = now();
+    conn.execute(
+        "INSERT INTO organization_nodes(guid,workspace_id,parent_id,kind,name,tab_label,responsible_user_id,display_order,color,icon,created_at,updated_at)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?11)",
+        params![uuid::Uuid::new_v4().to_string(),ws,parent,kind,name,s(input,"tabLabel"),i64v(input,"responsibleUserId"),i64v(input,"displayOrder").unwrap_or(0),s(input,"color"),s(input,"icon"),timestamp],
+    )?;
+    let id = conn.last_insert_rowid();
+    ledger::append(
+        conn,
+        ws,
+        uid,
+        None,
+        "organization_node_create",
+        None,
+        Some(&name),
+        None,
+        Some(&format!("Создан раздел типа {kind}")),
+    )
+    .map_err(|e| ApiError::internal(format!("Ошибка журнала: {e}")))?;
+    organization_node_json(conn, id).ok_or_else(|| ApiError::internal("Раздел не создан"))
+}
+
+fn organization_node_update(conn: &mut Connection, input: &Value, actor: Option<i64>) -> ApiResult {
+    atomic(conn, |conn| {
+        organization_node_update_atomic(conn, input, actor)
+    })
+}
+
+fn organization_node_update_atomic(
+    conn: &Connection,
+    input: &Value,
+    actor: Option<i64>,
+) -> ApiResult {
+    let uid = require_user(conn, actor)?;
+    let id = i64v(input, "id").ok_or_else(|| ApiError::bad("id"))?;
+    let old =
+        organization_node_json(conn, id).ok_or_else(|| ApiError::not_found("Раздел не найден"))?;
+    let ws = old["workspaceId"].as_i64().unwrap_or(0);
+    if let Some(name) = s(input, "name") {
+        validate_node_text(&name, "Название", 120)?;
+    }
+    if let Some(kind) = s(input, "kind") {
+        validate_node_text(&kind, "Тип", 40)?;
+    }
+    let parent = if input.get("parentId").is_some() {
+        i64v(input, "parentId")
+    } else {
+        old["parentId"].as_i64()
+    };
+    validate_node_parent(conn, ws, Some(id), parent)?;
+    conn.execute(
+        "UPDATE organization_nodes SET parent_id=?2,name=COALESCE(?3,name),kind=COALESCE(?4,kind),tab_label=CASE WHEN ?5 THEN ?6 ELSE tab_label END,responsible_user_id=CASE WHEN ?7 THEN ?8 ELSE responsible_user_id END,display_order=COALESCE(?9,display_order),color=CASE WHEN ?10 THEN ?11 ELSE color END,icon=CASE WHEN ?12 THEN ?13 ELSE icon END,archived=COALESCE(?14,archived),updated_at=?15 WHERE id=?1",
+        params![id,parent,s(input,"name"),s(input,"kind"),input.get("tabLabel").is_some(),s(input,"tabLabel"),input.get("responsibleUserId").is_some(),i64v(input,"responsibleUserId"),i64v(input,"displayOrder"),input.get("color").is_some(),s(input,"color"),input.get("icon").is_some(),s(input,"icon"),input.get("archived").and_then(Value::as_bool).map(i64::from),now()],
+    )?;
+    let updated =
+        organization_node_json(conn, id).ok_or_else(|| ApiError::not_found("Раздел не найден"))?;
+    ledger::append(
+        conn,
+        ws,
+        uid,
+        None,
+        "organization_node_update",
+        old["name"].as_str(),
+        updated["name"].as_str(),
+        None,
+        Some(&format!(
+            "Изменена структура: {}",
+            updated["name"].as_str().unwrap_or("раздел")
+        )),
+    )
+    .map_err(|e| ApiError::internal(format!("Ошибка журнала: {e}")))?;
+    Ok(updated)
+}
+
+fn organization_node_remove(conn: &mut Connection, input: &Value, actor: Option<i64>) -> ApiResult {
+    atomic(conn, |conn| {
+        organization_node_remove_atomic(conn, input, actor)
+    })
+}
+
+fn organization_node_remove_atomic(
+    conn: &Connection,
+    input: &Value,
+    actor: Option<i64>,
+) -> ApiResult {
+    let uid = require_user(conn, actor)?;
+    let id = i64v(input, "id").ok_or_else(|| ApiError::bad("id"))?;
+    let node =
+        organization_node_json(conn, id).ok_or_else(|| ApiError::not_found("Раздел не найден"))?;
+    let occupied: i64 = conn.query_row(
+        "SELECT (SELECT COUNT(*) FROM organization_nodes WHERE parent_id=?1 AND archived=0) + (SELECT COUNT(*) FROM items WHERE organization_node_id=?1)",
+        [id], |r| r.get(0),
+    )?;
+    if occupied != 0 {
+        return Err(ApiError::conflict(
+            "Сначала перенесите дочерние разделы и оборудование",
+        ));
+    }
+    conn.execute(
+        "UPDATE organization_nodes SET archived=1,updated_at=?2 WHERE id=?1",
+        params![id, now()],
+    )?;
+    let ws = node["workspaceId"].as_i64().unwrap_or(0);
+    ledger::append(
+        conn,
+        ws,
+        uid,
+        None,
+        "organization_node_archive",
+        node["name"].as_str(),
+        None,
+        None,
+        Some("Раздел архивирован"),
+    )
+    .map_err(|e| ApiError::internal(format!("Ошибка журнала: {e}")))?;
+    Ok(json!({"ok":true,"archived":true,"id":id}))
+}
+
 fn dict_table(kind: &str) -> Result<&'static str, ApiError> {
     match kind {
         "categories" => Ok("categories"),
@@ -4992,6 +5229,103 @@ mod tests {
         // Миниатюры нет — подставляется оригинал, карточка не остаётся пустой.
         assert_eq!(photo["thumbUrl"].as_str(), Some(url));
         assert!(photo["sha256"].as_str().is_some());
+        cleanup(conn, path);
+    }
+
+    #[test]
+    fn organization_tree_supports_arbitrary_depth_and_rejects_cycles() {
+        let (mut conn, path, users, ws) = test_db();
+        let division = dispatch(
+            &mut conn,
+            "admin.organizationNodes.create",
+            &json!({"workspaceId":ws,"kind":"division","name":"Производство","tabLabel":"Цеха"}),
+            Some(users[0]),
+        )
+        .unwrap();
+        let warehouse = dispatch(
+            &mut conn,
+            "admin.organizationNodes.create",
+            &json!({"workspaceId":ws,"parentId":division["id"],"kind":"warehouse","name":"Склад №1"}),
+            Some(users[0]),
+        ).unwrap();
+        let cabinet = dispatch(
+            &mut conn,
+            "admin.organizationNodes.create",
+            &json!({"workspaceId":ws,"parentId":warehouse["id"],"kind":"cabinet","name":"Кабинет 204"}),
+            Some(users[0]),
+        ).unwrap();
+
+        let nodes = dispatch(
+            &mut conn,
+            "admin.organizationNodes.list",
+            &json!({"workspaceId":ws}),
+            Some(users[0]),
+        )
+        .unwrap();
+        assert_eq!(nodes.as_array().unwrap().len(), 3);
+        assert_eq!(cabinet["parentId"], warehouse["id"]);
+        assert_eq!(division["tabLabel"], "Цеха");
+
+        let error = dispatch(
+            &mut conn,
+            "admin.organizationNodes.update",
+            &json!({"id":division["id"],"parentId":cabinet["id"]}),
+            Some(users[0]),
+        )
+        .unwrap_err();
+        assert_eq!(error.http, 400);
+        assert!(error.message.contains("дочернего"));
+        cleanup(conn, path);
+    }
+
+    #[test]
+    fn occupied_organization_node_cannot_be_archived() {
+        let (mut conn, path, users, ws) = test_db();
+        let parent = dispatch(
+            &mut conn,
+            "admin.organizationNodes.create",
+            &json!({"workspaceId":ws,"kind":"site","name":"Объект"}),
+            Some(users[0]),
+        )
+        .unwrap();
+        let child = dispatch(
+            &mut conn,
+            "admin.organizationNodes.create",
+            &json!({"workspaceId":ws,"parentId":parent["id"],"kind":"room","name":"Комната"}),
+            Some(users[0]),
+        )
+        .unwrap();
+        let error = dispatch(
+            &mut conn,
+            "admin.organizationNodes.remove",
+            &json!({"id":parent["id"]}),
+            Some(users[0]),
+        )
+        .unwrap_err();
+        assert_eq!(error.http, 409);
+
+        dispatch(
+            &mut conn,
+            "admin.organizationNodes.remove",
+            &json!({"id":child["id"]}),
+            Some(users[0]),
+        )
+        .unwrap();
+        dispatch(
+            &mut conn,
+            "admin.organizationNodes.remove",
+            &json!({"id":parent["id"]}),
+            Some(users[0]),
+        )
+        .unwrap();
+        let visible = dispatch(
+            &mut conn,
+            "admin.organizationNodes.list",
+            &json!({"workspaceId":ws}),
+            Some(users[0]),
+        )
+        .unwrap();
+        assert!(visible.as_array().unwrap().is_empty());
         cleanup(conn, path);
     }
 }
