@@ -88,7 +88,8 @@ pub fn hello(conn: &Connection) -> Value {
         "name": name,
         "protocol": "meshkeeper-sync/3",
         "ledger": "signed-account-chains",
-        "features": ["signed-snapshot", "account-frontier", "full-fallback"]
+        "features": ["signed-snapshot", "account-frontier", "full-fallback", "node-key-approval"],
+        "nodePublicKey": ledger::node_public_key(conn).ok()
     })
 }
 
@@ -1246,6 +1247,9 @@ pub fn apply_remote_journal(conn: &Connection, journal: &Value, peer_url: &str) 
     if let Err(error) = ledger::verify_journal(journal) {
         return json!({"ok":false,"error":format!("Криптографическая проверка снимка: {error}")});
     }
+    if let Err(error) = enforce_node_trust(conn, journal, peer_url) {
+        return json!({"ok":false,"error":format!("Ключ mesh-ноды не разрешён: {error}")});
+    }
     if let Err(error) = conn.execute_batch("SAVEPOINT verified_sync") {
         return json!({"ok":false,"error":error.to_string()});
     }
@@ -1288,6 +1292,91 @@ pub fn apply_remote_journal(conn: &Connection, journal: &Value, peer_url: &str) 
         );
     }
     result
+}
+
+fn enforce_node_trust(conn: &Connection, journal: &Value, peer_url: &str) -> anyhow::Result<()> {
+    enforce_node_trust_mode(
+        conn,
+        journal,
+        peer_url,
+        std::env::var("MESHKEEPER_STRICT_NODE_TRUST").as_deref() == Ok("1"),
+    )
+}
+
+fn enforce_node_trust_mode(
+    conn: &Connection,
+    journal: &Value,
+    peer_url: &str,
+    strict: bool,
+) -> anyhow::Result<()> {
+    if !strict {
+        return Ok(());
+    }
+    let key = journal
+        .get("journalPublicKey")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("нет публичного ключа"))?;
+    if conn
+        .query_row(
+            "SELECT 1 FROM trusted_node_keys WHERE public_key=?1",
+            [key],
+            |_| Ok(()),
+        )
+        .is_ok()
+    {
+        return Ok(());
+    }
+    let workspaces: i64 = conn
+        .query_row("SELECT count(*) FROM workspaces", [], |r| r.get(0))
+        .unwrap_or(0);
+    if workspaces == 0 {
+        conn.execute("INSERT OR IGNORE INTO trusted_node_keys(public_key,label,source,created_at) VALUES(?1,?2,'bootstrap',?3)",params![key,journal.get("nodeName").and_then(Value::as_str),chrono::Utc::now().to_rfc3339()])?;
+        return Ok(());
+    }
+    let now = chrono::Utc::now().to_rfc3339();
+    conn.execute("INSERT INTO pending_node_keys(public_key,peer_url,node_name,first_seen,last_seen) VALUES(?1,?2,?3,?4,?4) ON CONFLICT(public_key) DO UPDATE SET peer_url=excluded.peer_url,node_name=excluded.node_name,last_seen=excluded.last_seen",params![key,peer_url,journal.get("nodeName").and_then(Value::as_str),now])?;
+    anyhow::bail!(
+        "требуется одобрение владельца: {}",
+        &key[..key.len().min(16)]
+    )
+}
+
+pub fn node_keys(conn: &Connection) -> Value {
+    let mut trusted = Vec::new();
+    if let Ok(mut s)=conn.prepare("SELECT public_key,label,approved_by,source,created_at FROM trusted_node_keys ORDER BY created_at") {if let Ok(rows)=s.query_map([],|r|Ok(json!({"publicKey":r.get::<_,String>(0)?,"label":r.get::<_,Option<String>>(1)?,"approvedBy":r.get::<_,Option<i64>>(2)?,"source":r.get::<_,String>(3)?,"createdAt":r.get::<_,String>(4)?}))){trusted.extend(rows.flatten())}}
+    let mut pending = Vec::new();
+    if let Ok(mut s)=conn.prepare("SELECT public_key,peer_url,node_name,first_seen,last_seen FROM pending_node_keys ORDER BY last_seen DESC") {if let Ok(rows)=s.query_map([],|r|Ok(json!({"publicKey":r.get::<_,String>(0)?,"peerUrl":r.get::<_,Option<String>>(1)?,"nodeName":r.get::<_,Option<String>>(2)?,"firstSeen":r.get::<_,String>(3)?,"lastSeen":r.get::<_,String>(4)?}))){pending.extend(rows.flatten())}}
+    json!({"strict":std::env::var("MESHKEEPER_STRICT_NODE_TRUST").as_deref()==Ok("1"),"trusted":trusted,"pending":pending})
+}
+
+pub fn approve_node_key(
+    conn: &Connection,
+    key: &str,
+    label: Option<&str>,
+    actor: i64,
+) -> anyhow::Result<()> {
+    let pending: i64 = conn.query_row(
+        "SELECT count(*) FROM pending_node_keys WHERE public_key=?1",
+        [key],
+        |r| r.get(0),
+    )?;
+    if pending != 1 {
+        anyhow::bail!("ключ отсутствует в ожидающих")
+    }
+    conn.execute("INSERT INTO trusted_node_keys(public_key,label,approved_by,source,created_at) VALUES(?1,?2,?3,'approved',?4) ON CONFLICT(public_key) DO NOTHING",params![key,label,actor,chrono::Utc::now().to_rfc3339()])?;
+    conn.execute("DELETE FROM pending_node_keys WHERE public_key=?1", [key])?;
+    Ok(())
+}
+
+pub fn revoke_node_key(conn: &Connection, key: &str) -> anyhow::Result<()> {
+    let changed = conn.execute(
+        "DELETE FROM trusted_node_keys WHERE public_key=?1 AND source!='local'",
+        [key],
+    )?;
+    if changed != 1 {
+        anyhow::bail!("локальный или неизвестный ключ нельзя отозвать")
+    }
+    Ok(())
 }
 
 pub fn encrypt_backup(password: &str, plain: &str) -> anyhow::Result<Value> {
@@ -1552,6 +1641,38 @@ pub fn touch_peer_error(conn: &Connection, url: &str, err: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strict_node_trust_requires_explicit_approval_after_bootstrap() {
+        let source_path =
+            std::env::temp_dir().join(format!("trust-source-{}.db", uuid::Uuid::new_v4()));
+        let target_path =
+            std::env::temp_dir().join(format!("trust-target-{}.db", uuid::Uuid::new_v4()));
+        let bootstrap_path =
+            std::env::temp_dir().join(format!("trust-bootstrap-{}.db", uuid::Uuid::new_v4()));
+        let source = crate::db::open(&source_path).unwrap();
+        let target = crate::db::open(&target_path).unwrap();
+        let bootstrap = crate::db::open(&bootstrap_path).unwrap();
+        target.execute("INSERT INTO workspaces(name,internal_id_prefix,created_at,guid) VALUES('Established','E-',?1,?2)",params![chrono::Utc::now().to_rfc3339(),uuid::Uuid::new_v4().to_string()]).unwrap();
+        let journal = export_journal(&source);
+        let key = journal["journalPublicKey"].as_str().unwrap();
+        assert!(
+            enforce_node_trust_mode(&target, &journal, "https://new-node.invalid", true).is_err()
+        );
+        assert_eq!(node_keys(&target)["pending"].as_array().unwrap().len(), 1);
+        approve_node_key(&target, key, Some("Телефон прораба"), 7).unwrap();
+        enforce_node_trust_mode(&target, &journal, "https://new-node.invalid", true).unwrap();
+        enforce_node_trust_mode(&bootstrap, &journal, "https://first-node.invalid", true).unwrap();
+        assert!(node_keys(&bootstrap)["trusted"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["publicKey"] == key));
+        drop((source, target, bootstrap));
+        for path in [source_path, target_path, bootstrap_path] {
+            let _ = std::fs::remove_file(path);
+        }
+    }
 
     #[test]
     fn frontier_returns_only_descendants_and_falls_back_for_unknown_heads() {

@@ -90,6 +90,10 @@ fn signing_key(conn: &Connection) -> anyhow::Result<SigningKey> {
     Ok(key)
 }
 
+pub fn node_public_key(conn: &Connection) -> anyhow::Result<String> {
+    Ok(STANDARD_NO_PAD.encode(signing_key(conn)?.verifying_key().to_bytes()))
+}
+
 fn guid(conn: &Connection, table: &str, id: i64) -> anyhow::Result<String> {
     let sql = format!("SELECT guid FROM {table} WHERE id=?1");
     if let Some(value) = conn

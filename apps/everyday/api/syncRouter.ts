@@ -31,6 +31,8 @@ export const syncRouter = createRouter({
     database: "ok",
     ledgerVerified: 0,
     chatVerified: 0,
+    accountingVerified: true,
+    accountingError: null as string | null,
     ledgerError: null as string | null,
     chatError: null as string | null,
     snapshotError: null as string | null,
@@ -39,8 +41,9 @@ export const syncRouter = createRouter({
     orphanHistory: 0,
     missingGuids: 0,
     missingBlobs: 0,
+    missingReferencedBlobs: 0,
     pendingDownloads: 0,
-    counts: { workspaces: 0, users: 0, items: 0, history: 0, messages: 0, organizationNodes: 0, blobs: 0 },
+    counts: { workspaces: 0, users: 0, items: 0, history: 0, messages: 0, organizationNodes: 0, blobs: 0, accountingTransactions: 0, accountingLines: 0 },
     ledgerHeads: [] as Array<{ workspaceGuid: string; publicKey: string; head: string; createdAt: string }>,
   })),
   peers: publicQuery.query(async () => [] as Array<{
@@ -52,6 +55,13 @@ export const syncRouter = createRouter({
     lastSync: string | null;
     lastError: string | null;
   }>),
+  nodeKeys: publicQuery.query(async () => ({
+    strict: false,
+    trusted: [] as Array<{ publicKey: string; label: string | null; approvedBy: number | null; source: string; createdAt: string }>,
+    pending: [] as Array<{ publicKey: string; peerUrl: string | null; nodeName: string | null; firstSeen: string; lastSeen: string }>,
+  })),
+  approveNodeKey: publicQuery.input(z.object({ publicKey: z.string().min(32), label: z.string().max(100).optional() })).mutation(async () => ({ strict: true, trusted: [], pending: [] })),
+  revokeNodeKey: publicQuery.input(z.object({ publicKey: z.string().min(32) })).mutation(async () => ({ strict: true, trusted: [], pending: [] })),
   addPeer: publicQuery
     .input(z.object({ url: z.string().min(4), name: z.string().optional() }))
     .mutation(async ({ input }) => ({ ok: true, url: input.url })),

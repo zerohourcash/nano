@@ -77,4 +77,6 @@ test('browser signs a real custody transaction and ledger retains its proof', as
   ).toBeVisible({ timeout: 10_000 })
   await expect(page.getByText(/Проверено подписей:/)).toBeVisible()
   await expect(page.getByText(/Snapshot:/)).toContainText(/[a-f0-9]{64}/)
+  await expect(page.getByRole('heading', { name: 'Ключи mesh-нод' })).toBeVisible()
+  await expect(page.getByRole('heading', { name: 'Этот узел' })).toBeVisible()
 })

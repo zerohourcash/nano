@@ -157,6 +157,19 @@ fn migrate(conn: &Connection) -> Result<()> {
          );",
     )?;
     conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS trusted_node_keys(
+           public_key TEXT PRIMARY KEY, label TEXT, approved_by INTEGER,
+           source TEXT NOT NULL, created_at TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS pending_node_keys(
+           public_key TEXT PRIMARY KEY, peer_url TEXT, node_name TEXT,
+           first_seen TEXT NOT NULL, last_seen TEXT NOT NULL
+         );",
+    )?;
+    if let Ok(public_key) = ledger::node_public_key(conn) {
+        conn.execute("INSERT OR IGNORE INTO trusted_node_keys(public_key,label,source,created_at) VALUES(?1,'Этот узел','local',?2)",params![public_key,chrono::Utc::now().to_rfc3339()])?;
+    }
+    conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS accounting_accounts(
            guid TEXT PRIMARY KEY, workspace_id INTEGER NOT NULL, owner_user_id INTEGER,
            code TEXT NOT NULL, name TEXT NOT NULL, kind TEXT NOT NULL, currency TEXT NOT NULL,

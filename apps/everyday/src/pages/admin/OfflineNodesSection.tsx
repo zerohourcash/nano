@@ -17,6 +17,7 @@ export default function OfflineNodesSection() {
   const statusQ = trpc.sync.status.useQuery(undefined, { refetchInterval: 8000 })
   const auditQ = trpc.sync.audit.useQuery(undefined, { refetchInterval: 30000 })
   const conflictsQ = trpc.sync.conflicts.useQuery(undefined, { refetchInterval: 8000 })
+  const keysQ = trpc.sync.nodeKeys.useQuery(undefined, { refetchInterval: 8000 })
   const [peerUrl, setPeerUrl] = useState('')
   const [password, setPassword] = useState('')
   const addPeer = trpc.sync.addPeer.useMutation({
@@ -47,6 +48,14 @@ export default function OfflineNodesSection() {
       utils.items.list.invalidate()
       toast('Конфликт закрыт')
     },
+    onError: (e) => toast(e.message, 'error'),
+  })
+  const approveKey = trpc.sync.approveNodeKey.useMutation({
+    onSuccess: () => { utils.sync.nodeKeys.invalidate(); pull.mutate({}); toast('Ключ узла одобрен') },
+    onError: (e) => toast(e.message, 'error'),
+  })
+  const revokeKey = trpc.sync.revokeNodeKey.useMutation({
+    onSuccess: () => { utils.sync.nodeKeys.invalidate(); toast('Доверие к ключу отозвано') },
     onError: (e) => toast(e.message, 'error'),
   })
   const exp = trpc.backup.export.useMutation({
@@ -170,9 +179,9 @@ export default function OfflineNodesSection() {
               <div>CAS-файлов: <b>{auditQ.data?.counts.blobs ?? 0}</b></div>
               <div>Недокачанных файлов: <b>{auditQ.data?.missingBlobs ?? 0}</b></div>
             </div>
-            {(auditQ.data?.ledgerError || auditQ.data?.chatError || auditQ.data?.snapshotError) && (
+            {(auditQ.data?.ledgerError || auditQ.data?.chatError || auditQ.data?.accountingError || auditQ.data?.snapshotError) && (
               <p className="text-sm text-danger break-all">
-                {auditQ.data.ledgerError || auditQ.data.chatError || auditQ.data.snapshotError}
+                {auditQ.data.ledgerError || auditQ.data.chatError || auditQ.data.accountingError || auditQ.data.snapshotError}
               </p>
             )}
             <div className="flex items-center gap-2">
@@ -188,6 +197,19 @@ export default function OfflineNodesSection() {
             </p>
           </>
         )}
+      </section>
+
+      <section className={cardCls + ' p-5 space-y-3'}>
+        <div className="flex items-center gap-2"><ShieldCheck size={18} className="text-brand-600" /><h3 className="text-[17px] font-semibold text-ink-900">Ключи mesh-нод</h3></div>
+        <p className="text-sm text-ink-500">Строгий режим: <b>{keysQ.data?.strict ? 'включён' : 'выключен'}</b>. Новый ключ не получает доступ к летописи до одобрения владельцем.</p>
+        {(keysQ.data?.pending ?? []).map((key) => <div key={key.publicKey} className="rounded-xl border border-[#D8A928] p-3 text-sm space-y-2">
+          <p><b>{key.nodeName || 'Новая нода'}</b> · {key.peerUrl || 'адрес не объявлен'}</p><p className="font-mono-num break-all text-[11px]">{key.publicKey}</p>
+          <button className={btnPrimaryCls} onClick={() => approveKey.mutate({ publicKey: key.publicKey, label: key.nodeName || undefined })}>Одобрить ключ</button>
+        </div>)}
+        {(keysQ.data?.trusted ?? []).map((key) => <div key={key.publicKey} className="flex items-center justify-between gap-2 text-sm border-b border-brand-50 py-2">
+          <span className="min-w-0"><b>{key.label || key.source}</b><span className="block font-mono-num truncate text-[11px] text-ink-300">{key.publicKey}</span></span>
+          {key.source !== 'local' && <button className={btnSecondaryCls} onClick={() => revokeKey.mutate({ publicKey: key.publicKey })}>Отозвать</button>}
+        </div>)}
       </section>
 
       <section className={cardCls + ' p-5 space-y-3'}>

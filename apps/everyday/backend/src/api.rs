@@ -92,6 +92,7 @@ pub fn is_mutation(procedure: &str) -> bool {
             | "sync.audit"
             | "sync.peers"
             | "sync.conflicts"
+            | "sync.nodeKeys"
             | "bit.balance"
             | "bit.transactions"
             | "transfers.outgoing"
@@ -830,6 +831,19 @@ fn dispatch_inner(
         "sync.status" => Ok(crate::sync::status(conn)),
         "sync.audit" => Ok(crate::sync::integrity_audit(conn)),
         "sync.peers" => Ok(crate::sync::list_peers(conn)),
+        "sync.nodeKeys" => Ok(crate::sync::node_keys(conn)),
+        "sync.approveNodeKey" => {
+            let uid = require_user(conn, user_id)?;
+            let key = s(input, "publicKey").ok_or_else(|| ApiError::bad("publicKey"))?;
+            crate::sync::approve_node_key(conn, &key, s(input, "label").as_deref(), uid)
+                .map_err(|e| ApiError::bad(e.to_string()))?;
+            Ok(crate::sync::node_keys(conn))
+        }
+        "sync.revokeNodeKey" => {
+            let key = s(input, "publicKey").ok_or_else(|| ApiError::bad("publicKey"))?;
+            crate::sync::revoke_node_key(conn, &key).map_err(|e| ApiError::bad(e.to_string()))?;
+            Ok(crate::sync::node_keys(conn))
+        }
         "content.status" => Ok(crate::content::status(conn)),
         "content.setMode" => {
             let mode = s(input, "mode").ok_or_else(|| ApiError::bad("mode"))?;
