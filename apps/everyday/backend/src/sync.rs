@@ -1224,7 +1224,7 @@ pub fn add_peer(conn: &Connection, url: &str, name: Option<&str>, node_id: Optio
          ON CONFLICT(url) DO UPDATE SET name=COALESCE(excluded.name, peers.name), node_id=COALESCE(excluded.node_id, peers.node_id), last_seen=excluded.last_seen",
         params![url, name, node_id, chrono::Utc::now().to_rfc3339()],
     );
-    json!({"ok": true, "url": url})
+    json!({"ok": true, "url": url, "added": !exists})
 }
 
 pub fn list_conflicts(conn: &Connection) -> Value {

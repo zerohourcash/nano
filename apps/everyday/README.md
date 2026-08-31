@@ -160,6 +160,7 @@ revision DAG, явно показывают конфликт и детермин
 | --- | --- |
 | Принимающий/mesh-узел | `MESHKEEPER_SYNC_TOKEN` |
 | Узел с постоянным peer | `MESHKEEPER_SYNC_TOKEN` + `MESHKEEPER_UPSTREAM` |
+| Самоорганизующаяся offline LAN | предыдущие + `MESHKEEPER_DISCOVERY_BIND` |
 | Полностью изолированный | ничего |
 
 Каждый узел хранит собственную базу, принимает входящий обмен и обходит все
@@ -168,6 +169,12 @@ revision DAG, явно показывают конфликт и детермин
 остальных, а после восстановления изменения сходятся. `MESHKEEPER_UPSTREAM`
 остаётся удобным постоянным peer для облачного узла. Обмен закрыт общим токеном;
 без него `/sync/*` отвечает 401.
+
+Android-ноды автоматически объявляют sync endpoint через HMAC-SHA256 UDP
+broadcast и находят телефоны в той же Wi-Fi/hotspot сети без сервера и ручного
+ввода IP. Desktop включает discovery явно. Принимаются только свежие анонсы с
+общим mesh-токеном и private/link-local IP; найденный ключ ноды всё равно должен
+пройти независимый trust registry владельца.
 
 Когда прямого соединения нет, в панели «Офлайн-узлы» можно передать или принять
 `everyday-sync-bundle` через системное меню Bluetooth/Wi‑Fi Direct/AirDrop либо
@@ -219,6 +226,7 @@ npm run build        # сборка + проверка артефакта
 npm run smoke        # сквозные сценарии ТЗ через HTTP
 npm run sync:test    # связка «сервер + локальный узел»
 npm run mesh:test    # 3 узла, разрыв/восстановление и работа без первого узла
+npm run discovery:test # LAN discovery и отбрасывание анонса с чужим токеном
 npm run adversarial:test # повторы, replay, фальсификация и полное восстановление
 npm run scale:test   # 100 реальных процессов и отказ 10 узлов
 npm run test:e2e     # production-сборка + Chromium/Playwright

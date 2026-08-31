@@ -47,6 +47,23 @@ Transport закрыт bearer-токеном не короче 32 символо
 затем получает встречный delta. Старый полный snapshot не откатывает более новую
 историю.
 
+### Самоорганизация offline LAN
+
+При заданном `MESHKEEPER_DISCOVERY_BIND` узел каждые пять секунд отправляет UDP-
+анонс `everyday/lan-discovery/v1`. В нём находятся node ID, локальный sync URL,
+Unix-время, случайный nonce и HMAC-SHA256 общего transport token. Получатель:
+
+1. ограничивает datagram 2048 байтами и требует точную JSON-схему;
+2. проверяет HMAC в постоянное время, окно часов ±120 секунд и одноразовый nonce;
+3. отбрасывает собственный node ID;
+4. принимает только IP literal из private/link-local/loopback диапазона с портом;
+5. добавляет endpoint в ограниченный список peers и немедленно запускает sync.
+
+Обнаружение не обходит trust registry: новый Ed25519 key после соединения всё
+равно попадает в pending и требует одобрения владельца. Android использует UDP
+broadcast `255.255.255.255:8767`; desktop-узлы включают его явно. Это работает
+без Internet через одну Wi-Fi LAN или hotspot и не является BLE Mesh transport.
+
 ## Файл и системный Share
 
 `everyday-sync-bundle` версии 1 оборачивает полный подписанный journal:
@@ -104,7 +121,8 @@ CRC/MTU-фрагментация допустимы как защита кана
 
 - Windows, Linux и macOS: один Rust-бинарник с локальной SQLite и PWA.
 - Android: foreground service через JNI запускает тот же Rust/SQLite узел;
-  WebView работает с loopback UI, а отдельный LAN listener публикует только sync.
+  WebView работает с loopback UI, отдельный LAN listener публикует только sync,
+  а HMAC UDP broadcast автоматически находит соседние телефоны в offline LAN.
 - Обмен телефонов без IP: уже возможен вручную через системный файловый Share.
 - iOS-оболочка и потоковый BLE Mesh adapter ещё не реализованы; документация не
   должна заявлять обратное. Android ABI/APK проверяются отдельным CI job.

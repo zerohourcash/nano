@@ -25,6 +25,7 @@ required = {
     "service decrypts token": "SecretStore.loadSyncToken(this)" in service,
     "service seals node key": "SecretStore.saveNodeSigningKey(this" in service,
     "Rust receives sealed node key": "MESHKEEPER_NODE_SIGNING_KEY" in lib,
+    "authenticated LAN discovery": "MESHKEEPER_DISCOVERY_BIND" in lib and "discovery::run" in lib,
     "token absent from service Intent": "EXTRA_TOKEN" not in service and "EXTRA_TOKEN" not in activity,
     "token not restored into UI": "syncToken.setText(SecretStore.loadSyncToken" not in activity,
 }

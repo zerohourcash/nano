@@ -23,6 +23,7 @@
     "smoke": "npm run node:test:build && python3 scripts/smoke_runner.py",
     "sync:test": "npm run node:test:build && python3 scripts/sync_test.py",
     "mesh:test": "npm run node:test:build && python3 scripts/mesh_test.py",
+    "discovery:test": "npm run node:test:build && python3 scripts/discovery_test.py",
     "adversarial:test": "npm run node:test:build && python3 scripts/adversarial_sync_test.py",
     "scale:test": "npm run node:test:build && python3 scripts/scale_test.py",
     "import:facekit": "node scripts/import-facekit-snapshot.mjs",

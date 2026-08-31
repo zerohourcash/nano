@@ -4,6 +4,7 @@ mod auth;
 mod content;
 mod db;
 mod device;
+mod discovery;
 mod json;
 mod knowledge;
 mod ledger;
@@ -845,7 +846,15 @@ pub async fn run() -> anyhow::Result<()> {
     }
     match (upstream, sync_token()) {
         (upstream, Some(token)) => {
-            tokio::spawn(peer_loop(state.clone(), upstream, token));
+            tokio::spawn(peer_loop(state.clone(), upstream, token.clone()));
+            if let Ok(bind) = std::env::var("MESHKEEPER_DISCOVERY_BIND") {
+                let bind = bind.trim().to_owned();
+                if !bind.is_empty() {
+                    let target = std::env::var("MESHKEEPER_DISCOVERY_TARGET")
+                        .unwrap_or_else(|_| "255.255.255.255:8767".into());
+                    tokio::spawn(discovery::run(state.clone(), token, bind, target));
+                }
+            }
             eprintln!("Режим mesh: принимаю и инициирую обмен через /sync/journal");
         }
         (Some(_), None) => {
@@ -952,6 +961,8 @@ mod android_jni {
             std::env::set_var("MESHKEEPER_SYNC_BIND", "0.0.0.0:8766");
             std::env::set_var("MESHKEEPER_ALLOW_INSECURE_SYNC", "1");
             std::env::set_var("MESHKEEPER_CONTENT_MODE", "smart");
+            std::env::set_var("MESHKEEPER_DISCOVERY_BIND", "0.0.0.0:8767");
+            std::env::set_var("MESHKEEPER_DISCOVERY_TARGET", "255.255.255.255:8767");
             if upstream.is_empty() {
                 std::env::remove_var("MESHKEEPER_UPSTREAM");
             } else {
