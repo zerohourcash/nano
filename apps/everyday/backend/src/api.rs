@@ -4706,6 +4706,44 @@ fn notify_admins(conn: &Connection, ws: i64, item_id: i64, title: &str, text: &s
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn fault_payload_hash(
+    fault_guid: &str,
+    parent_hash: Option<&str>,
+    depth: i64,
+    workspace_guid: &str,
+    item_guid: &str,
+    reporter_guid: &str,
+    actor_guid: &str,
+    severity: &str,
+    description: &str,
+    photo_url: Option<&str>,
+    status: &str,
+    resolution: Option<&str>,
+    created_at: &str,
+) -> String {
+    let payload = json!({
+        "domain":"everyday/fault-record/v1","faultGuid":fault_guid,"parentHash":parent_hash,
+        "depth":depth,"workspaceGuid":workspace_guid,"itemGuid":item_guid,
+        "reporterGuid":reporter_guid,"actorGuid":actor_guid,"severity":severity,
+        "description":description,"photoUrl":photo_url,"status":status,
+        "resolution":resolution,"createdAt":created_at,
+    });
+    format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&payload).expect("JSON serialization"))
+    )
+}
+
+fn fault_record_hash(payload_hash: &str, ledger_hash: &str) -> String {
+    format!(
+        "{:x}",
+        Sha256::digest(
+            format!("everyday/fault-record-ledger/v1\n{payload_hash}\n{ledger_hash}").as_bytes()
+        )
+    )
+}
+
 fn report_fault(conn: &mut Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
     atomic(conn, |conn| report_fault_atomic(conn, input, user_id))
 }
@@ -4716,14 +4754,69 @@ fn report_fault_atomic(conn: &Connection, input: &Value, user_id: Option<i64>) -
     let ws = require_item_access(conn, uid, item_id)?;
     require_can_in_workspace(conn, uid, ws, "reportFaults")?;
     let desc = s(input, "description").ok_or_else(|| ApiError::bad("Опишите неисправность"))?;
+    if desc.chars().count() > 8_000 {
+        return Err(ApiError::bad("Описание длиннее 8000 символов"));
+    }
     let item = jsn::item_json(conn, item_id, false)
         .ok_or_else(|| ApiError::not_found("Инструмент не найден"))?;
     let severity = s(input, "severity").unwrap_or_else(|| "medium".into());
+    if !matches!(severity.as_str(), "low" | "medium" | "high") {
+        return Err(ApiError::bad("Некорректная важность"));
+    }
+    let source_photo = s(input, "photoUrl");
+    let photo = source_photo
+        .as_deref()
+        .map(|value| crate::content::ingest_data_url(conn, value))
+        .transpose()
+        .map_err(|error| ApiError::bad(format!("Некорректное фото: {error}")))?
+        .flatten()
+        .or(source_photo);
+    let fault_guid = Uuid::new_v4().to_string();
+    let created_at = now();
+    let workspace_guid =
+        ledger::guid(conn, "workspaces", ws).map_err(|e| ApiError::internal(e.to_string()))?;
+    let item_guid =
+        ledger::guid(conn, "items", item_id).map_err(|e| ApiError::internal(e.to_string()))?;
+    let actor_guid =
+        ledger::guid(conn, "users", uid).map_err(|e| ApiError::internal(e.to_string()))?;
+    let payload_hash = fault_payload_hash(
+        &fault_guid,
+        None,
+        0,
+        &workspace_guid,
+        &item_guid,
+        &actor_guid,
+        &actor_guid,
+        &severity,
+        &desc,
+        photo.as_deref(),
+        "open",
+        None,
+        &created_at,
+    );
+    let event = ledger::append(
+        conn,
+        ws,
+        uid,
+        Some(item_id),
+        "fault_report",
+        Some(&fault_guid),
+        Some(&payload_hash),
+        None,
+        Some(&desc),
+    )
+    .map_err(|e| ApiError::internal(format!("Ошибка журнала: {e}")))?;
+    let ledger_hash = event["opId"]
+        .as_str()
+        .ok_or_else(|| ApiError::internal("Ledger не вернул hash"))?;
+    let record_hash = fault_record_hash(&payload_hash, ledger_hash);
     conn.execute(
-        "INSERT INTO faults (item_id, workspace_id, author_id, severity, description, photo_url, created_at) VALUES (?1,?2,?3,?4,?5,?6,?7)",
-        params![item_id, ws, uid, severity, desc, s(input, "photoUrl"), now()],
+        "INSERT INTO faults (item_id, workspace_id, author_id, severity, description, photo_url, created_at,guid) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+        params![item_id,ws,uid,severity,desc,photo,created_at,fault_guid],
     )?;
     let fid = conn.last_insert_rowid();
+    conn.execute("INSERT INTO fault_records(record_hash,fault_guid,parent_hash,depth,workspace_guid,item_guid,reporter_guid,actor_guid,severity,description,photo_url,status,resolution,payload_hash,ledger_hash,created_at)
+        VALUES(?1,?2,NULL,0,?3,?4,?5,?5,?6,?7,?8,'open',NULL,?9,?10,?11)",params![record_hash,fault_guid,workspace_guid,item_guid,actor_guid,severity,desc,photo,payload_hash,ledger_hash,created_at])?;
     // Сообщение о неисправности переводит предмет в «На проверке»: решение о
     // ремонте принимает администратор (ТЗ §4, «Неисправность и ремонт»).
     if let Ok(st) = conn.query_row(
@@ -4737,18 +4830,6 @@ fn report_fault_atomic(conn: &Connection, input: &Value, user_id: Option<i64>) -
         )?;
     }
     let title = item["title"].as_str().unwrap_or("");
-    ledger::append(
-        conn,
-        ws,
-        uid,
-        Some(item_id),
-        "update",
-        None,
-        Some("На проверке"),
-        None,
-        Some(&format!("Неисправность ({severity}): {desc}")),
-    )
-    .map_err(|e| ApiError::internal(format!("Ошибка журнала: {e}")))?;
     notify_admins(
         conn,
         ws,
@@ -4756,11 +4837,13 @@ fn report_fault_atomic(conn: &Connection, input: &Value, user_id: Option<i64>) -
         "Неисправность",
         &format!("{title}: {desc}"),
     );
-    Ok(json!({"id": fid, "itemId": item_id, "status": "open"}))
+    Ok(
+        json!({"id":fid,"guid":fault_guid,"recordHash":record_hash,"ledgerHash":ledger_hash,"itemId":item_id,"status":"open"}),
+    )
 }
 
 fn list_faults(conn: &Connection, input: &Value) -> ApiResult {
-    let mut sql = String::from("SELECT id, item_id, workspace_id, author_id, severity, description, photo_url, status, resolution, resolver_id, created_at, resolved_at FROM faults WHERE 1=1");
+    let mut sql = String::from("SELECT id,item_id,workspace_id,author_id,severity,description,photo_url,status,resolution,resolver_id,created_at,resolved_at,guid FROM faults WHERE 1=1");
     if let Some(id) = i64v(input, "itemId") {
         sql.push_str(&format!(" AND item_id={id}"));
     } else {
@@ -4777,6 +4860,7 @@ fn list_faults(conn: &Connection, input: &Value) -> ApiResult {
             "photoUrl": r.get::<_, Option<String>>(6)?, "status": r.get::<_, String>(7)?,
             "resolution": r.get::<_, Option<String>>(8)?, "resolverId": r.get::<_, Option<i64>>(9)?,
             "createdAt": r.get::<_, String>(10)?, "resolvedAt": r.get::<_, Option<String>>(11)?,
+            "guid":r.get::<_,Option<String>>(12)?,
             "author": jsn::user_public(conn, author)
         }))
     })?.filter_map(|x| x.ok()).collect();
@@ -4790,20 +4874,84 @@ fn resolve_fault(conn: &mut Connection, input: &Value, user_id: Option<i64>) -> 
 fn resolve_fault_atomic(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
     let uid = require_user(conn, user_id)?;
     let id = i64v(input, "id").ok_or_else(|| ApiError::bad("id"))?;
-    let (item_id, ws): (i64, i64) = conn
+    let (item_id,ws,stored_guid,severity,description,photo,reporter_id):(i64,i64,Option<String>,String,String,Option<String>,i64)=conn
         .query_row(
-            "SELECT item_id, workspace_id FROM faults WHERE id=?1",
+            "SELECT item_id,workspace_id,guid,severity,description,photo_url,author_id FROM faults WHERE id=?1",
             params![id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?)),
         )
         .optional()?
         .ok_or_else(|| ApiError::not_found("Неисправность не найдена"))?;
+    let fault_guid = stored_guid
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    conn.execute(
+        "UPDATE faults SET guid=?1 WHERE id=?2 AND (guid IS NULL OR guid='')",
+        params![fault_guid, id],
+    )?;
     require_member(conn, uid, ws)?;
     require_can_in_workspace(conn, uid, ws, "editItems")?;
     let status = s(input, "status").unwrap_or_else(|| "resolved".into());
+    if !matches!(status.as_str(), "open" | "repair" | "resolved") {
+        return Err(ApiError::bad("Некорректный статус неисправности"));
+    }
+    let resolution = s(input, "comment");
+    if resolution
+        .as_deref()
+        .is_some_and(|v| v.chars().count() > 8_000)
+    {
+        return Err(ApiError::bad("Решение длиннее 8000 символов"));
+    }
+    let parent:Option<(String,i64)>=conn.query_row("SELECT record_hash,depth FROM fault_records WHERE fault_guid=?1 ORDER BY depth DESC,record_hash DESC LIMIT 1",[&fault_guid],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+    let (parent_hash, depth, event_type) = match parent {
+        Some((hash, depth)) => (Some(hash), depth + 1, "fault_update"),
+        None => (None, 0, "fault_adopt"),
+    };
+    let created_at = now();
+    let workspace_guid =
+        ledger::guid(conn, "workspaces", ws).map_err(|e| ApiError::internal(e.to_string()))?;
+    let item_guid =
+        ledger::guid(conn, "items", item_id).map_err(|e| ApiError::internal(e.to_string()))?;
+    let reporter_guid =
+        ledger::guid(conn, "users", reporter_id).map_err(|e| ApiError::internal(e.to_string()))?;
+    let actor_guid =
+        ledger::guid(conn, "users", uid).map_err(|e| ApiError::internal(e.to_string()))?;
+    let payload_hash = fault_payload_hash(
+        &fault_guid,
+        parent_hash.as_deref(),
+        depth,
+        &workspace_guid,
+        &item_guid,
+        &reporter_guid,
+        &actor_guid,
+        &severity,
+        &description,
+        photo.as_deref(),
+        &status,
+        resolution.as_deref(),
+        &created_at,
+    );
+    let event = ledger::append(
+        conn,
+        ws,
+        uid,
+        Some(item_id),
+        event_type,
+        Some(&fault_guid),
+        Some(&payload_hash),
+        None,
+        resolution.as_deref().or(Some(&status)),
+    )
+    .map_err(|e| ApiError::internal(format!("Ошибка журнала: {e}")))?;
+    let ledger_hash = event["opId"]
+        .as_str()
+        .ok_or_else(|| ApiError::internal("Ledger не вернул hash"))?;
+    let record_hash = fault_record_hash(&payload_hash, ledger_hash);
+    conn.execute("INSERT INTO fault_records(record_hash,fault_guid,parent_hash,depth,workspace_guid,item_guid,reporter_guid,actor_guid,severity,description,photo_url,status,resolution,payload_hash,ledger_hash,created_at)
+        VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",params![record_hash,fault_guid,parent_hash,depth,workspace_guid,item_guid,reporter_guid,actor_guid,severity,description,photo,status,resolution,payload_hash,ledger_hash,created_at])?;
     conn.execute(
         "UPDATE faults SET status=?1, resolution=?2, resolver_id=?3, resolved_at=?4 WHERE id=?5",
-        params![status, s(input, "comment"), uid, now(), id],
+        params![status, resolution, uid, created_at, id],
     )?;
     let slug = if status == "repair" || status == "open" {
         "in-repair"
@@ -4820,23 +4968,9 @@ fn resolve_fault_atomic(conn: &Connection, input: &Value, user_id: Option<i64>) 
             params![st, item_id],
         )?;
     }
-    ledger::append(
-        conn,
-        ws,
-        uid,
-        Some(item_id),
-        "update",
-        None,
-        Some(&status),
-        None,
-        Some(
-            s(input, "comment")
-                .unwrap_or_else(|| format!("Решение по неисправности: {status}"))
-                .as_str(),
-        ),
+    Ok(
+        json!({"ok":true,"id":id,"guid":fault_guid,"recordHash":record_hash,"ledgerHash":ledger_hash,"status":status}),
     )
-    .map_err(|e| ApiError::internal(format!("Ошибка журнала: {e}")))?;
-    Ok(json!({"ok": true, "id": id, "status": status}))
 }
 
 fn request_change(conn: &mut Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
@@ -6094,6 +6228,27 @@ mod tests {
             )
             .unwrap();
         assert_eq!(journaled, 1);
+        cleanup(conn, path);
+    }
+
+    #[test]
+    fn resolving_legacy_fault_adopts_it_into_signed_record_model() {
+        let (mut conn, path, users, ws) = test_db();
+        seed_workspace_defaults(&conn, ws, users[0]).unwrap();
+        let item = insert_item(&conn, ws, None, false, None);
+        conn.execute("INSERT INTO faults(item_id,workspace_id,author_id,severity,description,created_at) VALUES(?1,?2,?3,'medium','Старая запись',?4)",params![item,ws,users[1],now()]).unwrap();
+        let id = conn.last_insert_rowid();
+        let result = dispatch(
+            &mut conn,
+            "items.resolveFault",
+            &json!({"id":id,"status":"resolved","comment":"Проверено после обновления"}),
+            Some(users[0]),
+        )
+        .unwrap();
+        assert!(result["guid"].as_str().is_some_and(|v| !v.is_empty()));
+        let (depth,event_type):(i64,String)=conn.query_row("SELECT r.depth,h.type FROM fault_records r JOIN history_entries h ON h.hash=r.ledger_hash WHERE r.fault_guid=?1",[result["guid"].as_str().unwrap()],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+        assert_eq!(depth, 0);
+        assert_eq!(event_type, "fault_adopt");
         cleanup(conn, path);
     }
 

@@ -89,6 +89,15 @@ capability, затем применяют только её scope. Неверн�
   `item_comment` Ledger V2 и обязательным device-proof. Импорт сначала проверяет
   эту связь и лишь затем доверие к snapshot-ключу; пересчёт snapshot и record
   hash после подмены текста не помогает атакующему.
+- Lifecycle неисправности использует `append-only-branches/v1`. Корневой
+  `fault_report` и каждый `fault_update` требуют отдельный Ed25519 device-proof;
+  запись коммитит parent, глубину, автора, ТМЦ, описание, важность, решение и
+  CAS-ссылку. Конкурирующие offline-решения сохраняются обе, materialized state
+  выбирается по `(depth, recordHash)`, поэтому порядок доставки не влияет на
+  результат. Подмена решения с пересчётом node snapshot отклоняется связью с
+  исходным Ledger payload hash.
+  Первая операция над legacy-неисправностью создаёт device-signed
+  `fault_adopt`; система не приписывает старым данным несуществовавшую подпись.
 - «Удаление» ТМЦ реализовано как delete-wins `itemTombstoneMode=monotonic/v1`.
   Tombstone коммитит GUID организации, карточки и автора, Ledger hash и время;
   связанное `item_archive` обязано иметь полный device-proof. Проверка проходит

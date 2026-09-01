@@ -463,6 +463,30 @@ fn migrate(conn: &Connection) -> Result<()> {
         "ALTER TABLE item_holdings ADD COLUMN sync_rebuilt INTEGER NOT NULL DEFAULT 0",
         [],
     );
+    let _ = conn.execute("ALTER TABLE faults ADD COLUMN guid TEXT", []);
+    conn.execute_batch(
+        "CREATE UNIQUE INDEX IF NOT EXISTS faults_guid_idx ON faults(guid) WHERE guid IS NOT NULL;
+         CREATE TABLE IF NOT EXISTS fault_records(
+           record_hash TEXT PRIMARY KEY,
+           fault_guid TEXT NOT NULL,
+           parent_hash TEXT,
+           depth INTEGER NOT NULL CHECK(depth >= 0),
+           workspace_guid TEXT NOT NULL,
+           item_guid TEXT NOT NULL,
+           reporter_guid TEXT NOT NULL,
+           actor_guid TEXT NOT NULL,
+           severity TEXT NOT NULL,
+           description TEXT NOT NULL,
+           photo_url TEXT,
+           status TEXT NOT NULL,
+           resolution TEXT,
+           payload_hash TEXT NOT NULL,
+           ledger_hash TEXT NOT NULL UNIQUE,
+           created_at TEXT NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS fault_record_fault_idx
+           ON fault_records(fault_guid,depth DESC,record_hash DESC);",
+    )?;
     let _ = conn.execute("ALTER TABLE chat_messages ADD COLUMN guid TEXT", []);
     let _ = conn.execute("ALTER TABLE chat_messages ADD COLUMN ledger_hash TEXT", []);
     conn.execute_batch(

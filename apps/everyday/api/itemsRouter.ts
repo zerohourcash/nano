@@ -246,6 +246,7 @@ export const itemsRouter = createRouter({
     .input(z.object({ itemId: z.number().int().positive().optional(), workspaceId: z.number().int().positive().optional() }).optional())
     .query(async () => [] as Array<{
       id: number;
+      guid: string | null;
       itemId: number;
       workspaceId: number;
       authorId: number;

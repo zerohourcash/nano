@@ -536,6 +536,19 @@ def main() -> int:
             },
         )
         check("ревизия локальной базы знаний подписана", bool(knowledge.get("savedRevisionHash")), str(knowledge)[:180])
+        fault = node.call(
+            "items.reportFault",
+            {"itemId": created["id"], "severity": "high", "description": "Офлайн: искрит выключатель"},
+        )
+        resolved_fault = node.call(
+            "items.resolveFault",
+            {"id": fault["id"], "status": "resolved", "comment": "Выключатель заменён локально"},
+        )
+        check(
+            "офлайн lifecycle неисправности связан с двумя Ledger-транзакциями",
+            bool(fault.get("recordHash")) and bool(resolved_fault.get("recordHash")),
+            str(resolved_fault)[:180],
+        )
         node.call("sync.pullNow", {})
         back = wait_for(lambda: "Шуруповёрт с узла" in titles(server, ws_id))
         check("предмет с узла доехал до сервера", back, str(titles(server, ws_id))[:160])
@@ -585,6 +598,19 @@ def main() -> int:
             "текст и CAS-вложение базы знаний дошли до сервера",
             wait_for(knowledge_arrived, timeout=30),
             str(synced_knowledge)[:220],
+        )
+        synced_faults = server.call("items.faults", {"workspaceId": ws_id}, mutation=False)
+        check(
+            "полная нода восстановила описание и решение офлайн-неисправности",
+            isinstance(synced_faults, list)
+            and any(
+                row.get("guid") == fault.get("guid")
+                and row.get("description") == "Офлайн: искрит выключатель"
+                and row.get("resolution") == "Выключатель заменён локально"
+                and row.get("status") == "resolved"
+                for row in synced_faults
+            ),
+            str(synced_faults)[:260],
         )
 
         print("\n== 6. Статус синхронизации ==")

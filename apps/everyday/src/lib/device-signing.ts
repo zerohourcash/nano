@@ -76,6 +76,8 @@ const CRITICAL = [
   'items.update',
   'items.remove',
   'items.addComment',
+  'items.reportFault',
+  'items.resolveFault',
   'transfers.take',
   'transfers.takeMany',
   'transfers.returnItem',

@@ -84,6 +84,41 @@ fn item_comment_record_hash(payload_hash: &str, ledger_hash: &str) -> String {
     )
 }
 
+fn fault_payload_hash(record: &Value) -> anyhow::Result<String> {
+    let text = |name: &str| {
+        record
+            .get(name)
+            .and_then(Value::as_str)
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("fault record has no {name}"))
+    };
+    let payload = json!({
+        "domain":"everyday/fault-record/v1","faultGuid":text("faultGuid")?,
+        "parentHash":record.get("parentHash").filter(|v|!v.is_null()).and_then(Value::as_str),
+        "depth":record.get("depth").and_then(Value::as_i64).ok_or_else(||anyhow::anyhow!("fault record has no depth"))?,
+        "workspaceGuid":text("workspaceGuid")?,"itemGuid":text("itemGuid")?,
+        "reporterGuid":text("reporterGuid")?,"actorGuid":text("actorGuid")?,
+        "severity":text("severity")?,"description":text("description")?,
+        "photoUrl":record.get("photoUrl").filter(|v|!v.is_null()).and_then(Value::as_str),
+        "status":text("status")?,
+        "resolution":record.get("resolution").filter(|v|!v.is_null()).and_then(Value::as_str),
+        "createdAt":text("createdAt")?,
+    });
+    Ok(format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&payload)?)
+    ))
+}
+
+fn fault_record_hash(payload_hash: &str, ledger_hash: &str) -> String {
+    format!(
+        "{:x}",
+        Sha256::digest(
+            format!("everyday/fault-record-ledger/v1\n{payload_hash}\n{ledger_hash}").as_bytes()
+        )
+    )
+}
+
 fn next_journal_sequence(conn: &Connection) -> u64 {
     let next = kv_get(conn, "sync_journal_sequence")
         .and_then(|value| value.parse::<u64>().ok())
@@ -797,6 +832,15 @@ pub fn export_journal_since(conn: &Connection, recipient_frontier: Option<&Value
             "createdAt":row.get::<_,String>(8)?,
         }))) { item_comments.extend(rows.flatten()); }
     }
+    let mut faults = Vec::new();
+    if let Ok(mut statement)=conn.prepare("SELECT record_hash,fault_guid,parent_hash,depth,workspace_guid,item_guid,reporter_guid,actor_guid,severity,description,photo_url,status,resolution,payload_hash,ledger_hash,created_at FROM fault_records ORDER BY fault_guid,depth,record_hash") {
+        if let Ok(rows)=statement.query_map([],|r|Ok(json!({
+            "recordHash":r.get::<_,String>(0)?,"faultGuid":r.get::<_,String>(1)?,"parentHash":r.get::<_,Option<String>>(2)?,"depth":r.get::<_,i64>(3)?,
+            "workspaceGuid":r.get::<_,String>(4)?,"itemGuid":r.get::<_,String>(5)?,"reporterGuid":r.get::<_,String>(6)?,"actorGuid":r.get::<_,String>(7)?,
+            "severity":r.get::<_,String>(8)?,"description":r.get::<_,String>(9)?,"photoUrl":r.get::<_,Option<String>>(10)?,"status":r.get::<_,String>(11)?,
+            "resolution":r.get::<_,Option<String>>(12)?,"payloadHash":r.get::<_,String>(13)?,"ledgerHash":r.get::<_,String>(14)?,"createdAt":r.get::<_,String>(15)?,
+        }))) { faults.extend(rows.flatten()); }
+    }
     let mut messages = Vec::new();
     if let Ok(mut stmt) = conn.prepare(
         "SELECT guid,workspace_id,user_id,text,ledger_hash,created_at
@@ -875,6 +919,7 @@ pub fn export_journal_since(conn: &Connection, recipient_frontier: Option<&Value
         "custodyMode": "ledger-delta/v1",
         "itemTombstoneMode": "monotonic/v1",
         "itemCommentMode": "ledger-records/v1",
+        "faultMode": "append-only-branches/v1",
         "historyMode": if recipient_frontier.is_some() { "delta" } else { "full" },
         "frontier": frontier(conn),
         "workspaces": workspaces,
@@ -888,6 +933,7 @@ pub fn export_journal_since(conn: &Connection, recipient_frontier: Option<&Value
         "custody": custody,
         "itemTombstones": item_tombstones,
         "itemComments": item_comments,
+        "faults": faults,
         "messages": messages,
         "photos": photos,
         "documents": documents,
@@ -954,6 +1000,7 @@ fn filter_journal_scope(journal: &mut Value, allowed: &HashSet<String>) {
         "custody",
         "itemTombstones",
         "itemComments",
+        "faults",
         "messages",
         "frontier",
     ] {
@@ -1559,6 +1606,61 @@ fn rebuild_quantitative_holdings(conn: &Connection) -> anyhow::Result<()> {
     Ok(())
 }
 
+struct FaultStateRow {
+    guid: String,
+    item: String,
+    workspace: String,
+    reporter: String,
+    actor: String,
+    severity: String,
+    description: String,
+    photo: Option<String>,
+    status: String,
+    resolution: Option<String>,
+    updated: String,
+    created: String,
+}
+
+fn rebuild_fault_state(conn: &Connection) -> anyhow::Result<()> {
+    let mut statement=conn.prepare("SELECT r.fault_guid,r.item_guid,r.workspace_guid,r.reporter_guid,r.actor_guid,r.severity,r.description,r.photo_url,r.status,r.resolution,r.created_at,
+        (SELECT created_at FROM fault_records root WHERE root.fault_guid=r.fault_guid AND root.depth=0 ORDER BY root.record_hash LIMIT 1)
+        FROM fault_records r WHERE r.record_hash=(SELECT record_hash FROM fault_records w WHERE w.fault_guid=r.fault_guid ORDER BY depth DESC,record_hash DESC LIMIT 1)")?;
+    let rows: Vec<FaultStateRow> = statement
+        .query_map([], |r| {
+            Ok(FaultStateRow {
+                guid: r.get(0)?,
+                item: r.get(1)?,
+                workspace: r.get(2)?,
+                reporter: r.get(3)?,
+                actor: r.get(4)?,
+                severity: r.get(5)?,
+                description: r.get(6)?,
+                photo: r.get(7)?,
+                status: r.get(8)?,
+                resolution: r.get(9)?,
+                updated: r.get(10)?,
+                created: r.get(11)?,
+            })
+        })?
+        .collect::<Result<_, _>>()?;
+    for row in rows {
+        let item = id_by_guid(conn, "items", &row.item)
+            .ok_or_else(|| anyhow::anyhow!("fault item unavailable"))?;
+        let ws = id_by_guid(conn, "workspaces", &row.workspace)
+            .ok_or_else(|| anyhow::anyhow!("fault workspace unavailable"))?;
+        let reporter = id_by_guid(conn, "users", &row.reporter)
+            .ok_or_else(|| anyhow::anyhow!("fault reporter unavailable"))?;
+        let actor = id_by_guid(conn, "users", &row.actor)
+            .ok_or_else(|| anyhow::anyhow!("fault actor unavailable"))?;
+        conn.execute("INSERT OR IGNORE INTO faults(item_id,workspace_id,author_id,severity,description,photo_url,status,resolution,resolver_id,created_at,resolved_at,guid)
+            VALUES(?1,?2,?3,?4,?5,?6,?7,?8,CASE WHEN ?7='open' THEN NULL ELSE ?9 END,?10,CASE WHEN ?7='open' THEN NULL ELSE ?11 END,?12)",
+            params![item,ws,reporter,row.severity,row.description,row.photo,row.status,row.resolution,actor,row.created,row.updated,row.guid])?;
+        conn.execute("UPDATE faults SET item_id=?1,workspace_id=?2,author_id=?3,severity=?4,description=?5,photo_url=?6,status=?7,resolution=?8,resolver_id=CASE WHEN ?7='open' THEN NULL ELSE ?9 END,resolved_at=CASE WHEN ?7='open' THEN NULL ELSE ?10 END WHERE guid=?11",
+            params![item,ws,reporter,row.severity,row.description,row.photo,row.status,row.resolution,actor,row.updated,row.guid])?;
+    }
+    Ok(())
+}
+
 pub fn import_journal(conn: &Connection, journal: &Value) -> Value {
     let mut workspaces = 0u32;
     let mut users = 0u32;
@@ -2090,6 +2192,24 @@ pub fn import_journal(conn: &Connection, journal: &Value) -> Value {
             }
         }
     }
+    if let Some(records) = journal.get("faults").and_then(Value::as_array) {
+        for record in records {
+            let inserted=conn.execute("INSERT OR IGNORE INTO fault_records(record_hash,fault_guid,parent_hash,depth,workspace_guid,item_guid,reporter_guid,actor_guid,severity,description,photo_url,status,resolution,payload_hash,ledger_hash,created_at)
+                VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",params![
+                    record.get("recordHash").and_then(Value::as_str),record.get("faultGuid").and_then(Value::as_str),record.get("parentHash").and_then(Value::as_str),record.get("depth").and_then(Value::as_i64),
+                    record.get("workspaceGuid").and_then(Value::as_str),record.get("itemGuid").and_then(Value::as_str),record.get("reporterGuid").and_then(Value::as_str),record.get("actorGuid").and_then(Value::as_str),
+                    record.get("severity").and_then(Value::as_str),record.get("description").and_then(Value::as_str),record.get("photoUrl").and_then(Value::as_str),record.get("status").and_then(Value::as_str),
+                    record.get("resolution").and_then(Value::as_str),record.get("payloadHash").and_then(Value::as_str),record.get("ledgerHash").and_then(Value::as_str),record.get("createdAt").and_then(Value::as_str)]).unwrap_or(0);
+            if inserted > 0 {
+                ops += 1;
+            } else {
+                skipped += 1;
+            }
+        }
+        if let Err(error) = rebuild_fault_state(conn) {
+            return json!({"ok":false,"error":format!("Не удалось восстановить неисправности: {error}")});
+        }
+    }
     if let Some(arr) = journal.get("messages").and_then(Value::as_array) {
         for message in arr {
             let guid = message.get("guid").and_then(Value::as_str).unwrap_or("");
@@ -2508,6 +2628,9 @@ pub fn apply_remote_journal(conn: &Connection, journal: &Value, peer_url: &str) 
     if let Err(error) = verify_item_comments(conn, journal) {
         return json!({"ok":false,"error":format!("Проверка комментариев ТМЦ: {error}")});
     }
+    if let Err(error) = verify_fault_records(conn, journal) {
+        return json!({"ok":false,"error":format!("Проверка летописи неисправностей: {error}")});
+    }
     if let Err(error) = crate::accounting::verify_journal_links(conn, journal) {
         return json!({"ok":false,"error":format!("Проверка Bit-летописи: {error}")});
     }
@@ -2566,6 +2689,10 @@ pub fn apply_remote_journal(conn: &Connection, journal: &Value, peer_url: &str) 
     if let Err(error) = verify_stored_item_comments(conn) {
         let _ = conn.execute_batch("ROLLBACK TO verified_sync; RELEASE verified_sync");
         return json!({"ok":false,"error":format!("Проверка сохранённых комментариев ТМЦ: {error}")});
+    }
+    if let Err(error) = verify_stored_fault_records(conn) {
+        let _ = conn.execute_batch("ROLLBACK TO verified_sync; RELEASE verified_sync");
+        return json!({"ok":false,"error":format!("Проверка сохранённой летописи неисправностей: {error}")});
     }
     if let Err(error) = ledger::verify_chat_links(conn) {
         let _ = conn.execute_batch("ROLLBACK TO verified_sync; RELEASE verified_sync");
@@ -3249,6 +3376,136 @@ fn verify_membership_records(conn: &Connection, journal: &Value) -> anyhow::Resu
     Ok(())
 }
 
+fn verify_fault_records(conn: &Connection, journal: &Value) -> anyhow::Result<()> {
+    if journal.get("faultMode").and_then(Value::as_str) != Some("append-only-branches/v1") {
+        anyhow::bail!("journal does not provide fault branches");
+    }
+    let records = journal
+        .get("faults")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("journal has no fault array"))?;
+    let by_hash: HashMap<&str, &Value> = records
+        .iter()
+        .filter_map(|r| r.get("recordHash").and_then(Value::as_str).map(|h| (h, r)))
+        .collect();
+    if by_hash.len() != records.len() {
+        anyhow::bail!("duplicate or missing fault record hash");
+    }
+    let history: HashMap<&str, &Value> = journal
+        .get("history")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.get("opId").and_then(Value::as_str).map(|h| (h, e)))
+        .collect();
+    for record in records {
+        let get = |name: &str| {
+            record
+                .get(name)
+                .and_then(Value::as_str)
+                .filter(|v| !v.is_empty())
+                .ok_or_else(|| anyhow::anyhow!("fault record has no {name}"))
+        };
+        let record_hash = get("recordHash")?;
+        let ledger_hash = get("ledgerHash")?;
+        let payload_hash = get("payloadHash")?;
+        let fault = get("faultGuid")?;
+        let workspace = get("workspaceGuid")?;
+        let item = get("itemGuid")?;
+        let actor = get("actorGuid")?;
+        let depth = record
+            .get("depth")
+            .and_then(Value::as_i64)
+            .ok_or_else(|| anyhow::anyhow!("fault depth missing"))?;
+        if get("description")?.chars().count() > 8_000
+            || !matches!(get("severity")?, "low" | "medium" | "high")
+            || !matches!(get("status")?, "open" | "repair" | "resolved")
+        {
+            anyhow::bail!("invalid fault fields");
+        }
+        if fault_payload_hash(record)? != payload_hash
+            || fault_record_hash(payload_hash, ledger_hash) != record_hash
+        {
+            anyhow::bail!("fault record hash mismatch");
+        }
+        let parent = record.get("parentHash").and_then(Value::as_str);
+        if depth == 0 {
+            if parent.is_some() {
+                anyhow::bail!("invalid fault root");
+            }
+        } else {
+            let parent_record = parent
+                .and_then(|h| by_hash.get(h).copied())
+                .ok_or_else(|| anyhow::anyhow!("fault parent unavailable"))?;
+            if parent_record.get("depth").and_then(Value::as_i64) != Some(depth - 1) {
+                anyhow::bail!("fault depth does not follow parent");
+            }
+            for field in [
+                "faultGuid",
+                "workspaceGuid",
+                "itemGuid",
+                "reporterGuid",
+                "severity",
+                "description",
+                "photoUrl",
+            ] {
+                if parent_record.get(field) != record.get(field) {
+                    anyhow::bail!("fault immutable field changed");
+                }
+            }
+        }
+        let event_type = if depth == 0 && get("reporterGuid")? == actor && get("status")? == "open"
+        {
+            "fault_report"
+        } else if depth == 0 {
+            "fault_adopt"
+        } else {
+            "fault_update"
+        };
+        if let Some(event) = history.get(ledger_hash) {
+            let proof = [
+                "requestDeviceId",
+                "requestPublicKey",
+                "requestNonce",
+                "requestSignature",
+                "requestHash",
+                "requestTimestamp",
+                "requestPath",
+            ];
+            if event.get("type").and_then(Value::as_str) != Some(event_type)
+                || event.get("workspaceGuid").and_then(Value::as_str) != Some(workspace)
+                || event.get("itemGuid").and_then(Value::as_str) != Some(item)
+                || event.get("actorGuid").and_then(Value::as_str) != Some(actor)
+                || event.get("fromLabel").and_then(Value::as_str) != Some(fault)
+                || event.get("toLabel").and_then(Value::as_str) != Some(payload_hash)
+                || !proof.iter().all(|name| {
+                    event
+                        .get(*name)
+                        .and_then(Value::as_str)
+                        .is_some_and(|v| !v.is_empty())
+                })
+            {
+                anyhow::bail!("fault ledger evidence mismatch");
+            }
+        } else {
+            let exists:i64=conn.query_row("SELECT count(*) FROM history_entries h JOIN workspaces w ON w.id=h.workspace_id JOIN items i ON i.id=h.item_id JOIN users u ON u.id=h.actor_user_id WHERE h.hash=?1 AND h.type=?2 AND w.guid=?3 AND i.guid=?4 AND u.guid=?5 AND h.from_label=?6 AND h.to_label=?7 AND h.request_device_id IS NOT NULL AND h.request_signature IS NOT NULL",params![ledger_hash,event_type,workspace,item,actor,fault,payload_hash],|r|r.get(0))?;
+            if exists == 0 {
+                anyhow::bail!("fault ledger event unavailable");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn verify_stored_fault_records(conn: &Connection) -> anyhow::Result<usize> {
+    let snapshot = export_journal(conn);
+    verify_fault_records(conn, &snapshot)?;
+    Ok(snapshot
+        .get("faults")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len))
+}
+
 fn verify_item_comments(conn: &Connection, journal: &Value) -> anyhow::Result<()> {
     if journal.get("itemCommentMode").and_then(Value::as_str) != Some("ledger-records/v1") {
         anyhow::bail!("journal does not provide ledger-bound item comments");
@@ -3828,6 +4085,7 @@ pub fn integrity_audit(conn: &Connection) -> Value {
     let custody_result = verify_stored_custody(conn);
     let item_tombstone_result = verify_stored_item_tombstones(conn);
     let item_comment_result = verify_stored_item_comments(conn);
+    let fault_result = verify_stored_fault_records(conn);
     let membership_result = verify_membership_records(conn, &snapshot);
 
     let count = |table: &str| -> i64 {
@@ -3908,6 +4166,7 @@ pub fn integrity_audit(conn: &Connection) -> Value {
         .err()
         .map(ToString::to_string);
     let item_comment_error = item_comment_result.as_ref().err().map(ToString::to_string);
+    let fault_error = fault_result.as_ref().err().map(ToString::to_string);
     let membership_error = membership_result.as_ref().err().map(ToString::to_string);
     let healthy = database_check == "ok"
         && ledger_result.is_ok()
@@ -3919,6 +4178,7 @@ pub fn integrity_audit(conn: &Connection) -> Value {
         && custody_result.is_ok()
         && item_tombstone_result.is_ok()
         && item_comment_result.is_ok()
+        && fault_result.is_ok()
         && membership_result.is_ok()
         && orphan_history == 0
         && missing_guids == 0
@@ -3935,6 +4195,7 @@ pub fn integrity_audit(conn: &Connection) -> Value {
         "membershipVersions": count("membership_versions"),
         "itemTombstones": count("item_tombstones"),
         "itemComments": count("item_comment_records"),
+        "faultRecords":count("fault_records"),
     });
     json!({
         "healthy": healthy,
@@ -3959,6 +4220,8 @@ pub fn integrity_audit(conn: &Connection) -> Value {
         "itemTombstonesVerified": item_tombstone_result.unwrap_or(0),
         "itemCommentError": item_comment_error,
         "itemCommentsVerified": item_comment_result.unwrap_or(0),
+        "faultError":fault_error,
+        "faultRecordsVerified":fault_result.unwrap_or(0),
         "membershipError": membership_error,
         "membershipVerified": membership_result.is_ok(),
         "snapshotHash": snapshot.get("journalHash"),
@@ -4214,7 +4477,8 @@ mod tests {
         .unwrap();
         record_item_tombstone(&source, workspace, item, owner, &event).unwrap();
         let valid = export_journal(&source);
-        assert_eq!(apply_remote_journal(&target, &valid, "")["ok"], true);
+        let accepted = apply_remote_journal(&target, &valid, "");
+        assert_eq!(accepted["ok"], true, "{accepted}");
         assert_eq!(
             target
                 .query_row(
@@ -4260,14 +4524,14 @@ mod tests {
     }
 
     #[test]
-    fn item_comment_round_trips_and_rejects_node_signed_text_falsification() {
+    fn portable_comment_and_fault_branches_reject_node_signed_falsification() {
         let paths = (0..3)
             .map(|kind| {
                 std::env::temp_dir()
                     .join(format!("item-comment-{kind}-{}.db", uuid::Uuid::new_v4()))
             })
             .collect::<Vec<_>>();
-        let source = crate::db::open(&paths[0]).unwrap();
+        let mut source = crate::db::open(&paths[0]).unwrap();
         let target = crate::db::open(&paths[1]).unwrap();
         let rejected = crate::db::open(&paths[2]).unwrap();
         let created = chrono::Utc::now().to_rfc3339();
@@ -4321,8 +4585,36 @@ mod tests {
                 params![item, owner, text, created],
             )
             .unwrap();
+        crate::db::ensure_workspace_statuses(&source, workspace).unwrap();
+        crate::device::set_pending(
+            &source,
+            owner,
+            &signed_device_proof(&key, device, "/api/trpc/items.reportFault"),
+        )
+        .unwrap();
+        let fault = crate::api::dispatch(
+            &mut source,
+            "items.reportFault",
+            &json!({"itemId":item,"severity":"high","description":"Искрит кабель"}),
+            Some(owner),
+        )
+        .unwrap();
+        crate::device::set_pending(
+            &source,
+            owner,
+            &signed_device_proof(&key, device, "/api/trpc/items.resolveFault"),
+        )
+        .unwrap();
+        let resolved = crate::api::dispatch(
+            &mut source,
+            "items.resolveFault",
+            &json!({"id":fault["id"],"status":"resolved","comment":"Кабель заменён"}),
+            Some(owner),
+        )
+        .unwrap();
         let valid = export_journal(&source);
-        assert_eq!(apply_remote_journal(&target, &valid, "")["ok"], true);
+        let accepted = apply_remote_journal(&target, &valid, "");
+        assert_eq!(accepted["ok"], true, "{accepted}");
         assert_eq!(
             target
                 .query_row(
@@ -4334,8 +4626,84 @@ mod tests {
             text
         );
         verify_stored_item_comments(&target).unwrap();
+        assert_eq!(
+            target
+                .query_row(
+                    "SELECT status FROM faults WHERE guid=?1",
+                    [fault["guid"].as_str().unwrap()],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+            "resolved"
+        );
+        assert_eq!(verify_stored_fault_records(&target).unwrap(), 2);
 
-        let mut forged = valid;
+        // Два администратора могут принять разные решения от одного offline-parent.
+        // Обе ветки сохраняются, а materialized state выбирается одинаково на всех нодах.
+        let root_hash: String = source
+            .query_row(
+                "SELECT record_hash FROM fault_records WHERE fault_guid=?1 AND depth=0",
+                [fault["guid"].as_str().unwrap()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let branch_at = chrono::Utc::now().to_rfc3339();
+        let mut branch = json!({"faultGuid":fault["guid"],"parentHash":root_hash,"depth":1,"workspaceGuid":"comment-workspace","itemGuid":"comment-item","reporterGuid":"comment-owner","actorGuid":"comment-owner","severity":"high","description":"Искрит кабель","photoUrl":null,"status":"repair","resolution":"Отправить в сервис","createdAt":branch_at});
+        let branch_payload = fault_payload_hash(&branch).unwrap();
+        crate::device::set_pending(
+            &source,
+            owner,
+            &signed_device_proof(&key, device, "/api/trpc/items.resolveFault"),
+        )
+        .unwrap();
+        let branch_event = ledger::append(
+            &source,
+            workspace,
+            owner,
+            Some(item),
+            "fault_update",
+            Some(fault["guid"].as_str().unwrap()),
+            Some(&branch_payload),
+            None,
+            Some("Отправить в сервис"),
+        )
+        .unwrap();
+        let branch_ledger = branch_event["opId"].as_str().unwrap();
+        let branch_hash = fault_record_hash(&branch_payload, branch_ledger);
+        branch["payloadHash"] = json!(branch_payload);
+        branch["ledgerHash"] = json!(branch_ledger);
+        branch["recordHash"] = json!(branch_hash);
+        source.execute("INSERT INTO fault_records(record_hash,fault_guid,parent_hash,depth,workspace_guid,item_guid,reporter_guid,actor_guid,severity,description,status,resolution,payload_hash,ledger_hash,created_at) VALUES(?1,?2,?3,1,'comment-workspace','comment-item','comment-owner','comment-owner','high','Искрит кабель','repair','Отправить в сервис',?4,?5,?6)",params![branch_hash,fault["guid"].as_str(),root_hash,branch_payload,branch_ledger,branch_at]).unwrap();
+        let branched = export_journal(&source);
+        let merged = apply_remote_journal(&target, &branched, "");
+        assert_eq!(merged["ok"], true, "{merged}");
+        let expected = if branch_hash.as_str() > resolved["recordHash"].as_str().unwrap() {
+            "repair"
+        } else {
+            "resolved"
+        };
+        assert_eq!(
+            target
+                .query_row(
+                    "SELECT status FROM faults WHERE guid=?1",
+                    [fault["guid"].as_str().unwrap()],
+                    |r| r.get::<_, String>(0)
+                )
+                .unwrap(),
+            expected
+        );
+        assert_eq!(
+            target
+                .query_row(
+                    "SELECT count(*) FROM fault_records WHERE fault_guid=?1",
+                    [fault["guid"].as_str().unwrap()],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            3
+        );
+
+        let mut forged = valid.clone();
         forged["itemComments"][0]["text"] = json!("Поддельное указание");
         let forged_payload = item_comment_payload_hash(&forged["itemComments"][0]).unwrap();
         forged["itemComments"][0]["payloadHash"] = json!(forged_payload);
@@ -4360,6 +4728,32 @@ mod tests {
                 .unwrap(),
             0
         );
+        let mut forged_fault = valid;
+        let index = forged_fault["faults"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .position(|r| r["depth"] == 1)
+            .unwrap();
+        forged_fault["faults"][index]["resolution"] = json!("Поддельное решение");
+        let forged_payload = fault_payload_hash(&forged_fault["faults"][index]).unwrap();
+        forged_fault["faults"][index]["payloadHash"] = json!(forged_payload);
+        let fault_ledger = forged_fault["faults"][index]["ledgerHash"]
+            .as_str()
+            .unwrap();
+        forged_fault["faults"][index]["recordHash"] = json!(fault_record_hash(
+            forged_fault["faults"][index]["payloadHash"]
+                .as_str()
+                .unwrap(),
+            fault_ledger
+        ));
+        ledger::sign_journal(&source, &mut forged_fault).unwrap();
+        let result = apply_remote_journal(&rejected, &forged_fault, "");
+        assert_eq!(result["ok"], false, "{result}");
+        assert!(result["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("неисправност"));
         drop((source, target, rejected));
         for path in paths {
             let _ = std::fs::remove_file(path);
