@@ -9922,6 +9922,59 @@ mod tests {
     }
 
     #[test]
+    fn chat_spam_limit_is_atomic_and_scoped_per_member() {
+        let (mut conn, path, users, ws) = test_db();
+        for index in 0..20 {
+            dispatch(
+                &mut conn,
+                "chat.send",
+                &json!({"workspaceId":ws,"text":format!("Пакет {index}")}),
+                Some(users[0]),
+            )
+            .unwrap();
+        }
+        let before: (i64, i64) = (
+            conn.query_row("SELECT COUNT(*) FROM chat_messages", [], |row| row.get(0))
+                .unwrap(),
+            conn.query_row(
+                "SELECT COUNT(*) FROM history_entries WHERE type='chat_message'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap(),
+        );
+        let blocked = dispatch(
+            &mut conn,
+            "chat.send",
+            &json!({"workspaceId":ws,"text":"Двадцать первое"}),
+            Some(users[0]),
+        )
+        .unwrap_err();
+        assert_eq!((blocked.http, blocked.code), (429, "TOO_MANY_REQUESTS"));
+        let after: (i64, i64) = (
+            conn.query_row("SELECT COUNT(*) FROM chat_messages", [], |row| row.get(0))
+                .unwrap(),
+            conn.query_row(
+                "SELECT COUNT(*) FROM history_entries WHERE type='chat_message'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap(),
+        );
+        assert_eq!(after, before, "отказ не должен оставлять полутранзакцию");
+
+        let independent = dispatch(
+            &mut conn,
+            "chat.send",
+            &json!({"workspaceId":ws,"text":"Сообщение другого участника"}),
+            Some(users[1]),
+        )
+        .unwrap();
+        assert_eq!(independent["ledgerVerified"], true);
+        cleanup(conn, path);
+    }
+
+    #[test]
     fn chat_rejects_foreign_workspace() {
         let (mut conn, path, users, _ws) = test_db();
         conn.execute(

@@ -398,6 +398,7 @@ npm run mesh:test    # 3 узла, разрыв/восстановление и 
 npm run discovery:test # LAN discovery и отбрасывание анонса с чужим токеном
 npm run adversarial:test # повторы, replay, фальсификация и полное восстановление
 npm run interorg:test # две изолированные организации, partition и opaque relay
+npm run spam:test     # реальный HTTP flooding, дубль, restart и атомарный отказ
 npm run scale:test   # 100 реальных процессов и отказ 10 узлов
 npm run test:e2e     # production-сборка + Chromium/Playwright
 

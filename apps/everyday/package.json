@@ -27,6 +27,7 @@
     "adversarial:test": "npm run node:test:build && python3 scripts/adversarial_sync_test.py",
     "capability:test": "npm run node:test:build && python3 scripts/capability_test.py",
     "interorg:test": "npm run node:test:build && python3 scripts/interorg_test.py",
+    "spam:test": "npm run node:test:build && python3 scripts/spam_test.py",
     "scale:test": "npm run node:test:build && python3 scripts/scale_test.py",
     "import:facekit": "node scripts/import-facekit-snapshot.mjs",
     "pwa:icons": "python3 scripts/generate-pwa-icons.py",
@@ -35,7 +36,7 @@
     "mobile:node:test": "python3 scripts/mobile_node_test.py",
     "encrypted-db:test": "python3 scripts/encrypted_db_test.py",
     "backup:restore:test": "python3 scripts/backup_restore_test.py",
-    "production:audit": "npm run verify && npm run smoke && npm run test:e2e && npm run sync:test && npm run mesh:test && npm run discovery:test && npm run adversarial:test && npm run capability:test && npm run interorg:test && npm run mobile:node:test && npm run encrypted-db:test && npm run backup:restore:test",
+    "production:audit": "npm run verify && npm run smoke && npm run test:e2e && npm run sync:test && npm run mesh:test && npm run discovery:test && npm run adversarial:test && npm run capability:test && npm run interorg:test && npm run spam:test && npm run mobile:node:test && npm run encrypted-db:test && npm run backup:restore:test",
     "android:check": "python3 scripts/check_android_node.py",
     "android:apk:verify": "python3 scripts/verify_android_apk.py",
     "verify": "npm run check && npm run lint && npm test && npm run docs:check && npm run android:check && cargo test --manifest-path backend/Cargo.toml"
