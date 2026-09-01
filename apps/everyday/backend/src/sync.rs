@@ -177,6 +177,23 @@ fn config_version_hash(payload_hash: &str, ledger_hash: &str) -> String {
     )
 }
 
+fn item_state_payload_hash(record: &Value) -> anyhow::Result<String> {
+    let payload = json!({"domain":"everyday/item-state/v1","itemGuid":record.get("itemGuid"),"parentHash":record.get("parentHash"),"depth":record.get("depth"),"workspaceGuid":record.get("workspaceGuid"),"actorGuid":record.get("actorGuid"),"fields":record.get("fields"),"updatedAt":record.get("updatedAt")});
+    Ok(format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&payload)?)
+    ))
+}
+
+fn item_state_version_hash(payload_hash: &str, ledger_hash: &str) -> String {
+    format!(
+        "{:x}",
+        Sha256::digest(
+            format!("everyday/item-state-ledger/v1\n{payload_hash}\n{ledger_hash}").as_bytes()
+        )
+    )
+}
+
 fn next_journal_sequence(conn: &Connection) -> u64 {
     let next = kv_get(conn, "sync_journal_sequence")
         .and_then(|value| value.parse::<u64>().ok())
@@ -678,6 +695,7 @@ pub fn export_journal_since(conn: &Connection, recipient_frontier: Option<&Value
                 "brandGuid": r.get::<_,Option<i64>>(24)?.map(|id| guid_of(conn,"brands",id)),
                 "buildingSiteGuid": r.get::<_,Option<i64>>(25)?.map(|id| guid_of(conn,"building_sites",id)),
                 "storageGuid": r.get::<_,Option<i64>>(26)?.map(|id| guid_of(conn,"storages",id)),
+                "storageName": r.get::<_,Option<i64>>(26)?.and_then(|id|conn.query_row("SELECT name FROM storages WHERE id=?1",[id],|row|row.get::<_,String>(0)).ok()),
                 "serialNumber": r.get::<_, Option<String>>(7)?,
                 "qrCode": r.get::<_, Option<String>>(8)?,
                 "dueAt": r.get::<_, Option<String>>(9)?,
@@ -694,6 +712,7 @@ pub fn export_journal_since(conn: &Connection, recipient_frontier: Option<&Value
                     .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
                     .unwrap_or_else(|| json!({})),
                 "statusSlug": slug,
+                "statusGuid": st.map(|id|guid_of(conn,"statuses",id)),
                 "archived": r.get::<_,i64>(22)? != 0,
                 "archivedAt": r.get::<_,Option<String>>(23)?,
                 "localId": id,
@@ -917,6 +936,28 @@ pub fn export_journal_since(conn: &Connection, recipient_frontier: Option<&Value
     if let Ok(mut statement)=conn.prepare("SELECT version_hash,entity_guid,kind,parent_hash,depth,workspace_guid,actor_guid,active,fields_json,payload_hash,ledger_hash,updated_at FROM config_versions ORDER BY kind,entity_guid,depth,version_hash") {
         if let Ok(rows)=statement.query_map([],|r|{let fields:String=r.get(8)?;Ok(json!({"versionHash":r.get::<_,String>(0)?,"entityGuid":r.get::<_,String>(1)?,"kind":r.get::<_,String>(2)?,"parentHash":r.get::<_,Option<String>>(3)?,"depth":r.get::<_,i64>(4)?,"workspaceGuid":r.get::<_,String>(5)?,"actorGuid":r.get::<_,String>(6)?,"active":r.get::<_,i64>(7)?!=0,"fields":serde_json::from_str::<Value>(&fields).unwrap_or(Value::Null),"payloadHash":r.get::<_,String>(9)?,"ledgerHash":r.get::<_,String>(10)?,"updatedAt":r.get::<_,String>(11)?}))}){config_versions.extend(rows.flatten());}
     }
+    let mut item_state_versions = Vec::new();
+    if let Ok(mut statement)=conn.prepare("SELECT version_hash,item_guid,parent_hash,depth,workspace_guid,actor_guid,fields_json,payload_hash,ledger_hash,updated_at FROM item_state_versions ORDER BY item_guid,depth,version_hash"){
+        if let Ok(rows)=statement.query_map([],|r|{let fields:String=r.get(6)?;Ok(json!({"versionHash":r.get::<_,String>(0)?,"itemGuid":r.get::<_,String>(1)?,"parentHash":r.get::<_,Option<String>>(2)?,"depth":r.get::<_,i64>(3)?,"workspaceGuid":r.get::<_,String>(4)?,"actorGuid":r.get::<_,String>(5)?,"fields":serde_json::from_str::<Value>(&fields).unwrap_or(Value::Null),"payloadHash":r.get::<_,String>(7)?,"ledgerHash":r.get::<_,String>(8)?,"updatedAt":r.get::<_,String>(9)?}))}){item_state_versions.extend(rows.flatten());}
+    }
+    if recipient_frontier.is_some() {
+        let sent: HashSet<&str> = history
+            .iter()
+            .filter_map(|event| event.get("opId").and_then(Value::as_str))
+            .collect();
+        config_versions.retain(|record| {
+            record
+                .get("ledgerHash")
+                .and_then(Value::as_str)
+                .is_some_and(|hash| sent.contains(hash))
+        });
+        item_state_versions.retain(|record| {
+            record
+                .get("ledgerHash")
+                .and_then(Value::as_str)
+                .is_some_and(|hash| sent.contains(hash))
+        });
+    }
     let mut messages = Vec::new();
     if let Ok(mut stmt) = conn.prepare(
         "SELECT guid,workspace_id,user_id,text,ledger_hash,created_at
@@ -998,6 +1039,7 @@ pub fn export_journal_since(conn: &Connection, recipient_frontier: Option<&Value
         "faultMode": "append-only-branches/v1",
         "changeRequestMode":"portable-branches/v1",
         "configMode":"portable-branches/v1",
+        "itemStateMode":"portable-branches/v1",
         "historyMode": if recipient_frontier.is_some() { "delta" } else { "full" },
         "frontier": frontier(conn),
         "workspaces": workspaces,
@@ -1014,6 +1056,7 @@ pub fn export_journal_since(conn: &Connection, recipient_frontier: Option<&Value
         "faults": faults,
         "changeRequests":change_requests,
         "configVersions":config_versions,
+        "itemStateVersions":item_state_versions,
         "messages": messages,
         "photos": photos,
         "documents": documents,
@@ -1083,6 +1126,7 @@ fn filter_journal_scope(journal: &mut Value, allowed: &HashSet<String>) {
         "faults",
         "changeRequests",
         "configVersions",
+        "itemStateVersions",
         "messages",
         "frontier",
     ] {
@@ -1865,7 +1909,7 @@ fn rebuild_change_requests(conn: &Connection) -> anyhow::Result<()> {
         conn.execute("INSERT OR IGNORE INTO change_requests(item_id,workspace_id,author_id,payload,comment,status,reason,decided_by,created_at,decided_at,guid) VALUES(?1,?2,?3,?4,?5,?6,?7,CASE WHEN ?6='pending' THEN NULL ELSE ?8 END,?9,CASE WHEN ?6='pending' THEN NULL ELSE ?10 END,?11)",params![item,ws,requester,local_patch.to_string(),comment,status,reason,actor,created,updated,guid])?;
         conn.execute("UPDATE change_requests SET item_id=?1,workspace_id=?2,author_id=?3,payload=?4,comment=?5,status=?6,reason=?7,decided_by=CASE WHEN ?6='pending' THEN NULL ELSE ?8 END,decided_at=CASE WHEN ?6='pending' THEN NULL ELSE ?9 END WHERE guid=?10",params![item,ws,requester,local_patch.to_string(),comment,status,reason,actor,updated,guid])?;
         if depth > 0 {
-            let newer_direct:i64=conn.query_row("SELECT count(*) FROM history_entries WHERE item_id=?1 AND type='update' AND created_at>?2",params![item,updated],|r|r.get(0))?;
+            let newer_direct:i64=conn.query_row("SELECT count(*) FROM history_entries WHERE item_id=?1 AND type IN ('update','item_state_update') AND created_at>=?2",params![item,updated],|r|r.get(0))?;
             if newer_direct == 0 {
                 let chosen = if status == "accepted" {
                     local_patch
@@ -1997,6 +2041,45 @@ fn rebuild_config_state(conn: &Connection) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn rebuild_item_state(conn: &Connection) -> anyhow::Result<()> {
+    let mut statement=conn.prepare("SELECT item_guid,fields_json,updated_at FROM item_state_versions v WHERE version_hash=(SELECT version_hash FROM item_state_versions w WHERE w.item_guid=v.item_guid ORDER BY depth DESC,version_hash DESC LIMIT 1) ORDER BY item_guid")?;
+    let rows = statement
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    for (guid, raw, updated_at) in rows {
+        let Some(id) = id_by_guid(conn, "items", &guid) else {
+            continue;
+        };
+        let fields: Value = serde_json::from_str(&raw)?;
+        let reference = |key: &str, table: &str| {
+            fields
+                .get(key)
+                .and_then(Value::as_str)
+                .and_then(|guid| id_by_guid(conn, table, guid))
+        };
+        conn.execute("UPDATE items SET internal_id=?1,title=?2,category_id=?3,brand_id=?4,serial_number=?5,qr_code=?6,calibrated_until=?7,min_quantity=?8,quantitative=?9,unit=?10,cost=?11,comment=?12,source_system=?13,external_id=?14,metadata_json=?15,organization_node_id=?16 WHERE id=?17",params![fields.get("internalId").and_then(Value::as_str),fields.get("title").and_then(Value::as_str),reference("categoryGuid","categories"),reference("brandGuid","brands"),fields.get("serialNumber").and_then(Value::as_str),fields.get("qrCode").and_then(Value::as_str),fields.get("calibratedUntil").and_then(Value::as_str),fields.get("minQuantity").and_then(Value::as_f64),fields.get("quantitative").and_then(Value::as_bool).unwrap_or(false) as i64,fields.get("unit").and_then(Value::as_str),fields.get("cost").and_then(Value::as_f64),fields.get("comment").and_then(Value::as_str),fields.get("sourceSystem").and_then(Value::as_str),fields.get("externalId").and_then(Value::as_str),fields.get("metadata").map(Value::to_string),reference("organizationNodeGuid","organization_nodes"),id])?;
+        let later:i64=conn.query_row("SELECT count(*) FROM history_entries WHERE item_id=?1 AND created_at>=?2 AND type IN ('take','return','move','inventory','replenish','write_off','transfer_send','transfer_receive','fault_report','fault_update')",params![id,updated_at],|r|r.get(0))?;
+        if later == 0 {
+            let workspace: i64 =
+                conn.query_row("SELECT workspace_id FROM items WHERE id=?1", [id], |r| {
+                    r.get(0)
+                })?;
+            let status = fields
+                .get("statusSlug")
+                .and_then(Value::as_str)
+                .and_then(|slug| status_id(conn, workspace, slug));
+            conn.execute("UPDATE items SET status_id=?1,responsible_user_id=?2,building_site_id=?3,storage_id=?4,quantity=?5 WHERE id=?6",params![status,reference("responsibleGuid","users"),reference("buildingSiteGuid","building_sites"),reference("storageGuid","storages"),fields.get("quantity").and_then(Value::as_f64),id])?;
+        }
+    }
+    Ok(())
+}
+
 pub fn import_journal(conn: &Connection, journal: &Value) -> Value {
     let mut workspaces = 0u32;
     let mut users = 0u32;
@@ -2082,6 +2165,16 @@ pub fn import_journal(conn: &Connection, journal: &Value) -> Value {
             return json!({"ok":false,"error":format!("Не удалось восстановить справочники: {error}")});
         }
     }
+    if let Some(records) = journal.get("itemStateVersions").and_then(Value::as_array) {
+        for record in records {
+            let inserted=conn.execute("INSERT OR IGNORE INTO item_state_versions(version_hash,item_guid,parent_hash,depth,workspace_guid,actor_guid,fields_json,payload_hash,ledger_hash,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",params![record.get("versionHash").and_then(Value::as_str),record.get("itemGuid").and_then(Value::as_str),record.get("parentHash").and_then(Value::as_str),record.get("depth").and_then(Value::as_i64),record.get("workspaceGuid").and_then(Value::as_str),record.get("actorGuid").and_then(Value::as_str),record.get("fields").map(Value::to_string),record.get("payloadHash").and_then(Value::as_str),record.get("ledgerHash").and_then(Value::as_str),record.get("updatedAt").and_then(Value::as_str)]).unwrap_or(0);
+            if inserted > 0 {
+                ops += 1
+            } else {
+                skipped += 1
+            }
+        }
+    }
     if let Some(arr) = journal.get("organizationNodes").and_then(|v| v.as_array()) {
         // Первый проход создаёт узлы без родителей, чтобы порядок входящего
         // массива не имел значения. Второй восстанавливает связи по GUID.
@@ -2145,10 +2238,26 @@ pub fn import_journal(conn: &Connection, journal: &Value) -> Value {
                 .get("buildingSiteGuid")
                 .and_then(Value::as_str)
                 .and_then(|g| id_by_guid(conn, "building_sites", g));
-            let storage = it
+            let mut storage = it
                 .get("storageGuid")
                 .and_then(Value::as_str)
                 .and_then(|g| id_by_guid(conn, "storages", g));
+            if storage.is_none() {
+                if let (Some(guid), Some(name)) = (
+                    it.get("storageGuid").and_then(Value::as_str),
+                    it.get("storageName").and_then(Value::as_str),
+                ) {
+                    let existing:Option<i64>=conn.query_row("SELECT id FROM storages WHERE workspace_id=?1 AND name=?2 ORDER BY id LIMIT 1",params![ws,name],|r|r.get(0)).optional().ok().flatten();
+                    if let Some(id) = existing {
+                        if conn
+                            .execute("UPDATE storages SET guid=?1 WHERE id=?2", params![guid, id])
+                            .is_ok()
+                        {
+                            storage = Some(id);
+                        }
+                    }
+                }
+            }
             let slug = it
                 .get("statusSlug")
                 .and_then(|v| v.as_str())
@@ -2492,6 +2601,9 @@ pub fn import_journal(conn: &Connection, journal: &Value) -> Value {
             );
             ops += 1;
         }
+    }
+    if let Err(error) = rebuild_item_state(conn) {
+        return json!({"ok":false,"error":format!("Не удалось восстановить master-состояние ТМЦ: {error}")});
     }
     if let Some(entries) = journal.get("custody").and_then(Value::as_array) {
         for entry in entries {
@@ -3024,6 +3136,9 @@ pub fn apply_remote_journal(conn: &Connection, journal: &Value, peer_url: &str) 
     if let Err(error) = verify_config_versions(conn, journal) {
         return json!({"ok":false,"error":format!("Проверка летописи справочников: {error}")});
     }
+    if let Err(error) = verify_item_state_versions(conn, journal) {
+        return json!({"ok":false,"error":format!("Проверка master-летописи ТМЦ: {error}")});
+    }
     if let Err(error) = crate::accounting::verify_journal_links(conn, journal) {
         return json!({"ok":false,"error":format!("Проверка Bit-летописи: {error}")});
     }
@@ -3094,6 +3209,10 @@ pub fn apply_remote_journal(conn: &Connection, journal: &Value, peer_url: &str) 
     if let Err(error) = verify_stored_config_versions(conn) {
         let _ = conn.execute_batch("ROLLBACK TO verified_sync; RELEASE verified_sync");
         return json!({"ok":false,"error":format!("Проверка сохранённой летописи справочников: {error}")});
+    }
+    if let Err(error) = verify_stored_item_state_versions(conn) {
+        let _ = conn.execute_batch("ROLLBACK TO verified_sync; RELEASE verified_sync");
+        return json!({"ok":false,"error":format!("Проверка сохранённой master-летописи ТМЦ: {error}")});
     }
     if let Err(error) = ledger::verify_chat_links(conn) {
         let _ = conn.execute_batch("ROLLBACK TO verified_sync; RELEASE verified_sync");
@@ -4009,15 +4128,18 @@ fn verify_config_versions(conn: &Connection, journal: &Value) -> anyhow::Result<
                 anyhow::bail!("config root has parent");
             }
         } else {
-            let p = parent
-                .and_then(|h| by_hash.get(h).copied())
-                .ok_or_else(|| anyhow::anyhow!("config parent unavailable"))?;
-            if p.get("depth").and_then(Value::as_i64) != Some(depth - 1)
-                || p.get("kind") != record.get("kind")
-                || p.get("entityGuid") != record.get("entityGuid")
-                || p.get("workspaceGuid") != record.get("workspaceGuid")
-            {
-                anyhow::bail!("config branch mismatch");
+            let valid = if let Some(p) = parent.and_then(|h| by_hash.get(h).copied()) {
+                p.get("depth").and_then(Value::as_i64) == Some(depth - 1)
+                    && p.get("kind") == record.get("kind")
+                    && p.get("entityGuid") == record.get("entityGuid")
+                    && p.get("workspaceGuid") == record.get("workspaceGuid")
+            } else if let Some(parent) = parent {
+                conn.query_row("SELECT count(*) FROM config_versions WHERE version_hash=?1 AND depth=?2 AND kind=?3 AND entity_guid=?4 AND workspace_guid=?5",params![parent,depth-1,kind,entity,workspace],|r|r.get::<_,i64>(0))?==1
+            } else {
+                false
+            };
+            if !valid {
+                anyhow::bail!("config parent unavailable or mismatched");
             }
         }
         let expected = if depth > 0 && !active {
@@ -4072,6 +4194,384 @@ fn verify_stored_config_versions(conn: &Connection) -> anyhow::Result<usize> {
     let snapshot = export_journal(conn);
     verify_config_versions(conn, &snapshot)?;
     Ok(snapshot["configVersions"].as_array().map_or(0, Vec::len))
+}
+
+fn verify_item_state_versions(conn: &Connection, journal: &Value) -> anyhow::Result<()> {
+    if journal.get("itemStateMode").and_then(Value::as_str) != Some("portable-branches/v1") {
+        anyhow::bail!("journal does not provide portable item state");
+    }
+    let records = journal
+        .get("itemStateVersions")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("journal has no item state array"))?;
+    let by_hash: HashMap<&str, &Value> = records
+        .iter()
+        .filter_map(|record| {
+            record
+                .get("versionHash")
+                .and_then(Value::as_str)
+                .map(|hash| (hash, record))
+        })
+        .collect();
+    if by_hash.len() != records.len() {
+        anyhow::bail!("duplicate item state version");
+    }
+    let history: HashMap<&str, &Value> = journal
+        .get("history")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|event| {
+            event
+                .get("opId")
+                .and_then(Value::as_str)
+                .map(|hash| (hash, event))
+        })
+        .collect();
+    for record in records {
+        let get = |key: &str| {
+            record
+                .get(key)
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| anyhow::anyhow!("item state has no {key}"))
+        };
+        let version_hash = get("versionHash")?;
+        let item = get("itemGuid")?;
+        let workspace = get("workspaceGuid")?;
+        let actor = get("actorGuid")?;
+        let payload_hash = get("payloadHash")?;
+        let ledger_hash = get("ledgerHash")?;
+        let depth = record
+            .get("depth")
+            .and_then(Value::as_i64)
+            .ok_or_else(|| anyhow::anyhow!("item state depth missing"))?;
+        let fields = record
+            .get("fields")
+            .ok_or_else(|| anyhow::anyhow!("item state fields missing"))?;
+        if fields
+            .get("title")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+            || fields
+                .get("internalId")
+                .and_then(Value::as_str)
+                .is_none_or(str::is_empty)
+        {
+            anyhow::bail!("invalid item state fields");
+        }
+        if item_state_payload_hash(record)? != payload_hash
+            || item_state_version_hash(payload_hash, ledger_hash) != version_hash
+        {
+            anyhow::bail!("item state hash mismatch");
+        }
+        let parent = record.get("parentHash").and_then(Value::as_str);
+        if depth == 0 {
+            if parent.is_some() {
+                anyhow::bail!("item state root has parent");
+            }
+        } else {
+            let valid = if let Some(p) = parent.and_then(|hash| by_hash.get(hash).copied()) {
+                p.get("depth").and_then(Value::as_i64) == Some(depth - 1)
+                    && p.get("itemGuid") == record.get("itemGuid")
+                    && p.get("workspaceGuid") == record.get("workspaceGuid")
+            } else if let Some(parent) = parent {
+                conn.query_row("SELECT count(*) FROM item_state_versions WHERE version_hash=?1 AND depth=?2 AND item_guid=?3 AND workspace_guid=?4",params![parent,depth-1,item,workspace],|r|r.get::<_,i64>(0))?==1
+            } else {
+                false
+            };
+            if !valid {
+                anyhow::bail!("item state parent unavailable or mismatched");
+            }
+        }
+        let validate = |event: &&Value| {
+            let ty = event.get("type").and_then(Value::as_str);
+            let type_ok = if depth == 0 {
+                matches!(ty, Some("item_state_create" | "item_state_adopt"))
+            } else {
+                ty == Some("item_state_update")
+            };
+            let proof = [
+                "requestDeviceId",
+                "requestPublicKey",
+                "requestNonce",
+                "requestSignature",
+                "requestHash",
+                "requestTimestamp",
+                "requestPath",
+            ];
+            type_ok
+                && event.get("workspaceGuid").and_then(Value::as_str) == Some(workspace)
+                && event.get("itemGuid").and_then(Value::as_str) == Some(item)
+                && event.get("actorGuid").and_then(Value::as_str) == Some(actor)
+                && event.get("fromLabel").and_then(Value::as_str) == Some(item)
+                && event.get("toLabel").and_then(Value::as_str) == Some(payload_hash)
+                && proof.iter().all(|key| {
+                    event
+                        .get(*key)
+                        .and_then(Value::as_str)
+                        .is_some_and(|value| !value.is_empty())
+                })
+        };
+        if let Some(event) = history.get(ledger_hash) {
+            if !validate(event) {
+                anyhow::bail!("item state ledger evidence mismatch");
+            }
+        } else {
+            let exists:i64=conn.query_row("SELECT count(*) FROM history_entries h JOIN workspaces w ON w.id=h.workspace_id JOIN items i ON i.id=h.item_id JOIN users u ON u.id=h.actor_user_id WHERE h.hash=?1 AND w.guid=?2 AND i.guid=?3 AND u.guid=?4 AND h.from_label=?3 AND h.to_label=?5 AND h.type IN ('item_state_create','item_state_adopt','item_state_update') AND h.request_device_id IS NOT NULL AND h.request_signature IS NOT NULL",params![ledger_hash,workspace,item,actor,payload_hash],|r|r.get(0))?;
+            if exists == 0 {
+                anyhow::bail!("item state ledger event unavailable");
+            }
+        }
+    }
+    let snapshots: HashMap<&str, &Value> = journal
+        .get("items")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|item| {
+            item.get("guid")
+                .and_then(Value::as_str)
+                .map(|guid| (guid, item))
+        })
+        .collect();
+    let mut winners: HashMap<&str, &Value> = HashMap::new();
+    for record in records {
+        let item = record["itemGuid"].as_str().unwrap_or_default();
+        let candidate = (
+            record["depth"].as_i64().unwrap_or(-1),
+            record["versionHash"].as_str().unwrap_or_default(),
+        );
+        let replace = winners.get(item).is_none_or(|current| {
+            candidate
+                > (
+                    current["depth"].as_i64().unwrap_or(-1),
+                    current["versionHash"].as_str().unwrap_or_default(),
+                )
+        });
+        if replace {
+            winners.insert(item, record);
+        }
+    }
+    let master_keys = [
+        "internalId",
+        "title",
+        "categoryGuid",
+        "brandGuid",
+        "serialNumber",
+        "qrCode",
+        "calibratedUntil",
+        "minQuantity",
+        "quantitative",
+        "unit",
+        "cost",
+        "comment",
+        "sourceSystem",
+        "externalId",
+        "metadata",
+        "organizationNodeGuid",
+    ];
+    let mut change_winners: HashMap<&str, &Value> = HashMap::new();
+    for record in journal
+        .get("changeRequests")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let request = record
+            .get("requestGuid")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let candidate = (
+            record.get("depth").and_then(Value::as_i64).unwrap_or(-1),
+            record
+                .get("recordHash")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+        );
+        if change_winners.get(request).is_none_or(|current| {
+            candidate
+                > (
+                    current.get("depth").and_then(Value::as_i64).unwrap_or(-1),
+                    current
+                        .get("recordHash")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default(),
+                )
+        }) {
+            change_winners.insert(request, record);
+        }
+    }
+    let mut config_refs: HashMap<(&str, &str), &str> = HashMap::new();
+    for record in journal
+        .get("configVersions")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        if record.get("active").and_then(Value::as_bool) == Some(true) {
+            if let (Some(kind), Some(guid), Some(name)) = (
+                record.get("kind").and_then(Value::as_str),
+                record.get("entityGuid").and_then(Value::as_str),
+                record
+                    .get("fields")
+                    .and_then(|fields| fields.get("name"))
+                    .and_then(Value::as_str),
+            ) {
+                config_refs.insert((kind, name), guid);
+            }
+        }
+    }
+    for (guid, winner) in winners {
+        let snapshot = snapshots
+            .get(guid)
+            .ok_or_else(|| anyhow::anyhow!("item state snapshot unavailable"))?;
+        let updated = winner
+            .get("updatedAt")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let mut expected = winner["fields"].clone();
+        let mut decisions: Vec<&Value> = change_winners
+            .values()
+            .copied()
+            .filter(|record| {
+                record.get("itemGuid").and_then(Value::as_str) == Some(guid)
+                    && record.get("depth").and_then(Value::as_i64).unwrap_or(0) > 0
+                    && record
+                        .get("createdAt")
+                        .and_then(Value::as_str)
+                        .is_some_and(|created| created >= updated)
+            })
+            .collect();
+        decisions.sort_by_key(|record| {
+            (
+                record
+                    .get("createdAt")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+                record
+                    .get("recordHash")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+            )
+        });
+        for decision in decisions {
+            let source = if decision.get("status").and_then(Value::as_str) == Some("accepted") {
+                decision.get("patch")
+            } else {
+                decision.get("before")
+            };
+            for (key, value) in source.and_then(Value::as_object).into_iter().flatten() {
+                let (target, value) = match key.as_str() {
+                    "categoryId" => (
+                        "categoryGuid",
+                        value
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .and_then(|name| config_refs.get(&("category", name)).copied())
+                            .map(Value::from)
+                            .unwrap_or(Value::Null),
+                    ),
+                    "brandId" => (
+                        "brandGuid",
+                        value
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .and_then(|name| config_refs.get(&("brand", name)).copied())
+                            .map(Value::from)
+                            .unwrap_or(Value::Null),
+                    ),
+                    "statusId" => (
+                        "statusSlug",
+                        value.get("slug").cloned().unwrap_or(Value::Null),
+                    ),
+                    "responsibleUserId" => (
+                        "responsibleGuid",
+                        value.get("guid").cloned().unwrap_or(Value::Null),
+                    ),
+                    "buildingSiteId" => (
+                        "buildingSiteGuid",
+                        value
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .and_then(|name| config_refs.get(&("site", name)).copied())
+                            .map(Value::from)
+                            .unwrap_or(Value::Null),
+                    ),
+                    "storageId" => (
+                        "storageGuid",
+                        value
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .and_then(|name| config_refs.get(&("storage", name)).copied())
+                            .map(Value::from)
+                            .unwrap_or(Value::Null),
+                    ),
+                    other => (other, value.clone()),
+                };
+                expected[target] = value;
+            }
+        }
+        let later_operational = history.values().any(|event| {
+            event.get("itemGuid").and_then(Value::as_str) == Some(guid)
+                && event
+                    .get("createdAt")
+                    .and_then(Value::as_str)
+                    .is_some_and(|created| created >= updated)
+                && matches!(
+                    event.get("type").and_then(Value::as_str),
+                    Some(
+                        "take"
+                            | "return"
+                            | "move"
+                            | "inventory"
+                            | "replenish"
+                            | "write_off"
+                            | "transfer_send"
+                            | "transfer_receive"
+                            | "fault_report"
+                            | "fault_update"
+                    )
+                )
+        });
+        let has_custody = journal
+            .get("custody")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .any(|entry| entry.get("itemGuid").and_then(Value::as_str) == Some(guid));
+        let mut operational_keys = vec![
+            "statusSlug",
+            "responsibleGuid",
+            "buildingSiteGuid",
+            "storageGuid",
+        ];
+        if !has_custody {
+            operational_keys.push("quantity");
+        }
+        for key in master_keys.into_iter().chain(
+            (!later_operational)
+                .then_some(operational_keys)
+                .into_iter()
+                .flatten(),
+        ) {
+            if snapshot.get(key).unwrap_or(&Value::Null)
+                != expected.get(key).unwrap_or(&Value::Null)
+            {
+                anyhow::bail!(
+                    "item state snapshot mismatch for {key}: snapshot={} expected={}",
+                    snapshot.get(key).unwrap_or(&Value::Null),
+                    expected.get(key).unwrap_or(&Value::Null)
+                );
+            }
+        }
+    }
+    Ok(())
+}
+fn verify_stored_item_state_versions(conn: &Connection) -> anyhow::Result<usize> {
+    let snapshot = export_journal(conn);
+    verify_item_state_versions(conn, &snapshot)?;
+    Ok(snapshot["itemStateVersions"].as_array().map_or(0, Vec::len))
 }
 
 fn verify_fault_records(conn: &Connection, journal: &Value) -> anyhow::Result<()> {
@@ -4786,6 +5286,7 @@ pub fn integrity_audit(conn: &Connection) -> Value {
     let fault_result = verify_stored_fault_records(conn);
     let change_result = verify_stored_change_records(conn);
     let config_result = verify_stored_config_versions(conn);
+    let item_state_result = verify_stored_item_state_versions(conn);
     let membership_result = verify_membership_records(conn, &snapshot);
 
     let count = |table: &str| -> i64 {
@@ -4874,6 +5375,7 @@ pub fn integrity_audit(conn: &Connection) -> Value {
     let fault_error = fault_result.as_ref().err().map(ToString::to_string);
     let change_error = change_result.as_ref().err().map(ToString::to_string);
     let config_error = config_result.as_ref().err().map(ToString::to_string);
+    let item_state_error = item_state_result.as_ref().err().map(ToString::to_string);
     let membership_error = membership_result.as_ref().err().map(ToString::to_string);
     let healthy = database_check == "ok"
         && ledger_result.is_ok()
@@ -4888,6 +5390,7 @@ pub fn integrity_audit(conn: &Connection) -> Value {
         && fault_result.is_ok()
         && change_result.is_ok()
         && config_result.is_ok()
+        && item_state_result.is_ok()
         && membership_result.is_ok()
         && orphan_history == 0
         && missing_guids == 0
@@ -4907,6 +5410,7 @@ pub fn integrity_audit(conn: &Connection) -> Value {
         "faultRecords":count("fault_records"),
         "changeRequestRecords":count("change_request_records"),
         "configVersions":count("config_versions"),
+        "itemStateVersions":count("item_state_versions"),
     });
     json!({
         "healthy": healthy,
@@ -4937,6 +5441,8 @@ pub fn integrity_audit(conn: &Connection) -> Value {
         "changeRequestRecordsVerified":change_result.unwrap_or(0),
         "configError":config_error,
         "configVersionsVerified":config_result.unwrap_or(0),
+        "itemStateError":item_state_error,
+        "itemStateVersionsVerified":item_state_result.unwrap_or(0),
         "membershipError": membership_error,
         "membershipVerified": membership_result.is_ok(),
         "snapshotHash": snapshot.get("journalHash"),
@@ -5499,6 +6005,7 @@ mod tests {
         rejected_branch["ledgerHash"] = json!(decision_ledger);
         rejected_branch["recordHash"] = json!(decision_hash);
         source.execute("INSERT INTO change_request_records(record_hash,request_guid,parent_hash,depth,workspace_guid,item_guid,requester_guid,actor_guid,patch_json,before_json,comment,status,reason,payload_hash,ledger_hash,created_at) VALUES(?1,?2,?3,1,'comment-workspace','comment-item','comment-owner','comment-owner',?4,?5,?6,'rejected','Отклонено параллельно',?7,?8,?9)",params![decision_hash,change["guid"].as_str(),change_root,change_patch,change_before,change_comment,decision_payload,decision_ledger,decision_at]).unwrap();
+        rebuild_change_requests(&source).unwrap();
         let change_branches = export_journal(&source);
         let merged = apply_remote_journal(&target, &change_branches, "");
         assert_eq!(merged["ok"], true, "{merged}");
@@ -6607,6 +7114,157 @@ mod tests {
             .as_str()
             .unwrap_or_default()
             .contains("справочников"));
+        drop((source, target, rejected));
+        for path in [source_path, target_path, rejected_path] {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    #[test]
+    fn device_signed_item_state_rejects_a_trusted_node_rewrite() {
+        let source_path =
+            std::env::temp_dir().join(format!("item-state-source-{}.db", uuid::Uuid::new_v4()));
+        let target_path =
+            std::env::temp_dir().join(format!("item-state-target-{}.db", uuid::Uuid::new_v4()));
+        let rejected_path =
+            std::env::temp_dir().join(format!("item-state-rejected-{}.db", uuid::Uuid::new_v4()));
+        let mut source = crate::db::open(&source_path).unwrap();
+        let mut target = crate::db::open(&target_path).unwrap();
+        let rejected = crate::db::open(&rejected_path).unwrap();
+        let created = chrono::Utc::now().to_rfc3339();
+        source.execute("INSERT INTO workspaces(name,internal_id_prefix,created_at,guid) VALUES('Item org','I-',?1,'item-state-workspace')",[&created]).unwrap();
+        let workspace = source.last_insert_rowid();
+        source.execute("INSERT INTO users(full_name,phone,status,role_rights,created_at,guid) VALUES('Owner','+70000000088','active',?1,?2,'item-state-owner')",params![crate::db::owner_rights().to_string(),created]).unwrap();
+        let owner = source.last_insert_rowid();
+        source
+            .execute(
+                "INSERT INTO user_workspaces(user_id,workspace_id,rights_json) VALUES(?1,?2,?3)",
+                params![owner, workspace, crate::db::owner_rights().to_string()],
+            )
+            .unwrap();
+        record_membership_version(&source, workspace, owner, true, None, true).unwrap();
+        let key = SigningKey::generate(&mut OsRng);
+        let device = "item-state-device-1";
+        crate::device::register(&source,owner,&json!({"deviceId":device,"name":"Owner phone","publicKey":URL_SAFE_NO_PAD.encode(key.verifying_key().to_bytes())})).unwrap();
+        let proof = signed_device_proof(&key, device, "/api/trpc/items.create");
+        crate::device::set_pending(&source, owner, &proof).unwrap();
+        let created_item=crate::api::dispatch(&mut source,"items.create",&json!({"workspaceId":workspace,"title":"Signed drill","internalId":"I-0001","metadata":{"manual":"A-1"},"quantitative":true,"quantity":10,"unit":"pcs"}),Some(owner)).unwrap();
+        let item_guid = created_item["guid"].as_str().unwrap().to_string();
+        crate::device::set_pending(
+            &source,
+            owner,
+            &signed_device_proof(&key, device, "/api/trpc/transfers.take"),
+        )
+        .unwrap();
+        crate::api::dispatch(
+            &mut source,
+            "transfers.take",
+            &json!({"itemId":created_item["id"],"quantity":4}),
+            Some(owner),
+        )
+        .unwrap();
+        let valid = export_journal(&source);
+        assert_eq!(valid["itemStateVersions"].as_array().unwrap().len(), 1);
+        let accepted = apply_remote_journal(&target, &valid, "");
+        assert_eq!(accepted["ok"], true, "{accepted}");
+        assert_eq!(
+            target
+                .query_row("SELECT title FROM items WHERE guid=?1", [&item_guid], |r| r
+                    .get::<_, String>(0))
+                .unwrap(),
+            "Signed drill"
+        );
+        assert_eq!(target.query_row("SELECT COALESCE(sum(h.quantity),0) FROM item_holdings h JOIN items i ON i.id=h.item_id WHERE i.guid=?1 AND h.returned_at IS NULL",[&item_guid],|r|r.get::<_,f64>(0)).unwrap(),4.0);
+        let repeated = apply_remote_journal(&target, &export_journal(&source), "");
+        assert_eq!(repeated["ok"], true, "{repeated}");
+        assert_eq!(target.query_row("SELECT COALESCE(sum(h.quantity),0) FROM item_holdings h JOIN items i ON i.id=h.item_id WHERE i.guid=?1 AND h.returned_at IS NULL",[&item_guid],|r|r.get::<_,f64>(0)).unwrap(),4.0);
+        let target_owner = id_by_guid(&target, "users", "item-state-owner").unwrap();
+        let target_item = id_by_guid(&target, "items", &item_guid).unwrap();
+        crate::device::set_pending(
+            &source,
+            owner,
+            &signed_device_proof(&key, device, "/api/trpc/items.update"),
+        )
+        .unwrap();
+        crate::api::dispatch(
+            &mut source,
+            "items.update",
+            &json!({"id":created_item["id"],"title":"Offline branch A"}),
+            Some(owner),
+        )
+        .unwrap();
+        crate::device::set_pending(
+            &target,
+            target_owner,
+            &signed_device_proof(&key, device, "/api/trpc/items.update"),
+        )
+        .unwrap();
+        crate::api::dispatch(
+            &mut target,
+            "items.update",
+            &json!({"id":target_item,"title":"Offline branch B"}),
+            Some(target_owner),
+        )
+        .unwrap();
+        let branch_a = export_journal(&source);
+        let merged = apply_remote_journal(&target, &branch_a, "");
+        assert_eq!(merged["ok"], true, "{merged}");
+        let target_journal = export_journal(&target);
+        assert_eq!(
+            apply_remote_journal(&source, &target_journal, "")["ok"],
+            false
+        );
+        approve_node_key(
+            &source,
+            target_journal["journalPublicKey"].as_str().unwrap(),
+            Some("target"),
+            owner,
+        )
+        .unwrap();
+        let converged = apply_remote_journal(&source, &target_journal, "");
+        assert_eq!(converged["ok"], true, "{converged}");
+        let source_title: String = source
+            .query_row("SELECT title FROM items WHERE guid=?1", [&item_guid], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let target_title: String = target
+            .query_row("SELECT title FROM items WHERE guid=?1", [&item_guid], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(source_title, target_title);
+        assert_eq!(
+            source
+                .query_row(
+                    "SELECT count(*) FROM item_state_versions WHERE item_guid=?1",
+                    [&item_guid],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            3
+        );
+        let mut forged = valid;
+        let index = forged["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .position(|item| item["guid"] == item_guid)
+            .unwrap();
+        forged["items"][index]["title"] = json!("Node-forged drill");
+        ledger::sign_journal(&source, &mut forged).unwrap();
+        let result = apply_remote_journal(&rejected, &forged, "");
+        assert_eq!(result["ok"], false);
+        assert!(result["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("master-летописи"));
+        assert_eq!(
+            rejected
+                .query_row("SELECT count(*) FROM items", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
         drop((source, target, rejected));
         for path in [source_path, target_path, rejected_path] {
             let _ = std::fs::remove_file(path);

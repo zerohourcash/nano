@@ -162,7 +162,7 @@ check(
 )
 item_id = item.get("id") if isinstance(item, dict) else None
 create_event = next(
-    (entry for entry in item.get("history", []) if entry.get("type") == "create"),
+    (entry for entry in item.get("history", []) if entry.get("type") == "item_state_create"),
     {},
 ) if isinstance(item, dict) else {}
 check(

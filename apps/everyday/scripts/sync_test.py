@@ -349,7 +349,7 @@ def main() -> int:
         item_events = [
             event
             for event in journal.get("history", [])
-            if event.get("type") in {"create", "update"}
+            if event.get("type") in {"item_state_create", "item_state_update"}
             and event.get("itemGuid") == server_item.get("guid")
         ]
         check(
@@ -360,7 +360,8 @@ def main() -> int:
             str(item_events)[:300],
         )
 
-        node.call("sync.pullNow", {})
+        initial_pull = push_journal(node, journal)
+        check("первичный pull принят криптографическим импортом", initial_pull.get("ok") is True, str(initial_pull))
 
         print("\n== 4. Вход на узле офлайн ==")
         # Каталог закрыт без сессии, поэтому сначала логин — как только узел
@@ -585,7 +586,7 @@ def main() -> int:
             custody_synced
             and len(restored_material.get("holders", [])) == 1
             and restored_material.get("holders", [{}])[0].get("quantity") == 4,
-            str(restored_material)[:220],
+            str({key: restored_material.get(key) for key in ("issuedQty", "stockQty", "quantity", "holders")}),
         )
         bit_synced = wait_for(
             lambda: server.call("bit.balance", {"workspaceId": ws_id, "userId": owner["id"]}, mutation=False).get("balance") == 100

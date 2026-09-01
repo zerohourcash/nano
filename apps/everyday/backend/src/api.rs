@@ -1725,6 +1725,142 @@ fn items_next_id(conn: &Connection, input: &Value) -> ApiResult {
     Ok(json!(format!("{prefix}{:04}", max + 1)))
 }
 
+fn item_state_fields(conn: &Connection, id: i64) -> Result<(i64, String, Value), ApiError> {
+    conn.query_row(
+        "SELECT i.workspace_id,i.guid,i.internal_id,i.title,i.category_id,i.brand_id,i.status_id,i.responsible_user_id,i.building_site_id,i.storage_id,i.serial_number,i.qr_code,i.calibrated_until,i.min_quantity,i.quantitative,i.quantity,i.unit,i.cost,i.comment,i.source_system,i.external_id,i.metadata_json,i.organization_node_id
+         FROM items i WHERE i.id=?1",
+        [id],
+        |r| {
+            let ws:i64=r.get(0)?;
+            let reference=|table:&str,value:Option<i64>| value.and_then(|value| ledger::guid(conn,table,value).ok());
+            let metadata:Option<String>=r.get(21)?;
+            Ok((ws,r.get(1)?,json!({
+                "internalId":r.get::<_,String>(2)?,"title":r.get::<_,String>(3)?,
+                "categoryGuid":reference("categories",r.get(4)?),"brandGuid":reference("brands",r.get(5)?),
+                "statusSlug":r.get::<_,Option<i64>>(6)?.and_then(|id|conn.query_row("SELECT slug FROM statuses WHERE id=?1",[id],|row|row.get::<_,String>(0)).ok()),"responsibleGuid":reference("users",r.get(7)?),
+                "buildingSiteGuid":reference("building_sites",r.get(8)?),"storageGuid":reference("storages",r.get(9)?),
+                "serialNumber":r.get::<_,Option<String>>(10)?,"qrCode":r.get::<_,Option<String>>(11)?,
+                "calibratedUntil":r.get::<_,Option<String>>(12)?,"minQuantity":r.get::<_,Option<f64>>(13)?,
+                "quantitative":r.get::<_,i64>(14)?!=0,"quantity":r.get::<_,Option<f64>>(15)?,
+                "unit":r.get::<_,Option<String>>(16)?,"cost":r.get::<_,Option<f64>>(17)?,
+                "comment":r.get::<_,Option<String>>(18)?,"sourceSystem":r.get::<_,Option<String>>(19)?,
+                "externalId":r.get::<_,Option<String>>(20)?,
+                "metadata":metadata.and_then(|raw|serde_json::from_str::<Value>(&raw).ok()).unwrap_or_else(||json!({})),
+                "organizationNodeGuid":reference("organization_nodes",r.get(22)?),
+            })))
+        },
+    ).map_err(Into::into)
+}
+
+fn item_state_payload_hash(
+    item_guid: &str,
+    parent: Option<&str>,
+    depth: i64,
+    workspace_guid: &str,
+    actor_guid: &str,
+    fields: &Value,
+    updated_at: &str,
+) -> String {
+    let payload = json!({"domain":"everyday/item-state/v1","itemGuid":item_guid,"parentHash":parent,"depth":depth,"workspaceGuid":workspace_guid,"actorGuid":actor_guid,"fields":fields,"updatedAt":updated_at});
+    format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&payload).expect("JSON serialization"))
+    )
+}
+
+fn item_state_version_hash(payload_hash: &str, ledger_hash: &str) -> String {
+    format!(
+        "{:x}",
+        Sha256::digest(
+            format!("everyday/item-state-ledger/v1\n{payload_hash}\n{ledger_hash}").as_bytes()
+        )
+    )
+}
+
+fn record_item_state_version(
+    conn: &Connection,
+    id: i64,
+    uid: i64,
+    operation: &str,
+    note: &str,
+) -> Result<Value, ApiError> {
+    ledger::guid(conn, "items", id).map_err(|error| ApiError::internal(error.to_string()))?;
+    let (ws, item_guid, fields) = item_state_fields(conn, id)?;
+    let parent:Option<(String,i64)>=conn.query_row("SELECT version_hash,depth FROM item_state_versions WHERE item_guid=?1 ORDER BY depth DESC,version_hash DESC LIMIT 1",[&item_guid],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+    let (parent_hash, depth, event_type) = match (parent, operation) {
+        (Some((hash, depth)), _) => (Some(hash), depth + 1, "item_state_update"),
+        (None, "create") => (None, 0, "item_state_create"),
+        (None, _) => (None, 0, "item_state_adopt"),
+    };
+    let workspace_guid =
+        ledger::guid(conn, "workspaces", ws).map_err(|e| ApiError::internal(e.to_string()))?;
+    let actor_guid =
+        ledger::guid(conn, "users", uid).map_err(|e| ApiError::internal(e.to_string()))?;
+    let updated_at = now();
+    let payload_hash = item_state_payload_hash(
+        &item_guid,
+        parent_hash.as_deref(),
+        depth,
+        &workspace_guid,
+        &actor_guid,
+        &fields,
+        &updated_at,
+    );
+    let event = ledger::append(
+        conn,
+        ws,
+        uid,
+        Some(id),
+        event_type,
+        Some(&item_guid),
+        Some(&payload_hash),
+        None,
+        Some(note),
+    )
+    .map_err(|e| ApiError::internal(format!("Ошибка журнала: {e}")))?;
+    let ledger_hash = event["opId"]
+        .as_str()
+        .ok_or_else(|| ApiError::internal("Ledger не вернул hash"))?;
+    let version_hash = item_state_version_hash(&payload_hash, ledger_hash);
+    conn.execute("INSERT INTO item_state_versions(version_hash,item_guid,parent_hash,depth,workspace_guid,actor_guid,fields_json,payload_hash,ledger_hash,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",params![version_hash,item_guid,parent_hash,depth,workspace_guid,actor_guid,fields.to_string(),payload_hash,ledger_hash,updated_at])?;
+    Ok(json!({"versionHash":version_hash,"ledgerHash":ledger_hash}))
+}
+
+fn adopt_item_config_references(conn: &Connection, id: i64, uid: i64) -> Result<(), ApiError> {
+    let refs: (
+        Option<i64>,
+        Option<i64>,
+        Option<i64>,
+        Option<i64>,
+        Option<i64>,
+    ) = conn.query_row(
+        "SELECT category_id,brand_id,status_id,building_site_id,storage_id FROM items WHERE id=?1",
+        [id],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+    )?;
+    for (kind, value) in [
+        ("category", refs.0),
+        ("brand", refs.1),
+        ("status", refs.2),
+        ("site", refs.3),
+        ("storage", refs.4),
+    ] {
+        let Some(value) = value else { continue };
+        let table = config_kind_table(kind)?;
+        let guid = ledger::guid(conn, table, value)
+            .map_err(|error| ApiError::internal(error.to_string()))?;
+        let exists: i64 = conn.query_row(
+            "SELECT count(*) FROM config_versions WHERE kind=?1 AND entity_guid=?2",
+            params![kind, guid],
+            |r| r.get(0),
+        )?;
+        if exists == 0 {
+            record_config_version(conn, kind, value, uid, "adopt")?;
+        }
+    }
+    Ok(())
+}
+
 fn items_create(conn: &mut Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
     atomic(conn, |conn| items_create_atomic(conn, input, user_id))
 }
@@ -1774,18 +1910,8 @@ fn items_create_atomic(conn: &Connection, input: &Value, user_id: Option<i64>) -
             }
         }
     }
-    ledger::append(
-        conn,
-        ws,
-        uid,
-        Some(id),
-        "create",
-        None,
-        Some(&title),
-        None,
-        Some("Инструмент добавлен в каталог"),
-    )
-    .map_err(|e| ApiError::internal(format!("Ошибка журнала: {e}")))?;
+    adopt_item_config_references(conn, id, uid)?;
+    record_item_state_version(conn, id, uid, "create", "Инструмент добавлен в каталог")?;
     jsn::item_json(conn, id, true).ok_or_else(|| ApiError::bad("не создан"))
 }
 
@@ -1938,18 +2064,29 @@ fn items_update_atomic_bound(
         .map_or(("update", None, None), |(kind, from, to)| {
             (kind, Some(from), Some(to))
         });
-    let event = ledger::append(
-        conn,
-        ws,
-        uid,
-        Some(id),
-        event_type,
-        from_label,
-        to_label,
-        None,
-        Some(&note),
-    )
-    .map_err(|e| ApiError::internal(format!("Ошибка журнала: {e}")))?;
+    let event = if ledger_binding.is_none() {
+        adopt_item_config_references(conn, id, uid)?;
+        record_item_state_version(conn, id, uid, "update", &note)?
+    } else {
+        let bound_event = ledger::append(
+            conn,
+            ws,
+            uid,
+            Some(id),
+            event_type,
+            from_label,
+            to_label,
+            None,
+            Some(&note),
+        )
+        .map_err(|e| ApiError::internal(format!("Ошибка журнала: {e}")))?;
+        // Решение коммитит portable patch, а отдельная производная запись —
+        // полное получившееся master-состояние. Обе операции авторизованы тем
+        // же атомарным запросом и откатываются вместе.
+        adopt_item_config_references(conn, id, uid)?;
+        record_item_state_version(conn, id, uid, "update", "Master-состояние после решения")?;
+        bound_event
+    };
     let mut item = jsn::item_json(conn, id, true).ok_or_else(|| ApiError::not_found("нет"))?;
     if let Some(object) = item.as_object_mut() {
         object.insert("ledgerHash".into(), event["opId"].clone());

@@ -8,7 +8,7 @@
 | Требование | Реализация | Исполняемое доказательство | Статус |
 | --- | --- | --- | --- |
 | Подписанная выдача по QR | canonical `everyday:item:<UUID>`, Ed25519 device-proof, Ledger V2, append-only custody commitment и восстановление holdings | `npm run test:e2e`, `npm run sync:test`, Rust QR/custody tamper tests | Проверено |
-| Master-карточка ТМЦ | создание/изменение требует отдельный Ed25519-signed HTTP request; proof сохраняется в Ledger V2, signed batch запрещён | `npm run smoke`, `npm run sync:test`, Rust device policy tests | Проверено |
+| Master-карточка ТМЦ | создание/изменение требует отдельный Ed25519-signed HTTP request; полное portable state связано с Ledger, offline-ветви сходятся детерминированно, node-signed подмена snapshot отклоняется | Rust `device_signed_item_state_rejects_a_trusted_node_rewrite`, `npm run smoke`, `npm run sync:test` | Проверено |
 | Удаление без воскрешения | физические строки сохраняются; delete-wins item tombstone связан с device-signed Ledger и монотонно распространяется после offline-разрыва | `npm run smoke`, `npm run sync:test`, Rust forged-tombstone test | Проверено |
 | Текстовые комментарии ТМЦ | append-only SHA-256 record связан с device-signed Ledger; offline round-trip и подмена текста доверенной нодой проверяются до импорта | Rust `portable_text_fault_and_change_branches_reject_falsification`, integrity audit | Проверено |
 | Неисправности и ремонт | report/resolve — device-signed append-only branches; состояние восстанавливается из записей, concurrent offline-решения сходятся детерминированно, подмена решения отклоняется до импорта | Rust offline branch/forged-resolution test, `npm run smoke`, `npm run sync:test` | Проверено |
