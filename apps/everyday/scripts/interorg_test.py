@@ -111,6 +111,33 @@ def main() -> int:
               incoming["transactionId"] == transaction_id
               and incoming["contact"]["remoteWorkspaceGuid"] == ws_a["guid"]
               and incoming["body"]["text"] == text, str(incoming))
+        with sqlite3.connect(b.db) as database:
+            original_body = database.execute(
+                "SELECT body_json FROM interorg_inbox WHERE envelope_id=?",
+                (incoming["envelopeId"],),
+            ).fetchone()[0]
+            database.execute(
+                "UPDATE interorg_inbox SET body_json=? WHERE envelope_id=?",
+                (json.dumps({"text": "локальная подмена", "amount": 999999}), incoming["envelopeId"]),
+            )
+            database.commit()
+        forged_inbox_audit = b.call("sync.audit", None, mutation=False)
+        check("полный аудит повторно открывает AEAD envelope и обнаруживает подмену inbox",
+              forged_inbox_audit.get("healthy") is False
+              and "signed envelope" in (forged_inbox_audit.get("interorgInboxError") or ""),
+              str(forged_inbox_audit.get("interorgInboxError")))
+        with sqlite3.connect(b.db) as database:
+            database.execute(
+                "UPDATE interorg_inbox SET body_json=? WHERE envelope_id=?",
+                (original_body, incoming["envelopeId"]),
+            )
+            database.commit()
+        restored_inbox_audit = b.call("sync.audit", None, mutation=False)
+        check("после восстановления точного payload межорганизационный аудит снова здоров",
+              restored_inbox_audit.get("healthy") is True
+              and restored_inbox_audit.get("interorgInboxVerified") == 1
+              and restored_inbox_audit.get("interorgInboxLegacy") == 0,
+              str(restored_inbox_audit.get("interorgInboxError")))
         accepted = b.call("interorg.accept", {
             "workspaceId": ws_b["id"], "envelopeId": incoming["envelopeId"],
         })

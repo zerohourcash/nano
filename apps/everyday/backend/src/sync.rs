@@ -6907,6 +6907,7 @@ pub fn integrity_audit(conn: &Connection) -> Value {
     let sale_offer_result = verify_sale_offers(&snapshot);
     let membership_result = verify_membership_records(conn, &snapshot);
     let interorg_receipt_result = crate::interorg::verify_outbox(conn);
+    let interorg_inbox_result = crate::interorg::verify_inbox(conn);
 
     let count = |table: &str| -> i64 {
         conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
@@ -7014,6 +7015,10 @@ pub fn integrity_audit(conn: &Connection) -> Value {
         .as_ref()
         .err()
         .map(ToString::to_string);
+    let interorg_inbox_error = interorg_inbox_result
+        .as_ref()
+        .err()
+        .map(ToString::to_string);
     let healthy = database_check == "ok"
         && ledger_result.is_ok()
         && chat_result.is_ok()
@@ -7037,6 +7042,7 @@ pub fn integrity_audit(conn: &Connection) -> Value {
         && membership_result.is_ok()
         && sale_offer_result.is_ok()
         && interorg_receipt_result.is_ok()
+        && interorg_inbox_result.is_ok()
         && orphan_history == 0
         && missing_guids == 0
         && missing_blobs == 0
@@ -7060,6 +7066,7 @@ pub fn integrity_audit(conn: &Connection) -> Value {
         "inventoryRecords":count("inventory_records"),
         "photos":count("item_photos"),
         "documents":count("item_documents"),
+        "interorgInbox":count("interorg_inbox"),
         "interorgOutbox":count("interorg_outbox"),
     });
     let mut audit = json!({
@@ -7121,6 +7128,26 @@ pub fn integrity_audit(conn: &Connection) -> Value {
         object.insert(
             "interorgReceiptError".into(),
             interorg_receipt_error
+                .map(Value::String)
+                .unwrap_or(Value::Null),
+        );
+        object.insert(
+            "interorgInboxVerified".into(),
+            json!(interorg_inbox_result
+                .as_ref()
+                .map(|(verified, _)| *verified)
+                .unwrap_or(0)),
+        );
+        object.insert(
+            "interorgInboxLegacy".into(),
+            json!(interorg_inbox_result
+                .as_ref()
+                .map(|(_, legacy)| *legacy)
+                .unwrap_or(0)),
+        );
+        object.insert(
+            "interorgInboxError".into(),
+            interorg_inbox_error
                 .map(Value::String)
                 .unwrap_or(Value::Null),
         );

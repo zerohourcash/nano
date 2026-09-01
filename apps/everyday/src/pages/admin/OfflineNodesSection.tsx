@@ -433,11 +433,18 @@ export default function OfflineNodesSection() {
               <div>CAS-файлов: <b>{auditQ.data?.counts.blobs ?? 0}</b></div>
               <div>Страниц знаний: <b>{auditQ.data?.counts.knowledgePages ?? 0}</b></div>
               <div>Ревизий знаний: <b>{auditQ.data?.counts.knowledgeRevisions ?? 0}</b></div>
+              <div>Входящих межорг. транзакций: <b>{auditQ.data?.interorgInboxVerified ?? 0}</b></div>
+              <div>Legacy межорг. транзакций: <b>{auditQ.data?.interorgInboxLegacy ?? 0}</b></div>
               <div>Недокачанных файлов: <b>{auditQ.data?.missingBlobs ?? 0}</b></div>
             </div>
-            {(auditQ.data?.ledgerError || auditQ.data?.chatError || auditQ.data?.deviceError || auditQ.data?.custodyError || auditQ.data?.itemTombstoneError || auditQ.data?.itemCommentError || auditQ.data?.faultError || auditQ.data?.changeRequestError || auditQ.data?.configError || auditQ.data?.itemStateError || auditQ.data?.organizationNodeError || auditQ.data?.inventoryError || auditQ.data?.membershipError || auditQ.data?.accountingError || auditQ.data?.knowledgeError || auditQ.data?.snapshotError) && (
+            {(auditQ.data?.ledgerError || auditQ.data?.chatError || auditQ.data?.deviceError || auditQ.data?.custodyError || auditQ.data?.itemTombstoneError || auditQ.data?.itemCommentError || auditQ.data?.faultError || auditQ.data?.changeRequestError || auditQ.data?.configError || auditQ.data?.itemStateError || auditQ.data?.organizationNodeError || auditQ.data?.inventoryError || auditQ.data?.membershipError || auditQ.data?.accountingError || auditQ.data?.knowledgeError || auditQ.data?.interorgInboxError || auditQ.data?.interorgReceiptError || auditQ.data?.snapshotError) && (
               <p className="text-sm text-danger break-all">
-                {auditQ.data.ledgerError || auditQ.data.chatError || auditQ.data.deviceError || auditQ.data.custodyError || auditQ.data.itemTombstoneError || auditQ.data.itemCommentError || auditQ.data.faultError || auditQ.data.changeRequestError || auditQ.data.configError || auditQ.data.itemStateError || auditQ.data.organizationNodeError || auditQ.data.inventoryError || auditQ.data.membershipError || auditQ.data.accountingError || auditQ.data.knowledgeError || auditQ.data.snapshotError}
+                {auditQ.data.ledgerError || auditQ.data.chatError || auditQ.data.deviceError || auditQ.data.custodyError || auditQ.data.itemTombstoneError || auditQ.data.itemCommentError || auditQ.data.faultError || auditQ.data.changeRequestError || auditQ.data.configError || auditQ.data.itemStateError || auditQ.data.organizationNodeError || auditQ.data.inventoryError || auditQ.data.membershipError || auditQ.data.accountingError || auditQ.data.knowledgeError || auditQ.data.interorgInboxError || auditQ.data.interorgReceiptError || auditQ.data.snapshotError}
+              </p>
+            )}
+            {(auditQ.data?.interorgInboxLegacy ?? 0) > 0 && (
+              <p className="rounded-xl bg-warning-bg p-3 text-sm text-warning">
+                Старые межорганизационные записи без сохранённого source envelope нельзя повторно криптографически подтвердить. Они явно отмечены legacy и не включены в число проверенных.
               </p>
             )}
             <div className="flex items-center gap-2">

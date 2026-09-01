@@ -128,7 +128,8 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
            envelope_id TEXT PRIMARY KEY, workspace_id INTEGER NOT NULL,
            contact_guid TEXT NOT NULL, transaction_id TEXT NOT NULL,
            kind TEXT NOT NULL, body_json TEXT NOT NULL,
-           received_at TEXT NOT NULL, accepted INTEGER NOT NULL DEFAULT 0
+           received_at TEXT NOT NULL, accepted INTEGER NOT NULL DEFAULT 0,
+           source_envelope_json TEXT
          );
          CREATE TABLE IF NOT EXISTS interorg_outbox(
            workspace_id INTEGER NOT NULL, transaction_id TEXT NOT NULL,
@@ -148,6 +149,17 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
     if !has_acceptance_proof {
         conn.execute(
             "ALTER TABLE interorg_outbox ADD COLUMN acceptance_proof_json TEXT",
+            [],
+        )?;
+    }
+    let has_source_envelope = conn
+        .prepare("PRAGMA table_info(interorg_inbox)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .flatten()
+        .any(|name| name == "source_envelope_json");
+    if !has_source_envelope {
+        conn.execute(
+            "ALTER TABLE interorg_inbox ADD COLUMN source_envelope_json TEXT",
             [],
         )?;
     }
@@ -445,6 +457,102 @@ pub fn verify_outbox(conn: &Connection) -> Result<usize> {
     Ok(verified)
 }
 
+/// Replays the cryptographic opening of every new inbox row against the exact
+/// envelope retained at delivery time. Relay envelopes are intentionally
+/// short-lived, so the authenticated source is copied into the inbox before
+/// relay garbage collection. Rows created by older releases remain explicit
+/// legacy records instead of receiving a false verification claim.
+pub fn verify_inbox(conn: &Connection) -> Result<(usize, usize)> {
+    let mut statement = conn.prepare(
+        "SELECT i.envelope_id,i.workspace_id,i.transaction_id,i.kind,i.body_json,i.accepted,
+                i.source_envelope_json,w.guid,c.remote_workspace_guid,c.signing_key,
+                d.secret_ciphertext,d.nonce
+         FROM interorg_inbox i
+         JOIN workspaces w ON w.id=i.workspace_id
+         JOIN interorg_contacts c ON c.guid=i.contact_guid AND c.workspace_id=i.workspace_id
+         JOIN interorg_identities d ON d.workspace_id=i.workspace_id",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, bool>(5)?,
+            row.get::<_, Option<String>>(6)?,
+            row.get::<_, String>(7)?,
+            row.get::<_, String>(8)?,
+            row.get::<_, String>(9)?,
+            row.get::<_, String>(10)?,
+            row.get::<_, String>(11)?,
+        ))
+    })?;
+    let mut verified = 0;
+    let mut legacy = 0;
+    for row in rows {
+        let (
+            envelope_id,
+            workspace_id,
+            transaction_id,
+            kind,
+            body_json,
+            accepted,
+            source_envelope,
+            workspace_guid,
+            remote_workspace_guid,
+            signing_key,
+            identity_ciphertext,
+            identity_nonce,
+        ) = row?;
+        let Some(source_envelope) = source_envelope else {
+            legacy += 1;
+            continue;
+        };
+        let envelope: Envelope = serde_json::from_str(&source_envelope)
+            .with_context(|| format!("interorg inbox {envelope_id} has invalid source envelope"))?;
+        let created = DateTime::parse_from_rfc3339(&envelope.created_at)?.with_timezone(&Utc);
+        // Historical verification must not fail merely because the transport
+        // TTL elapsed after successful delivery. Signature, bounded original
+        // TTL and AEAD are still checked at the envelope's creation instant.
+        validate(&envelope, created, 0)
+            .with_context(|| format!("interorg inbox {envelope_id} source verification failed"))?;
+        let secret =
+            decrypt_identity_secret(conn, workspace_id, &identity_ciphertext, &identity_nonce)?;
+        let payload = decrypt_payload(&envelope, &secret)
+            .with_context(|| format!("interorg inbox {envelope_id} source decryption failed"))?;
+        let stored_body: serde_json::Value = serde_json::from_str(&body_json)
+            .with_context(|| format!("interorg inbox {envelope_id} has invalid body"))?;
+        if envelope.id != envelope_id
+            || envelope.sender_signing_key != signing_key
+            || payload.sender_workspace != remote_workspace_guid
+            || payload.recipient_workspace != workspace_guid
+            || payload.transaction_id != transaction_id
+            || payload.kind != kind
+            || payload.body != stored_body
+        {
+            bail!("interorg inbox {envelope_id} payload does not match signed envelope")
+        }
+        let acceptance_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM history_entries
+             WHERE workspace_id=?1 AND type='interorg_accept' AND from_label=?2
+               AND to_label=?3 AND event_version=3 AND request_path='/api/trpc/interorg.accept'
+               AND json_extract(request_body,'$.0.json.envelopeId')=?2",
+            params![workspace_id, envelope_id, transaction_id],
+            |row| row.get(0),
+        )?;
+        if (accepted && acceptance_count != 1) || (!accepted && acceptance_count != 0) {
+            bail!("interorg inbox {envelope_id} acceptance is not bound to one V3 ledger event")
+        }
+        verified += 1;
+    }
+    let total: i64 = conn.query_row("SELECT COUNT(*) FROM interorg_inbox", [], |row| row.get(0))?;
+    if total != verified + legacy {
+        bail!("interorg inbox contains orphaned organization/contact/identity rows")
+    }
+    Ok((verified as usize, legacy as usize))
+}
+
 /// Marks an inbox transaction accepted and emits a separately encrypted,
 /// store-and-forward receipt to the sender. The receipt commits to the
 /// receiver's append-only ledger event without exposing either organization
@@ -617,9 +725,9 @@ pub fn receive_local(conn: &Connection, work_bits: u8) -> Result<usize> {
                 continue;
             }
             let changed = conn.execute(
-                "INSERT OR IGNORE INTO interorg_inbox(envelope_id,workspace_id,contact_guid,transaction_id,kind,body_json,received_at)
-                 VALUES(?1,?2,?3,?4,?5,?6,?7)",
-                params![envelope.id, workspace_id, contact_guid, payload.transaction_id, payload.kind, payload.body.to_string(), Utc::now().to_rfc3339()],
+                "INSERT OR IGNORE INTO interorg_inbox(envelope_id,workspace_id,contact_guid,transaction_id,kind,body_json,received_at,source_envelope_json)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+                params![envelope.id, workspace_id, contact_guid, payload.transaction_id, payload.kind, payload.body.to_string(), Utc::now().to_rfc3339(), serde_json::to_string(&envelope)?],
             )?;
             if changed == 1 {
                 conn.execute(
@@ -862,6 +970,10 @@ pub fn gossip_batch(conn: &Connection, limit: usize) -> Result<Vec<Envelope>> {
 
 pub fn open(envelope: &Envelope, recipient_secret: &[u8; 32], work_bits: u8) -> Result<Payload> {
     validate(envelope, Utc::now(), work_bits)?;
+    decrypt_payload(envelope, recipient_secret)
+}
+
+fn decrypt_payload(envelope: &Envelope, recipient_secret: &[u8; 32]) -> Result<Payload> {
     let secret = StaticSecret::from(*recipient_secret);
     let public = XPublicKey::from(&secret);
     if destination(public.as_bytes()) != envelope.destination {
@@ -1105,7 +1217,12 @@ mod tests {
         let db = Connection::open_in_memory().unwrap();
         db.execute_batch(
             "CREATE TABLE kv(k TEXT PRIMARY KEY,v TEXT NOT NULL);
-             CREATE TABLE workspaces(id INTEGER PRIMARY KEY,guid TEXT NOT NULL);",
+             CREATE TABLE workspaces(id INTEGER PRIMARY KEY,guid TEXT NOT NULL);
+             CREATE TABLE history_entries(
+               workspace_id INTEGER NOT NULL,type TEXT NOT NULL,
+               from_label TEXT,to_label TEXT,event_version INTEGER,
+               request_path TEXT,request_body TEXT
+             );",
         )
         .unwrap();
         db.execute("INSERT INTO workspaces(id,guid) VALUES(1,?1)", [guid])
@@ -1151,7 +1268,8 @@ mod tests {
             .is_ok());
         assert!(db
             .execute(
-                "INSERT INTO interorg_inbox VALUES('new',1,'contact','tx','invoice','{}','2026-01-03T00:00:00Z',0)",
+                "INSERT INTO interorg_inbox(envelope_id,workspace_id,contact_guid,transaction_id,kind,body_json,received_at,accepted)
+                 VALUES('new',1,'contact','tx','invoice','{}','2026-01-03T00:00:00Z',0)",
                 [],
             )
             .is_err());
@@ -1223,6 +1341,29 @@ mod tests {
         assert_eq!(initial_inbox[0]["transactionId"], transaction_id);
         assert_eq!(initial_inbox[0]["body"]["amount"], 125);
         assert_eq!(initial_inbox[0]["contact"]["remoteWorkspaceGuid"], "org-a");
+        assert_eq!(verify_inbox(&b).unwrap(), (1, 0));
+        let original_body: String = b
+            .query_row(
+                "SELECT body_json FROM interorg_inbox WHERE envelope_id=?1",
+                [&envelope.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        b.execute(
+            "UPDATE interorg_inbox SET body_json=?1 WHERE envelope_id=?2",
+            params![r#"{"amount":999999}"#, envelope.id],
+        )
+        .unwrap();
+        assert!(verify_inbox(&b)
+            .unwrap_err()
+            .to_string()
+            .contains("signed envelope"));
+        b.execute(
+            "UPDATE interorg_inbox SET body_json=?1 WHERE envelope_id=?2",
+            params![original_body, envelope.id],
+        )
+        .unwrap();
+        assert_eq!(verify_inbox(&b).unwrap(), (1, 0));
 
         // A trusted (or compromised) sender cannot replay the same semantic
         // transaction under a fresh envelope ID and substitute another body.
