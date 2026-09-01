@@ -191,6 +191,14 @@ test('browser signs a real custody transaction and ledger retains its proof', as
   expect(
     qrItem.history.find(entry => entry.type === 'item_state_create')?.requestDeviceId
   ).toBeTruthy();
+  await page.getByRole('button', { name: 'Печать QR' }).click();
+  const qrPngData = await page.evaluate(() => {
+    const canvas = document.getElementById('item-qr-canvas') as HTMLCanvasElement | null;
+    if (!canvas) throw new Error('export QR canvas is missing');
+    return canvas.toDataURL('image/png');
+  });
+  const qrPng = Buffer.from(qrPngData.split(',')[1], 'base64');
+  await page.getByRole('button', { name: 'Закрыть' }).click();
   await page.goto('/scan');
   const manualCode = page.getByPlaceholder('Или вставьте ссылку / токен');
   await manualCode.fill('everyday:item:00000000-0000-4000-8000-000000000000');
@@ -222,6 +230,46 @@ test('browser signs a real custody transaction and ledger retains its proof', as
   expect(qrEvent).toMatchObject({ eventVersion: 2 });
   expect(qrEvent?.requestDeviceId).toBeTruthy();
   expect(qrEvent?.requestHash).toMatch(/^[a-f0-9]{64}$/);
+
+  const inventory = await trpc<{ id: number; number: string }>(
+    page,
+    'inventory.create',
+    { workspaceId: workspaces[0].id }
+  );
+  await page.goto('/inventory');
+  await page.getByText(inventory.number, { exact: true }).click();
+  await page.getByRole('button', { name: 'Сканировать QR' }).first().click();
+  const inventoryScanner = page.getByTestId('inventory-qr-scanner');
+  await expect(inventoryScanner).toBeVisible();
+  const inventoryCode = inventoryScanner.getByPlaceholder('Или вставьте ссылку / токен');
+  await inventoryCode.fill('everyday:item:00000000-0000-4000-8000-000000000000');
+  await inventoryScanner.getByRole('button', { name: 'Далее' }).click();
+  await expect(page.getByText('QR не относится к позиции этой инвентаризации')).toBeVisible();
+  await inventoryScanner.locator('input[type="file"]').setInputFiles({
+    name: 'real-tool-qr.png',
+    mimeType: 'image/png',
+    buffer: qrPng,
+  });
+  await expect(page.getByText('Отмечено: Шуруповёрт QR E2E')).toBeVisible({ timeout: 10_000 });
+  await inventoryScanner.getByRole('button', { name: 'Закрыть сканер' }).click();
+  const inventoryAfterScan = await trpc<{
+    results: Array<{ itemId: number; checked: boolean; actualQty: number | null }>;
+  }>(page, 'inventory.byId', { id: inventory.id }, false);
+  expect(inventoryAfterScan.results.find(result => result.itemId === qrItem.id)).toMatchObject({
+    checked: true,
+    actualQty: 1,
+  });
+  const inventoryHistory = await trpc<Array<{
+    type: string;
+    eventVersion: number;
+    requestDeviceId?: string;
+    requestHash?: string;
+  }>>(page, 'history.all', { workspaceId: workspaces[0].id, limit: 500 }, false);
+  expect(inventoryHistory.find(entry => entry.type === 'inventory_check')).toMatchObject({
+    eventVersion: 3,
+    requestDeviceId: expect.any(String),
+    requestHash: expect.stringMatching(/^[a-f0-9]{64}$/),
+  });
 
   await page.goto('/knowledge');
   await expect(

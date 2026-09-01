@@ -5,6 +5,7 @@ import { cn } from '@/lib/utils'
 interface Props {
   onCode: (code: string) => void
   className?: string
+  subjectLabel?: string
 }
 
 type NativeBridge = {
@@ -38,7 +39,7 @@ async function openCamera(): Promise<MediaStream> {
   throw last instanceof Error ? last : new Error('camera')
 }
 
-export default function QrScanner({ onCode, className }: Props) {
+export default function QrScanner({ onCode, className, subjectLabel = 'QR-код' }: Props) {
   const videoRef = useRef<HTMLVideoElement>(null)
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const fileRef = useRef<HTMLInputElement>(null)
@@ -166,7 +167,7 @@ export default function QrScanner({ onCode, className }: Props) {
           <div className="flex h-14 w-14 items-center justify-center rounded-2xl bg-brand-50 text-brand-600">
             <Camera size={28} />
           </div>
-          <p className="text-sm font-semibold text-ink-900">Наведите камеру на QR группы</p>
+          <p className="text-sm font-semibold text-ink-900">Наведите камеру на {subjectLabel}</p>
           <p className="text-[13px] text-ink-500">Откроется системная камера телефона — так она работает стабильнее, чем в браузере.</p>
           <button
             type="button"

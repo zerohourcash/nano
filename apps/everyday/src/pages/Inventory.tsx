@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import { AnimatePresence, animate, motion } from 'framer-motion'
 import {
   ArrowLeft,
@@ -19,6 +19,7 @@ import type { inferRouterOutputs } from '@trpc/server'
 import type { AppRouter } from '../../api/router'
 import { trpc } from '@/providers/trpc'
 import { cn } from '@/lib/utils'
+import QrScanner from '@/components/QrScanner'
 
 type RouterOutputs = inferRouterOutputs<AppRouter>
 type SessionListItem = RouterOutputs['inventory']['sessions'][number]
@@ -571,7 +572,7 @@ function SessionView({
   const sitesQ = trpc.admin.buildingSites.list.useQuery()
 
   const [manualId, setManualId] = useState('')
-  const [scanTarget, setScanTarget] = useState<ResultRow | null>(null)
+  const [scannerOpen, setScannerOpen] = useState(false)
   const [confirmOpen, setConfirmOpen] = useState(false)
   const [summaryOpen, setSummaryOpen] = useState(false)
 
@@ -640,17 +641,36 @@ function SessionView({
   }
 
   const openScanner = () => {
-    const target = sortedResults.find((r) => !r.checked)
-    if (!target) {
+    if (!sortedResults.some((r) => !r.checked)) {
       showToast('Все позиции уже проверены')
       return
     }
-    setScanTarget(target)
+    setScannerOpen(true)
   }
 
-  const handleScanDetected = () => {
-    if (scanTarget) doCheck(scanTarget, scanTarget.expectedQty ?? undefined)
-    setScanTarget(null)
+  const handleScannedCode = (raw: string) => {
+    const code = raw.trim().toLowerCase()
+    const canonical = code.match(/^everyday:item:([0-9a-f-]{36})$/)?.[1]
+    const match = sortedResults.find((row) => {
+      const item = row.item
+      if (!item) return false
+      // Rust includes the globally portable GUID; the legacy TypeScript
+      // adapter only declares the local catalog fields.
+      const identity = item as typeof item & { guid?: string; qrCode?: string }
+      const guid = String(identity.guid ?? '').toLowerCase()
+      const internalId = String(identity.internalId ?? '').toLowerCase()
+      const qrCode = String(identity.qrCode ?? '').toLowerCase()
+      return canonical ? guid === canonical : code === internalId || code === qrCode || code === guid
+    })
+    if (!match) {
+      showToast('QR не относится к позиции этой инвентаризации', 'error')
+      return
+    }
+    if (match.checked) {
+      showToast(`Уже отмечено: ${match.item?.title ?? match.itemId}`)
+      return
+    }
+    doCheck(match, match.expectedQty ?? undefined)
   }
 
   const submitManual = (e: React.FormEvent) => {
@@ -883,13 +903,11 @@ function SessionView({
 
       {/* ── Оверлеи ── */}
       <AnimatePresence>
-        {scanTarget && (
+        {scannerOpen && (
           <ScannerOverlay
             key="scanner"
-            itemTitle={scanTarget.item?.title ?? ''}
-            itemInternalId={scanTarget.item?.internalId ?? ''}
-            onCancel={() => setScanTarget(null)}
-            onDetected={handleScanDetected}
+            onCancel={() => setScannerOpen(false)}
+            onCode={handleScannedCode}
           />
         )}
       </AnimatePresence>
@@ -1084,116 +1102,33 @@ function ResultRowView({
   )
 }
 
-// ─── Сканер-оверлей (визуальный макет камеры) ───────────────────────────────
+// ─── Настоящий QR-сканер камеры / фото / Android native bridge ──────────────
 
 function ScannerOverlay({
-  itemTitle,
-  itemInternalId,
   onCancel,
-  onDetected,
+  onCode,
 }: {
-  itemTitle: string
-  itemInternalId: string
   onCancel: () => void
-  onDetected: () => void
+  onCode: (code: string) => void
 }) {
-  const [found, setFound] = useState(false)
-  const detectedRef = useRef(onDetected)
-
-  useEffect(() => {
-    detectedRef.current = onDetected
-  }, [onDetected])
-
-  useEffect(() => {
-    const t1 = setTimeout(() => setFound(true), 2200)
-    const t2 = setTimeout(() => detectedRef.current(), 2800)
-    return () => {
-      clearTimeout(t1)
-      clearTimeout(t2)
-    }
-  }, [])
-
   return (
     <motion.div
       initial={{ opacity: 0 }}
       animate={{ opacity: 1 }}
       exit={{ opacity: 0 }}
       transition={{ duration: 0.2 }}
-      className="fixed inset-0 z-[70] flex flex-col items-center justify-center bg-[#2E3160]/95 backdrop-blur-sm p-4"
+      className="fixed inset-0 z-[70] overflow-y-auto bg-[#2E3160]/95 backdrop-blur-sm p-4"
+      data-testid="inventory-qr-scanner"
     >
-      {/* Видоискатель */}
-      <motion.div
-        animate={
-          found
-            ? { borderColor: '#2E9E5B', boxShadow: '0 0 0 4px #2E9E5B55, 0 0 32px #2E9E5B88' }
-            : { borderColor: '#66C6BE', boxShadow: '0 0 0 1px #66C6BE33' }
-        }
-        transition={{ duration: 0.25 }}
-        className="relative h-[280px] w-[320px] max-w-[88vw] overflow-hidden rounded-2xl border-2 bg-[#23264D]"
-      >
-        {/* Уголки рамки */}
-        {[
-          'left-3 top-3 border-l-[3px] border-t-[3px] rounded-tl-lg',
-          'right-3 top-3 border-r-[3px] border-t-[3px] rounded-tr-lg',
-          'left-3 bottom-3 border-l-[3px] border-b-[3px] rounded-bl-lg',
-          'right-3 bottom-3 border-r-[3px] border-b-[3px] rounded-br-lg',
-        ].map((cls) => (
-          <span
-            key={cls}
-            className={cn('absolute h-8 w-8 transition-colors duration-200', cls)}
-            style={{ borderColor: found ? '#2E9E5B' : '#66C6BE' }}
-          />
-        ))}
-
-        {/* Декоративные узлы mesh-сети */}
-        <span className="absolute left-[18%] top-[26%] h-1.5 w-1.5 rounded-full bg-teal/40" />
-        <span className="absolute left-[70%] top-[18%] h-1 w-1 rounded-full bg-brand-100/40" />
-        <span className="absolute left-[82%] top-[62%] h-1.5 w-1.5 rounded-full bg-teal/30" />
-        <span className="absolute left-[30%] top-[74%] h-1 w-1 rounded-full bg-brand-100/30" />
-
-        {/* Сканирующая линия */}
-        {!found && (
-          <motion.div
-            className="absolute left-4 right-4 top-3 h-0.5 rounded-full"
-            style={{
-              background: 'linear-gradient(90deg, transparent, #66C6BE, transparent)',
-              boxShadow: '0 0 14px #66C6BE, 0 0 4px #66C6BE',
-            }}
-            animate={{ y: [0, 248] }}
-            transition={{ duration: 1.5, repeat: Infinity, repeatType: 'mirror', ease: 'easeInOut' }}
-          />
-        )}
-
-        {/* Распознано */}
-        <AnimatePresence>
-          {found && (
-            <motion.div
-              initial={{ opacity: 0, scale: 0.8 }}
-              animate={{ opacity: 1, scale: 1 }}
-              transition={{ type: 'spring', stiffness: 300, damping: 22 }}
-              className="absolute inset-0 flex flex-col items-center justify-center gap-2 px-6 text-center"
-            >
-              <span className="flex h-14 w-14 items-center justify-center rounded-full bg-success text-white">
-                <Check size={28} strokeWidth={3} />
-              </span>
-              <div className="font-mono-num text-teal">{itemInternalId}</div>
-              <div className="text-sm font-semibold text-white">{itemTitle}</div>
-            </motion.div>
-          )}
-        </AnimatePresence>
-      </motion.div>
-
-      <div className="mt-5 text-center text-sm text-white/80">
-        {found ? 'Распознано — отмечаем позицию…' : 'Наведите камеру на QR-код инструмента'}
+      <div className="mx-auto flex min-h-full w-full max-w-md flex-col justify-center py-4">
+        <div className="mb-3 flex items-center justify-between text-white">
+          <div><h2 className="font-semibold">Сканирование инвентаризации</h2><p className="text-xs text-white/70">Каждый распознанный QR проверяется по текущей сессии</p></div>
+          <button type="button" onClick={onCancel} className="flex h-10 w-10 items-center justify-center rounded-xl border border-white/25" aria-label="Закрыть сканер"><X size={18} /></button>
+        </div>
+        <div className="rounded-2xl bg-white p-4 shadow-modal">
+          <QrScanner onCode={onCode} subjectLabel="QR-код инструмента" />
+        </div>
       </div>
-
-      <button
-        type="button"
-        onClick={onCancel}
-        className="mt-6 h-11 rounded-xl border border-white/25 px-6 text-sm font-semibold text-white transition-colors hover:bg-white/10"
-      >
-        Отмена
-      </button>
     </motion.div>
   )
 }
