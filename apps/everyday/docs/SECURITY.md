@@ -394,9 +394,11 @@ capability, затем применяют только её scope. Неверн�
   `interorg.importGossip` требует device-proof и применяет batch в одной
   SQLite-транзакции: неверная Ed25519-подпись, TTL, PoW либо структура любого
   envelope откатывает все новые строки и не подтверждает durable BLE spool.
-  Desktop/PWA экспортирует тот же scoped batch как файл с отдельным MIME;
-  импорт до чтения ограничен 3 МБ, проверяет format/version/count в браузере и
-  затем всё равно проходит signed backend mutation. Расширение, MIME и канал
+  Desktop/PWA экспортирует тот же scoped batch как файл с отдельным MIME.
+  Exact API route имеет отдельный body limit 3 МБ + 64 КиБ для tRPC wrapper и
+  отклоняет больший upload HTTP 413 до JSON, подписи и SQLite; сам bundle
+  независимо ограничен backend-валидатором 3 МБ. Браузер также проверяет
+  format/version/count, затем всё равно вызывает signed backend mutation. Расширение, MIME и канал
   доставки не являются доверием: поддельный batch отклоняется валидатором
   envelope до изменения БД.
   Фоновый IP-gossip включается отдельным `MESHKEEPER_RELAY_PEERS`; эти связи не

@@ -22,6 +22,26 @@ def unauthorized_journal(node: Node) -> int:
         return error.code
 
 
+def oversized_import_status(node: Node) -> int:
+    # Route-specific Axum limit must reject the body before JSON parsing,
+    # session lookup, device signature verification, or SQLite locking.
+    body = b"x" * (3 * 1024 * 1024 + 64 * 1024 + 1)
+    request = urllib.request.Request(
+        f"{node.base}/api/trpc/interorg.importGossip?batch=1",
+        data=body,
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "Origin": node.base,
+        },
+    )
+    try:
+        urllib.request.urlopen(request, timeout=5)
+        return 200
+    except urllib.error.HTTPError as error:
+        return error.code
+
+
 def item_titles(node: Node, workspace_id: int) -> list[str]:
     value = node.call("items.list", {"workspaceId": workspace_id}, mutation=False)
     rows = value.get("rows", []) if isinstance(value, dict) else value
@@ -40,6 +60,8 @@ def main() -> int:
     b = Node("interorg-b", free_port(), {})
     try:
         check("две независимые ноды запущены без общей capability", a.wait_ready() and b.wait_ready())
+        check("oversized gossip отклонён HTTP 413 до JSON/signature/SQLite",
+              oversized_import_status(a) == 413)
         a.call("auth.register", {
             "fullName": "Владелец А", "phone": "+7 900 810-00-01",
             "password": "InterorgOwnerA123", "workspaceName": "Организация А",

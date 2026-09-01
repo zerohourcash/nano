@@ -7745,6 +7745,7 @@ fn interorg_outbox(conn: &Connection, input: &Value) -> ApiResult {
 }
 
 const MAX_INTERORG_GOSSIP_ENVELOPES: usize = 32;
+const MAX_INTERORG_GOSSIP_BYTES: usize = 3 * 1024 * 1024;
 
 fn interorg_gossip(conn: &Connection, input: &Value) -> ApiResult {
     let ws = i64v(input, "workspaceId").unwrap_or_else(|| ws_fallback(conn));
@@ -7766,6 +7767,12 @@ fn interorg_import_gossip(conn: &mut Connection, input: &Value) -> ApiResult {
         || bundle.get("version").and_then(Value::as_u64) != Some(1)
     {
         return Err(ApiError::bad("Неподдерживаемый interorg gossip bundle"));
+    }
+    let serialized_size = serde_json::to_vec(bundle)
+        .map_err(|_| ApiError::bad("Некорректный interorg gossip bundle"))?
+        .len();
+    if serialized_size > MAX_INTERORG_GOSSIP_BYTES {
+        return Err(ApiError::bad("Interorg gossip bundle превышает 3 МБ"));
     }
     let envelopes = bundle
         .get("envelopes")
@@ -11059,6 +11066,19 @@ mod tests {
         .unwrap();
         assert_eq!(imported["duplicates"], 1);
         assert_eq!(imported["stored"], 0);
+        let oversized_gossip = dispatch(
+            &mut conn,
+            "interorg.importGossip",
+            &json!({"bundle":{
+                "format":"everyday-interorg-gossip",
+                "version":1,
+                "envelopes":[{"ciphertext":"x".repeat(MAX_INTERORG_GOSSIP_BYTES)}]
+            }}),
+            Some(users[0]),
+        )
+        .unwrap_err();
+        assert_eq!(oversized_gossip.http, 400);
+        assert!(oversized_gossip.message.contains("3 МБ"));
         let local_encryption: [u8; 32] = STANDARD
             .decode(identity["publicKey"].as_str().unwrap())
             .unwrap()

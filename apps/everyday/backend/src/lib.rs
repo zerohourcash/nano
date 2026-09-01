@@ -42,6 +42,10 @@ struct AppState {
 }
 
 const MAX_REQUEST_BYTES: usize = 32 * 1024 * 1024;
+// 32 maximal interorg envelopes fit below 3 MiB. Keep a small allowance for
+// the tRPC wrapper while rejecting a generic 32 MiB upload before it is read
+// into memory by the handler.
+const MAX_INTERORG_GOSSIP_REQUEST_BYTES: usize = 3 * 1024 * 1024 + 64 * 1024;
 
 /// Единый защитный контур для API и SPA. Заголовки выставляются самим узлом,
 /// поэтому защита остаётся и при ошибочной конфигурации reverse proxy.
@@ -175,7 +179,36 @@ async fn trpc(
     method: Method,
     headers: HeaderMap,
     body: Bytes,
-) -> impl IntoResponse {
+) -> Response {
+    trpc_request(state, procedures, q, method, headers, body).await
+}
+
+async fn trpc_interorg_import(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<HashMap<String, String>>,
+    method: Method,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    trpc_request(
+        state,
+        "interorg.importGossip".to_owned(),
+        q,
+        method,
+        headers,
+        body,
+    )
+    .await
+}
+
+async fn trpc_request(
+    state: Arc<AppState>,
+    procedures: String,
+    q: HashMap<String, String>,
+    method: Method,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
     let calls = parse_calls(&procedures, q.get("input").map(|s| s.as_str()), Some(&body));
     let has_mutation = calls
         .iter()
@@ -1320,6 +1353,11 @@ pub async fn run() -> anyhow::Result<()> {
         .route("/mesh/envelopes", post(interorg_envelope_post))
         .route("/mesh/envelopes/{destination}", get(interorg_envelopes_get))
         .route("/mesh/gossip", get(interorg_gossip_get))
+        .route(
+            "/api/trpc/interorg.importGossip",
+            any(trpc_interorg_import)
+                .layer(DefaultBodyLimit::max(MAX_INTERORG_GOSSIP_REQUEST_BYTES)),
+        )
         .route("/api/trpc/{*procedures}", any(trpc))
         .fallback_service(static_files)
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
