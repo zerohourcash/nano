@@ -15,7 +15,7 @@ CRITICAL = {
     "transfers.prepare", "transfers.accept", "transfers.reject", "transfers.acceptAll",
     "history.writeOff", "history.replenish", "history.move",
     "inventory.create", "inventory.checkItem", "inventory.complete",
-    "chat.send", "items.addDocument", "bit.transfer", "bit.sale", "bit.mint", "knowledge.save", "sync.importBundle",
+    "chat.send", "items.addDocument", "bit.transfer", "bit.sale", "bit.offer", "bit.acceptSale", "bit.rejectSale", "bit.mint", "knowledge.save", "sync.importBundle",
     "interorg.ensureIdentity", "interorg.trustContact", "interorg.revokeContact", "interorg.send", "interorg.accept",
     "sync.approveNodeKey", "sync.revokeNodeKey", "sync.addPeer", "sync.removePeer", "sync.pullNow", "sync.resolveConflict",
     "sync.clearDiagnostics", "sync.reportTransportStatus", "content.setMode", "content.ingest", "content.pin", "content.unpin",

@@ -34,6 +34,7 @@
     "pwa:icons": "python3 scripts/generate-pwa-icons.py",
     "pwa:check": "node scripts/check-pwa.mjs",
     "docs:check": "python3 scripts/check_docs.py",
+    "security:contract": "python3 scripts/check_signature_policy.py",
     "mobile:node:test": "python3 scripts/mobile_node_test.py",
     "encrypted-db:test": "python3 scripts/encrypted_db_test.py",
     "backup:restore:test": "python3 scripts/backup_restore_test.py",
@@ -43,7 +44,7 @@
     "android:debug:audit": "npm run android:debug:build && npm run android:apk:verify",
     "android:apk:verify": "python3 scripts/verify_android_apk.py",
     "release:candidate:audit": "npm run production:audit && npm run scale:test && npm run android:debug:audit",
-    "verify": "npm run check && npm run lint && npm test && npm run docs:check && npm run android:check && cargo test --manifest-path backend/Cargo.toml"
+    "verify": "npm run check && npm run lint && npm test && npm run docs:check && npm run security:contract && npm run android:check && cargo test --manifest-path backend/Cargo.toml"
   },
   "dependencies": {
     "@gsap/react": "^2.1.2",
