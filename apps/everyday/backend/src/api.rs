@@ -819,8 +819,8 @@ fn dispatch_inner(
         "auth.options" => auth_options(conn),
         "auth.login" => auth_login(conn, input),
         "auth.register" => auth_register(conn, input),
-        "auth.join" => auth_join(conn, input, user_id),
-        "auth.joinRegister" => auth_join_register(conn, input),
+        "auth.join" => atomic(conn, |conn| auth_join(conn, input, user_id)),
+        "auth.joinRegister" => atomic(conn, |conn| auth_join_register(conn, input)),
         "auth.logout" => Ok(json!({"ok": true})),
         "auth.me" => {
             Ok(jsn::user_public(conn, require_user(conn, user_id)?).unwrap_or(Value::Null))
@@ -1784,11 +1784,11 @@ fn consume_invite(conn: &Connection, token: &str, user_id: i64) -> ApiResult {
             previous == 0,
         )
         .map_err(|error| ApiError::internal(format!("Ошибка версии членства: {error}")))?;
+        conn.execute(
+            "UPDATE invites SET used_count=used_count+1 WHERE id=?1",
+            params![id],
+        )?;
     }
-    conn.execute(
-        "UPDATE invites SET used_count=used_count+1 WHERE id=?1",
-        params![id],
-    )?;
     Ok(jsn::workspace_json(conn, ws).unwrap_or(json!({"id": ws})))
 }
 
@@ -8624,6 +8624,81 @@ mod tests {
         assert!(chrono::DateTime::parse_from_rfc3339(expires).unwrap() > chrono::Utc::now());
         assert_eq!(created["role"].as_str(), Some("viewer"));
         assert_eq!(created["payload"]["role"].as_str(), Some("viewer"));
+        cleanup(conn, path);
+    }
+
+    #[test]
+    fn invite_join_is_atomic_and_an_existing_member_does_not_consume_it() {
+        let (mut conn, path, users, ws) = test_db();
+        conn.execute(
+            "INSERT INTO invites (workspace_id,token,role,created_by,max_uses,expires_at,created_at)
+             VALUES (?1,'atomic-join-token','member',?2,5,?3,?4)",
+            params![
+                ws,
+                users[0],
+                (chrono::Utc::now() + chrono::Duration::days(1)).to_rfc3339(),
+                now()
+            ],
+        )
+        .unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER reject_membership_join
+             BEFORE INSERT ON history_entries WHEN NEW.type='membership_join'
+             BEGIN SELECT RAISE(ABORT,'forced ledger failure'); END;",
+        )
+        .unwrap();
+
+        let failed = dispatch(
+            &mut conn,
+            "auth.joinRegister",
+            &json!({
+                "token":"atomic-join-token","fullName":"Offline worker",
+                "phone":"+79995552222","password":"LongEnoughPass1"
+            }),
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(failed.http, 500);
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM users WHERE phone='+79995552222'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0,
+            "user creation must roll back with membership Ledger failure"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT used_count FROM invites WHERE token='atomic-join-token'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+
+        conn.execute_batch("DROP TRIGGER reject_membership_join")
+            .unwrap();
+        let already_member = dispatch(
+            &mut conn,
+            "auth.join",
+            &json!({"token":"atomic-join-token"}),
+            Some(users[0]),
+        )
+        .unwrap();
+        assert_eq!(already_member["id"].as_i64(), Some(ws));
+        assert_eq!(
+            conn.query_row(
+                "SELECT used_count FROM invites WHERE token='atomic-join-token'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0,
+            "idempotent join by an existing member must not exhaust capability"
+        );
         cleanup(conn, path);
     }
 

@@ -365,6 +365,10 @@ def main() -> int:
             "admin.workspaces.createInvite",
             {"workspaceId": ws_id, "role": "viewer", "maxUses": 1},
         )
+        offline_member_invite = server.call(
+            "admin.workspaces.createInvite",
+            {"workspaceId": ws_id, "role": "member", "maxUses": 1},
+        )
         journal_req = urllib.request.Request(f"{server.base}/sync/journal")
         journal_req.add_header("authorization", f"Bearer {TOKEN}")
         with urllib.request.urlopen(journal_req, timeout=5) as response:
@@ -372,9 +376,10 @@ def main() -> int:
         synced_invites = journal.get("invites", [])
         check(
             "приглашение экспортируется только как SHA-256 capability",
-            len(synced_invites) == 1
-            and len(synced_invites[0].get("tokenDigest", "")) == 64
-            and mesh_invite["token"] not in json.dumps(journal),
+            len(synced_invites) == 2
+            and all(len(invite.get("tokenDigest", "")) == 64 for invite in synced_invites)
+            and mesh_invite["token"] not in json.dumps(journal)
+            and offline_member_invite["token"] not in json.dumps(journal),
             str(synced_invites),
         )
         administrative_events = [
@@ -385,7 +390,7 @@ def main() -> int:
         ]
         check(
             "структура и приглашение привязаны к Ed25519 device-proof администратора",
-            len(administrative_events) == 3
+            len(administrative_events) == 4
             and all(event.get("requestDeviceId") for event in administrative_events)
             and all(event.get("requestSignature") for event in administrative_events),
             str(administrative_events)[:300],
@@ -545,10 +550,37 @@ def main() -> int:
             },
         )
         check("предмет создан на узле", isinstance(created, dict) and "id" in created, str(created)[:140])
+        created_qr = node.call("items.qrLabel", {"itemId": created["id"]}, mutation=False)
 
         # Реальный offline-разрыв: upstream-процесс недоступен, но телефонная
         # нода продолжает принимать подписанные текстовые транзакции и CAS bytes.
         server.stop(cleanup=False)
+        owner_session = (node.cj, node.opener, node.signer, node.device_registered)
+        node.cj = CookieJar()
+        node.opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(node.cj))
+        node.signer = DeviceSigner("offline-joining-member")
+        node.device_registered = False
+        offline_member = node.call(
+            "auth.joinRegister",
+            {
+                "token": offline_member_invite["token"],
+                "fullName": "Офлайн участник",
+                "phone": "+7 900 777-00-02",
+                "password": "OfflineMember123",
+            },
+        )
+        offline_take = node.call(
+            "transfers.take",
+            {"itemId": created["id"], "qrLabel": created_qr.get("label")},
+        )
+        check(
+            "новый участник вступил и подписал QR-выдачу при полном разрыве",
+            isinstance(offline_member, dict)
+            and bool(offline_member.get("id"))
+            and offline_take.get("responsible", {}).get("fullName") == "Офлайн участник",
+            str({"member": offline_member, "take": offline_take})[:500],
+        )
+        node.cj, node.opener, node.signer, node.device_registered = owner_session
         offline_blob = node.call(
             "content.ingest",
             {"workspaceId": node_ws_id, "dataUrl": DOCUMENT_DATA_URL},
@@ -595,6 +627,16 @@ def main() -> int:
         server.restart()
         check("upstream восстановился после разрыва", server.wait_ready())
         node.call("sync.pullNow", {})
+        offline_member_converged = wait_for(
+            lambda: (item_named(server, ws_id, "Шуруповёрт с узла") or {})
+            .get("responsible", {}).get("fullName") == "Офлайн участник",
+            timeout=30,
+        )
+        check(
+            "owner-нода получила offline membership и подписанную QR-выдачу",
+            offline_member_converged,
+            str(item_named(server, ws_id, "Шуруповёрт с узла"))[:400],
+        )
         remote_document_arrived = wait_for(
             lambda: any(
                 document.get("guid") == document_guid
