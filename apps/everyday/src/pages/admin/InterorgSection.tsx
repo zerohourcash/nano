@@ -1,5 +1,5 @@
 import { useMemo, useState } from 'react'
-import { Ban, Check, Clipboard, Download, KeyRound, Paperclip, Plus, Radio, Send, ShieldCheck, X } from 'lucide-react'
+import { Ban, Check, Clipboard, Download, KeyRound, Paperclip, Plus, Radio, Send, ShieldCheck, Upload, X } from 'lucide-react'
 import { trpc } from '@/providers/trpc'
 import { useStore } from '@/lib/store'
 import InviteQrBlock from '@/components/InviteQrBlock'
@@ -7,6 +7,7 @@ import { decodeCard, encodeCard } from '@/lib/interorg-card'
 import { SectionHeader, btnPrimaryCls, btnSecondaryCls, cardCls, inputCls, useToast } from './ui'
 
 const MAX_INTERORG_FILE_BYTES = 24 * 1024
+const MAX_INTERORG_GOSSIP_FILE_BYTES = 3 * 1024 * 1024
 
 type InterorgFileBody = {
   name: string
@@ -94,6 +95,14 @@ export default function InterorgSection() {
   })
   const accept = trpc.interorg.accept.useMutation({
     onSuccess: () => { void inboxQ.refetch(); toast('Принятие записано в летопись') },
+    onError: (error) => toast(error.message, 'error'),
+  })
+  const importGossip = trpc.interorg.importGossip.useMutation({
+    onSuccess: (result) => {
+      void inboxQ.refetch()
+      void outboxQ.refetch()
+      toast(`Пакет проверен: новых ${result.stored}, доставлено ${result.delivered}, повторов ${result.duplicates}`)
+    },
     onError: (error) => toast(error.message, 'error'),
   })
 
@@ -194,6 +203,64 @@ export default function InterorgSection() {
     toast(`BLE передаёт opaque-конверты: ${result.data.envelopes.length}`)
   }
 
+  const exportGossipFile = async () => {
+    const result = await gossipQ.refetch()
+    if (!result.data) {
+      toast(result.error?.message ?? 'Не удалось собрать interorg gossip', 'error')
+      return
+    }
+    if (result.data.envelopes.length === 0) {
+      toast('В межорганизационной очереди пока нет конвертов')
+      return
+    }
+    const file = new File(
+      [JSON.stringify(result.data)],
+      `everyday-interorg-${new Date().toISOString().replace(/[:.]/g, '-')}.json`,
+      { type: 'application/vnd.everyday.interorg+json' },
+    )
+    if (navigator.canShare?.({ files: [file] })) {
+      try {
+        await navigator.share({ files: [file], title: 'Everyday: межорганизационные транзакции' })
+        toast('Зашифрованный пакет передан системному меню обмена')
+        return
+      } catch (error) {
+        if (error instanceof DOMException && error.name === 'AbortError') return
+      }
+    }
+    const url = URL.createObjectURL(file)
+    const anchor = document.createElement('a')
+    anchor.href = url
+    anchor.download = file.name
+    anchor.click()
+    setTimeout(() => URL.revokeObjectURL(url), 0)
+    toast('Зашифрованный пакет скачан — передайте его любым доступным каналом')
+  }
+
+  const importGossipFile = async (file: File) => {
+    if (file.size === 0 || file.size > MAX_INTERORG_GOSSIP_FILE_BYTES) {
+      toast('Interorg-пакет пуст или превышает лимит 3 МБ', 'error')
+      return
+    }
+    try {
+      const bundle = JSON.parse(await file.text()) as {
+        format?: unknown
+        version?: unknown
+        envelopes?: unknown
+      }
+      if (bundle.format !== 'everyday-interorg-gossip' || bundle.version !== 1 || !Array.isArray(bundle.envelopes)) {
+        throw new Error('Это не interorg-пакет Everyday версии 1')
+      }
+      if (bundle.envelopes.length > 32) throw new Error('В пакете больше 32 конвертов')
+      importGossip.mutate({ bundle: {
+        format: 'everyday-interorg-gossip',
+        version: 1,
+        envelopes: bundle.envelopes,
+      } })
+    } catch (error) {
+      toast(error instanceof Error ? error.message : 'Файл не является корректным interorg-пакетом', 'error')
+    }
+  }
+
   if (!workspaceId) return <div className={cardCls + ' p-6 text-sm text-ink-500'}>Выберите организацию.</div>
 
   return (
@@ -232,10 +299,33 @@ export default function InterorgSection() {
       <section className={`${cardCls} overflow-hidden`}>
         <div className="flex flex-wrap items-center justify-between gap-3 border-b border-brand-100 px-5 py-4">
           <h3 className="font-semibold text-ink-900">Исходящие и квитанции</h3>
-          <button type="button" className={btnSecondaryCls} onClick={() => void sendGossipOverBle()} disabled={gossipQ.isFetching} data-testid="interorg-ble-send">
-            <Radio size={16} /> Передать очередь по BLE
-          </button>
+          <div className="flex flex-wrap gap-2">
+            <button type="button" className={btnSecondaryCls} onClick={() => void exportGossipFile()} disabled={gossipQ.isFetching} data-testid="interorg-file-export">
+              <Download size={16} /> Передать файлом
+            </button>
+            <label className={`${btnSecondaryCls} cursor-pointer`}>
+              <Upload size={16} /> Принять файл
+              <input
+                type="file"
+                className="hidden"
+                accept=".json,application/json,application/vnd.everyday.interorg+json"
+                data-testid="interorg-file-import"
+                disabled={importGossip.isPending}
+                onChange={(event) => {
+                  const selectedFile = event.target.files?.[0]
+                  if (selectedFile) void importGossipFile(selectedFile)
+                  event.target.value = ''
+                }}
+              />
+            </label>
+            <button type="button" className={btnSecondaryCls} onClick={() => void sendGossipOverBle()} disabled={gossipQ.isFetching} data-testid="interorg-ble-send">
+              <Radio size={16} /> Передать очередь по BLE
+            </button>
+          </div>
         </div>
+        <p className="border-b border-brand-100 bg-brand-50/50 px-5 py-3 text-xs text-ink-500">
+          Файл содержит только opaque AEAD-конверты (до 32); USB, SD, Bluetooth Share и посредник не получают открытые данные организации.
+        </p>
         <div className="divide-y divide-brand-100">
           {(outboxQ.data ?? []).map((item) => (
             <article key={item.transactionId} className="flex flex-col gap-2 p-5 sm:flex-row sm:items-center sm:justify-between" data-testid="interorg-outbox-item">

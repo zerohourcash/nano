@@ -394,6 +394,11 @@ capability, затем применяют только её scope. Неверн�
   `interorg.importGossip` требует device-proof и применяет batch в одной
   SQLite-транзакции: неверная Ed25519-подпись, TTL, PoW либо структура любого
   envelope откатывает все новые строки и не подтверждает durable BLE spool.
+  Desktop/PWA экспортирует тот же scoped batch как файл с отдельным MIME;
+  импорт до чтения ограничен 3 МБ, проверяет format/version/count в браузере и
+  затем всё равно проходит signed backend mutation. Расширение, MIME и канал
+  доставки не являются доверием: поддельный batch отклоняется валидатором
+  envelope до изменения БД.
   Фоновый IP-gossip включается отдельным `MESHKEEPER_RELAY_PEERS`; эти связи не
   получают capability какой-либо организации и переносят только конверты.
   Адрес gateway создаётся подписанной операцией `interorg.ensureIdentity`, а

@@ -588,6 +588,28 @@ test('browser signs a real custody transaction and ledger retains its proof', as
   await page.getByRole('button', { name: 'Сеть организаций' }).first().click();
   await expect(page.getByTestId('interorg-network')).toBeVisible();
   await expect(page.getByTestId('interorg-ble-send')).toBeVisible();
+  await expect(page.getByTestId('interorg-file-export')).toBeVisible();
+  const interorgImport = page.getByTestId('interorg-file-import');
+  await interorgImport.setInputFiles({
+    name: 'too-many-interorg-envelopes.json',
+    mimeType: 'application/vnd.everyday.interorg+json',
+    buffer: Buffer.from(JSON.stringify({
+      format: 'everyday-interorg-gossip',
+      version: 1,
+      envelopes: Array.from({ length: 33 }, () => ({})),
+    })),
+  });
+  await expect(page.getByText('В пакете больше 32 конвертов')).toBeVisible();
+  await interorgImport.setInputFiles({
+    name: 'empty-interorg-gossip.json',
+    mimeType: 'application/vnd.everyday.interorg+json',
+    buffer: Buffer.from(JSON.stringify({
+      format: 'everyday-interorg-gossip',
+      version: 1,
+      envelopes: [],
+    })),
+  });
+  await expect(page.getByText(/Пакет проверен: новых 0, доставлено 0, повторов 0/)).toBeVisible();
   await page.getByRole('button', { name: 'Создать адрес' }).click();
   await expect(page.getByTestId('organization-card')).toContainText(
     'everyday:org:',
