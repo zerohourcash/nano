@@ -2205,6 +2205,15 @@ fn take_one_atomic(
 ) -> ApiResult {
     let item_ws = require_item_access(conn, uid, item_id)?;
     require_can_in_workspace(conn, uid, item_ws, "transferItems")?;
+    let stored_photo = photo_url
+        .map(|source| crate::content::ingest_data_url(conn, source))
+        .transpose()
+        .map_err(|error| ApiError::bad(format!("Некорректное фото выдачи: {error}")))?
+        .flatten();
+    let photo_url = stored_photo.as_deref().or(photo_url);
+    if photo_url.is_some_and(|value| value.len() > 512) {
+        return Err(ApiError::bad("Ссылка на фото выдачи слишком длинная"));
+    }
     let item = jsn::item_json(conn, item_id, false)
         .ok_or_else(|| ApiError::not_found("Инструмент не найден"))?;
     ensure_item_circulates(conn, &item, item_id)?;
@@ -2292,7 +2301,7 @@ fn take_one_atomic(
         let to_name = jsn::user_public(conn, uid)
             .and_then(|u| u["fullName"].as_str().map(|s| s.to_string()))
             .unwrap_or_default();
-        ledger::append(
+        let event = ledger::append(
             conn,
             ws,
             uid,
@@ -2304,6 +2313,10 @@ fn take_one_atomic(
             Some(&format!("Выдача {code}: {take_qty} × {title}")),
         )
         .map_err(|e| ApiError::internal(format!("Ошибка журнала: {e}")))?;
+        crate::sync::record_custody_entry(
+            conn, ws, item_id, uid, take_qty, due_at, comment, photo_url, &event,
+        )
+        .map_err(|e| ApiError::internal(format!("Ошибка custody-летописи: {e}")))?;
         return jsn::item_json(conn, item_id, false).ok_or_else(|| ApiError::bad("ошибка"));
     }
     if need_admin {
@@ -2367,7 +2380,7 @@ fn take_one_atomic(
         Some(&format!("Выдача {code}: {title}")),
     )
     .map_err(|e| ApiError::internal(format!("Ошибка журнала: {e}")))?;
-    ledger::append(
+    let receive_event = ledger::append(
         conn,
         ws,
         uid,
@@ -2379,6 +2392,18 @@ fn take_one_atomic(
         Some(&format!("Получение {code}")),
     )
     .map_err(|e| ApiError::internal(format!("Ошибка журнала: {e}")))?;
+    crate::sync::record_custody_entry(
+        conn,
+        ws,
+        item_id,
+        uid,
+        1.0,
+        due_at,
+        comment,
+        photo_url,
+        &receive_event,
+    )
+    .map_err(|e| ApiError::internal(format!("Ошибка custody-летописи: {e}")))?;
     jsn::item_json(conn, item_id, false).ok_or_else(|| ApiError::bad("ошибка"))
 }
 
@@ -2505,7 +2530,7 @@ fn transfers_return_atomic(conn: &Connection, input: &Value, user_id: Option<i64
         let name = jsn::user_public(conn, uid)
             .and_then(|u| u["fullName"].as_str().map(|s| s.to_string()))
             .unwrap_or_default();
-        ledger::append(
+        let event = ledger::append(
             conn,
             item["workspaceId"].as_i64().unwrap_or(1),
             uid,
@@ -2517,6 +2542,18 @@ fn transfers_return_atomic(conn: &Connection, input: &Value, user_id: Option<i64
             Some(&format!("Возврат {give} × {vn}")),
         )
         .map_err(|e| ApiError::internal(format!("Ошибка журнала: {e}")))?;
+        crate::sync::record_custody_entry(
+            conn,
+            item["workspaceId"].as_i64().unwrap_or(1),
+            id,
+            uid,
+            -give,
+            None,
+            s(input, "comment").as_deref(),
+            None,
+            &event,
+        )
+        .map_err(|e| ApiError::internal(format!("Ошибка custody-летописи: {e}")))?;
         return jsn::item_json(conn, id, false).ok_or_else(|| ApiError::bad("ошибка"));
     }
     if item["responsibleUserId"].as_i64() != Some(uid) {
@@ -2540,7 +2577,7 @@ fn transfers_return_atomic(conn: &Connection, input: &Value, user_id: Option<i64
     let name = jsn::user_public(conn, uid)
         .and_then(|u| u["fullName"].as_str().map(|s| s.to_string()))
         .unwrap_or_default();
-    ledger::append(
+    let event = ledger::append(
         conn,
         ws,
         uid,
@@ -2552,6 +2589,18 @@ fn transfers_return_atomic(conn: &Connection, input: &Value, user_id: Option<i64
         Some(&format!("Возврат {vn} на склад")),
     )
     .map_err(|e| ApiError::internal(format!("Ошибка журнала: {e}")))?;
+    crate::sync::record_custody_entry(
+        conn,
+        ws,
+        id,
+        uid,
+        -1.0,
+        None,
+        s(input, "comment").as_deref(),
+        None,
+        &event,
+    )
+    .map_err(|e| ApiError::internal(format!("Ошибка custody-летописи: {e}")))?;
     jsn::item_json(conn, id, false).ok_or_else(|| ApiError::bad("ошибка"))
 }
 
@@ -5559,6 +5608,19 @@ mod tests {
             )
             .unwrap();
         assert_eq!(journaled, 1);
+        let (custody_entries, custody_balance, linked): (i64, f64, i64) = conn
+            .query_row(
+                "SELECT COUNT(*),COALESCE(SUM(c.quantity_delta),0),
+                        SUM(CASE WHEN h.hash IS NOT NULL THEN 1 ELSE 0 END)
+                 FROM custody_entries c LEFT JOIN history_entries h ON h.hash=c.ledger_hash
+                 WHERE c.item_guid=(SELECT guid FROM items WHERE id=?1)",
+                params![item_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(custody_entries, 2);
+        assert_eq!(linked, 2);
+        assert!(custody_balance.abs() < 1e-9);
         cleanup(conn, path);
     }
 

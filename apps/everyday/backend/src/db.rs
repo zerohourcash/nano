@@ -117,6 +117,10 @@ fn migrate(conn: &Connection) -> Result<()> {
     );
     let _ = conn.execute("ALTER TABLE transfers ADD COLUMN photo_url TEXT", []);
     let _ = conn.execute("ALTER TABLE history_entries ADD COLUMN photo_url TEXT", []);
+    let _ = conn.execute(
+        "ALTER TABLE item_holdings ADD COLUMN sync_rebuilt INTEGER NOT NULL DEFAULT 0",
+        [],
+    );
     // ТЗ §5: у вложения есть уменьшенная копия и контрольная сумма.
     let _ = conn.execute("ALTER TABLE item_photos ADD COLUMN thumb_url TEXT", []);
     let _ = conn.execute("ALTER TABLE item_photos ADD COLUMN sha256 TEXT", []);
@@ -241,6 +245,22 @@ fn migrate(conn: &Connection) -> Result<()> {
            updated_at TEXT NOT NULL,
            PRIMARY KEY(workspace_guid,user_guid)
          );",
+    )?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS custody_entries(
+           entry_hash TEXT PRIMARY KEY,
+           workspace_guid TEXT NOT NULL,
+           item_guid TEXT NOT NULL,
+           user_guid TEXT NOT NULL,
+           quantity_delta REAL NOT NULL CHECK(quantity_delta != 0),
+           due_at TEXT,
+           comment TEXT,
+           photo_url TEXT,
+           ledger_hash TEXT NOT NULL UNIQUE,
+           created_at TEXT NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS custody_item_user_idx
+           ON custody_entries(item_guid,user_guid,created_at,entry_hash);",
     )?;
     conn.execute(
         "UPDATE user_workspaces SET rights_json=(SELECT role_rights FROM users WHERE users.id=user_workspaces.user_id) WHERE rights_json IS NULL",

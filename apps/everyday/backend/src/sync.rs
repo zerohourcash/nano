@@ -95,6 +95,84 @@ impl MembershipFields {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn custody_entry_hash(
+    workspace_guid: &str,
+    item_guid: &str,
+    user_guid: &str,
+    quantity_delta: f64,
+    due_at: Option<&str>,
+    comment: Option<&str>,
+    photo_url: Option<&str>,
+    ledger_hash: &str,
+    created_at: &str,
+) -> String {
+    let canonical = json!([
+        "everyday/custody-entry/v1",
+        workspace_guid,
+        item_guid,
+        user_guid,
+        quantity_delta,
+        due_at,
+        comment,
+        photo_url,
+        ledger_hash,
+        created_at
+    ]);
+    hex::encode(Sha256::digest(
+        serde_json::to_vec(&canonical).unwrap_or_default(),
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn record_custody_entry(
+    conn: &Connection,
+    workspace_id: i64,
+    item_id: i64,
+    user_id: i64,
+    quantity_delta: f64,
+    due_at: Option<&str>,
+    comment: Option<&str>,
+    photo_url: Option<&str>,
+    ledger_event: &Value,
+) -> anyhow::Result<Value> {
+    if !quantity_delta.is_finite() || quantity_delta.abs() < 1e-9 {
+        anyhow::bail!("custody quantity must be finite and non-zero");
+    }
+    let workspace_guid = ledger::guid(conn, "workspaces", workspace_id)?;
+    let item_guid = ledger::guid(conn, "items", item_id)?;
+    let user_guid = ledger::guid(conn, "users", user_id)?;
+    let ledger_hash = ledger_event
+        .get("opId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("custody entry has no ledger hash"))?;
+    let created_at = ledger_event
+        .get("createdAt")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("custody entry has no timestamp"))?;
+    let entry_hash = custody_entry_hash(
+        &workspace_guid,
+        &item_guid,
+        &user_guid,
+        quantity_delta,
+        due_at,
+        comment,
+        photo_url,
+        ledger_hash,
+        created_at,
+    );
+    conn.execute(
+        "INSERT INTO custody_entries(entry_hash,workspace_guid,item_guid,user_guid,quantity_delta,due_at,comment,photo_url,ledger_hash,created_at)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+        params![entry_hash,workspace_guid,item_guid,user_guid,quantity_delta,due_at,comment,photo_url,ledger_hash,created_at],
+    )?;
+    Ok(json!({
+        "entryHash":entry_hash,"workspaceGuid":workspace_guid,"itemGuid":item_guid,
+        "userGuid":user_guid,"quantityDelta":quantity_delta,"dueAt":due_at,
+        "comment":comment,"photoUrl":photo_url,"ledgerHash":ledger_hash,"createdAt":created_at
+    }))
+}
+
 struct StoredMembershipVersion {
     revision: i64,
     version_hash: String,
@@ -583,6 +661,23 @@ pub fn export_journal_since(conn: &Connection, recipient_frontier: Option<&Value
             memberships.extend(rows.flatten());
         }
     }
+    let mut custody = Vec::new();
+    if let Ok(mut statement) = conn.prepare(
+        "SELECT entry_hash,workspace_guid,item_guid,user_guid,quantity_delta,due_at,comment,
+                photo_url,ledger_hash,created_at FROM custody_entries ORDER BY created_at,entry_hash",
+    ) {
+        if let Ok(rows) = statement.query_map([], |row| {
+            Ok(json!({
+                "entryHash":row.get::<_,String>(0)?,"workspaceGuid":row.get::<_,String>(1)?,
+                "itemGuid":row.get::<_,String>(2)?,"userGuid":row.get::<_,String>(3)?,
+                "quantityDelta":row.get::<_,f64>(4)?,"dueAt":row.get::<_,Option<String>>(5)?,
+                "comment":row.get::<_,Option<String>>(6)?,"photoUrl":row.get::<_,Option<String>>(7)?,
+                "ledgerHash":row.get::<_,String>(8)?,"createdAt":row.get::<_,String>(9)?,
+            }))
+        }) {
+            custody.extend(rows.flatten());
+        }
+    }
     let mut messages = Vec::new();
     if let Ok(mut stmt) = conn.prepare(
         "SELECT guid,workspace_id,user_id,text,ledger_hash,created_at
@@ -658,6 +753,7 @@ pub fn export_journal_since(conn: &Connection, recipient_frontier: Option<&Value
         "journalSequence": next_journal_sequence(conn),
         "journalScope": "*",
         "membershipMode": "versioned-tombstones/v1",
+        "custodyMode": "ledger-delta/v1",
         "historyMode": if recipient_frontier.is_some() { "delta" } else { "full" },
         "frontier": frontier(conn),
         "workspaces": workspaces,
@@ -668,6 +764,7 @@ pub fn export_journal_since(conn: &Connection, recipient_frontier: Option<&Value
         "history": history,
         "invites": invites,
         "memberships": memberships,
+        "custody": custody,
         "messages": messages,
         "photos": photos,
         "documents": documents,
@@ -731,6 +828,7 @@ fn filter_journal_scope(journal: &mut Value, allowed: &HashSet<String>) {
         "history",
         "invites",
         "memberships",
+        "custody",
         "messages",
         "frontier",
     ] {
@@ -814,7 +912,7 @@ fn filter_journal_scope(journal: &mut Value, allowed: &HashSet<String>) {
     }
 
     let mut user_guids = HashSet::new();
-    for key in ["memberships", "messages"] {
+    for key in ["memberships", "messages", "custody"] {
         if let Some(rows) = object.get(key).and_then(Value::as_array) {
             user_guids.extend(rows.iter().filter_map(|row| {
                 row.get("userGuid")
@@ -875,7 +973,7 @@ fn filter_journal_scope(journal: &mut Value, allowed: &HashSet<String>) {
     }
 
     let mut hashes = HashSet::new();
-    for key in ["photos", "documents", "knowledge"] {
+    for key in ["photos", "documents", "knowledge", "custody"] {
         if let Some(value) = object.get(key) {
             cas_hashes(value, &mut hashes);
         }
@@ -942,7 +1040,10 @@ pub fn content_hash_allowed(conn: &Connection, allowed: &HashSet<String>, hash: 
          WHERE w.guid IN (SELECT value FROM json_each(?1)) AND (lower(p.url)=?2 OR lower(p.thumb_url)=?2)
          UNION ALL
          SELECT 1 FROM item_documents d JOIN items i ON i.id=d.item_id JOIN workspaces w ON w.id=i.workspace_id
-         WHERE w.guid IN (SELECT value FROM json_each(?1)) AND lower(d.url)=?2 LIMIT 1",
+         WHERE w.guid IN (SELECT value FROM json_each(?1)) AND lower(d.url)=?2
+         UNION ALL
+         SELECT 1 FROM custody_entries c JOIN workspaces w ON w.guid=c.workspace_guid
+         WHERE w.guid IN (SELECT value FROM json_each(?1)) AND lower(c.photo_url)=?2 LIMIT 1",
         params![serde_json::to_string(&allowed.iter().collect::<Vec<_>>()).unwrap_or_else(|_| "[]".into()), cas],
         |_| Ok(()),
     ).is_ok();
@@ -1248,6 +1349,89 @@ fn status_id(conn: &Connection, ws: i64, slug: &str) -> Option<i64> {
         |r| r.get(0),
     )
     .ok()
+}
+
+#[derive(Clone)]
+struct CustodyLot {
+    quantity: f64,
+    due_at: Option<String>,
+    comment: Option<String>,
+    photo_url: Option<String>,
+    created_at: String,
+}
+
+fn rebuild_quantitative_holdings(conn: &Connection) -> anyhow::Result<()> {
+    let mut statement = conn.prepare(
+        "SELECT i.id,u.id,c.quantity_delta,c.due_at,c.comment,c.photo_url,c.created_at
+         FROM custody_entries c JOIN items i ON i.guid=c.item_guid
+         JOIN users u ON u.guid=c.user_guid WHERE i.quantitative=1
+         ORDER BY c.created_at,c.entry_hash",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, f64>(2)?,
+            row.get::<_, Option<String>>(3)?,
+            row.get::<_, Option<String>>(4)?,
+            row.get::<_, Option<String>>(5)?,
+            row.get::<_, String>(6)?,
+        ))
+    })?;
+    let mut balances: HashMap<(i64, i64), Vec<CustodyLot>> = HashMap::new();
+    for row in rows {
+        let (item, user, delta, due_at, comment, photo_url, created_at) = row?;
+        let lots = balances.entry((item, user)).or_default();
+        if delta > 0.0 {
+            lots.push(CustodyLot {
+                quantity: delta,
+                due_at,
+                comment,
+                photo_url,
+                created_at,
+            });
+            continue;
+        }
+        let mut returned = -delta;
+        for lot in lots.iter_mut() {
+            if returned <= 1e-9 {
+                break;
+            }
+            let consumed = lot.quantity.min(returned);
+            lot.quantity -= consumed;
+            returned -= consumed;
+        }
+        lots.retain(|lot| lot.quantity > 1e-9);
+        if returned > 1e-9 {
+            anyhow::bail!("custody return exceeds verified holdings for item {item}, user {user}");
+        }
+    }
+    for ((item, user), lots) in balances {
+        let (active, rebuilt): (i64, i64) = conn.query_row(
+            "SELECT COUNT(*),COALESCE(SUM(sync_rebuilt),0) FROM item_holdings
+             WHERE item_id=?1 AND user_id=?2 AND returned_at IS NULL",
+            params![item, user],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if active > 0 && active != rebuilt {
+            // Локальная pre-upgrade запись содержит metadata, которой нет в старой
+            // custody-летописи. Не уничтожаем её автоматически.
+            continue;
+        }
+        conn.execute(
+            "DELETE FROM item_holdings WHERE item_id=?1 AND user_id=?2
+             AND returned_at IS NULL AND sync_rebuilt=1",
+            params![item, user],
+        )?;
+        for lot in lots {
+            conn.execute(
+                "INSERT INTO item_holdings(item_id,user_id,quantity,due_at,comment,photo_url,created_at,sync_rebuilt)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,1)",
+                params![item,user,lot.quantity,lot.due_at,lot.comment,lot.photo_url,lot.created_at],
+            )?;
+        }
+    }
+    Ok(())
 }
 
 pub fn import_journal(conn: &Connection, journal: &Value) -> Value {
@@ -1665,6 +1849,34 @@ pub fn import_journal(conn: &Connection, journal: &Value) -> Value {
             ops += 1;
         }
     }
+    if let Some(entries) = journal.get("custody").and_then(Value::as_array) {
+        for entry in entries {
+            let inserted = conn
+                .execute(
+                    "INSERT OR IGNORE INTO custody_entries(entry_hash,workspace_guid,item_guid,user_guid,quantity_delta,due_at,comment,photo_url,ledger_hash,created_at)
+                     VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+                    params![
+                        entry.get("entryHash").and_then(Value::as_str),
+                        entry.get("workspaceGuid").and_then(Value::as_str),
+                        entry.get("itemGuid").and_then(Value::as_str),
+                        entry.get("userGuid").and_then(Value::as_str),
+                        entry.get("quantityDelta").and_then(Value::as_f64),
+                        entry.get("dueAt").and_then(Value::as_str),
+                        entry.get("comment").and_then(Value::as_str),
+                        entry.get("photoUrl").and_then(Value::as_str),
+                        entry.get("ledgerHash").and_then(Value::as_str),
+                        entry.get("createdAt").and_then(Value::as_str),
+                    ],
+                )
+                .unwrap_or(0);
+            if inserted == 0 {
+                skipped += 1;
+            }
+        }
+        if let Err(error) = rebuild_quantitative_holdings(conn) {
+            return json!({"ok":false,"error":format!("Не удалось восстановить custody-состояние: {error}")});
+        }
+    }
     if let Some(arr) = journal.get("messages").and_then(Value::as_array) {
         for message in arr {
             let guid = message.get("guid").and_then(Value::as_str).unwrap_or("");
@@ -2071,6 +2283,9 @@ pub fn apply_remote_journal(conn: &Connection, journal: &Value, peer_url: &str) 
     if let Err(error) = verify_device_registry(conn, journal) {
         return json!({"ok":false,"error":format!("Проверка устройств: {error}")});
     }
+    if let Err(error) = verify_custody_records(conn, journal) {
+        return json!({"ok":false,"error":format!("Проверка custody-летописи: {error}")});
+    }
     if let Err(error) = verify_membership_records(conn, journal) {
         return json!({"ok":false,"error":format!("Проверка членства: {error}")});
     }
@@ -2090,6 +2305,10 @@ pub fn apply_remote_journal(conn: &Connection, journal: &Value, peer_url: &str) 
         return json!({"ok":false,"error":error.to_string()});
     }
     let result = import_journal(conn, journal);
+    if result.get("ok").and_then(Value::as_bool) != Some(true) {
+        let _ = conn.execute_batch("ROLLBACK TO verified_sync; RELEASE verified_sync");
+        return result;
+    }
     if let Some(knowledge) = journal.get("knowledge") {
         if let Err(error) = crate::knowledge::import(conn, knowledge) {
             let _ = conn.execute_batch("ROLLBACK TO verified_sync; RELEASE verified_sync");
@@ -2113,6 +2332,10 @@ pub fn apply_remote_journal(conn: &Connection, journal: &Value, peer_url: &str) 
     if let Err(error) = verify_stored_device_bindings(conn) {
         let _ = conn.execute_batch("ROLLBACK TO verified_sync; RELEASE verified_sync");
         return json!({"ok":false,"error":format!("Проверка привязки устройств: {error}")});
+    }
+    if let Err(error) = verify_stored_custody(conn) {
+        let _ = conn.execute_batch("ROLLBACK TO verified_sync; RELEASE verified_sync");
+        return json!({"ok":false,"error":format!("Проверка сохранённой custody-летописи: {error}")});
     }
     if let Err(error) = ledger::verify_chat_links(conn) {
         let _ = conn.execute_batch("ROLLBACK TO verified_sync; RELEASE verified_sync");
@@ -2349,6 +2572,247 @@ fn verify_stored_device_bindings(conn: &Connection) -> anyhow::Result<usize> {
             .is_some_and(|revoked| event_time >= revoked);
         if event_time < registered_time || revoked_before_event {
             anyhow::bail!("stored device proof {device_id} is outside validity interval");
+        }
+        verified += 1;
+    }
+    Ok(verified)
+}
+
+struct CustodyLedgerEvidence {
+    workspace_guid: String,
+    item_guid: String,
+    actor_guid: String,
+    operation: String,
+    quantity: Option<f64>,
+    created_at: String,
+    has_device_proof: bool,
+}
+
+fn custody_ledger_evidence(
+    conn: &Connection,
+    incoming: &HashMap<&str, &Value>,
+    hash: &str,
+) -> anyhow::Result<CustodyLedgerEvidence> {
+    if let Some(event) = incoming.get(hash) {
+        let present = |field: &str| {
+            event
+                .get(field)
+                .and_then(Value::as_str)
+                .is_some_and(|value| !value.is_empty())
+        };
+        return Ok(CustodyLedgerEvidence {
+            workspace_guid: event
+                .get("workspaceGuid")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
+            item_guid: event
+                .get("itemGuid")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
+            actor_guid: event
+                .get("actorGuid")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
+            operation: event
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
+            quantity: event.get("quantityDelta").and_then(Value::as_f64),
+            created_at: event
+                .get("createdAt")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
+            has_device_proof: [
+                "requestDeviceId",
+                "requestPublicKey",
+                "requestNonce",
+                "requestSignature",
+                "requestHash",
+                "requestTimestamp",
+                "requestPath",
+            ]
+            .into_iter()
+            .all(present),
+        });
+    }
+    conn.query_row(
+        "SELECT w.guid,i.guid,u.guid,h.type,h.quantity_delta,h.created_at,
+                h.request_device_id IS NOT NULL AND h.request_device_id!='' AND
+                h.request_public_key IS NOT NULL AND h.request_public_key!='' AND
+                h.request_nonce IS NOT NULL AND h.request_nonce!='' AND
+                h.request_signature IS NOT NULL AND h.request_signature!='' AND
+                h.request_hash IS NOT NULL AND h.request_hash!='' AND
+                h.request_timestamp IS NOT NULL AND h.request_timestamp!='' AND
+                h.request_path IS NOT NULL AND h.request_path!=''
+         FROM history_entries h JOIN workspaces w ON w.id=h.workspace_id
+         JOIN items i ON i.id=h.item_id JOIN users u ON u.id=h.actor_user_id WHERE h.hash=?1",
+        [hash],
+        |row| {
+            Ok(CustodyLedgerEvidence {
+                workspace_guid: row.get(0)?,
+                item_guid: row.get(1)?,
+                actor_guid: row.get(2)?,
+                operation: row.get(3)?,
+                quantity: row.get(4)?,
+                created_at: row.get(5)?,
+                has_device_proof: row.get::<_, i64>(6)? != 0,
+            })
+        },
+    )
+    .map_err(Into::into)
+}
+
+fn verify_custody_records(conn: &Connection, journal: &Value) -> anyhow::Result<()> {
+    if journal.get("custodyMode").and_then(Value::as_str) != Some("ledger-delta/v1") {
+        anyhow::bail!("journal does not provide ledger custody entries");
+    }
+    let history: HashMap<&str, &Value> = journal
+        .get("history")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|event| {
+            event
+                .get("opId")
+                .and_then(Value::as_str)
+                .map(|hash| (hash, event))
+        })
+        .collect();
+    let mut hashes = HashSet::new();
+    let mut ledger_hashes = HashSet::new();
+    for record in journal
+        .get("custody")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("journal has no custody array"))?
+    {
+        let required = |field: &str| {
+            record
+                .get(field)
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| anyhow::anyhow!("custody record has no {field}"))
+        };
+        let entry_hash = required("entryHash")?;
+        let workspace = required("workspaceGuid")?;
+        let item = required("itemGuid")?;
+        let user = required("userGuid")?;
+        let ledger_hash = required("ledgerHash")?;
+        let created_at = required("createdAt")?;
+        let delta = record
+            .get("quantityDelta")
+            .and_then(Value::as_f64)
+            .filter(|value| value.is_finite() && value.abs() >= 1e-9)
+            .ok_or_else(|| anyhow::anyhow!("invalid custody quantity"))?;
+        let due_at = record.get("dueAt").and_then(Value::as_str);
+        let comment = record.get("comment").and_then(Value::as_str);
+        let photo_url = record.get("photoUrl").and_then(Value::as_str);
+        if comment.is_some_and(|value| value.chars().count() > 2000)
+            || photo_url.is_some_and(|value| value.len() > 512)
+            || !hashes.insert(entry_hash)
+            || !ledger_hashes.insert(ledger_hash)
+        {
+            anyhow::bail!("duplicate or oversized custody record");
+        }
+        if custody_entry_hash(
+            workspace,
+            item,
+            user,
+            delta,
+            due_at,
+            comment,
+            photo_url,
+            ledger_hash,
+            created_at,
+        ) != entry_hash
+        {
+            anyhow::bail!("custody entry hash mismatch");
+        }
+        let evidence = custody_ledger_evidence(conn, &history, ledger_hash)
+            .map_err(|_| anyhow::anyhow!("custody ledger event is unavailable"))?;
+        let expected_type = if delta > 0.0 {
+            "transfer_receive"
+        } else {
+            "transfer_send"
+        };
+        let quantity_matches = evidence
+            .quantity
+            .map(|quantity| (quantity.abs() - delta.abs()).abs() < 1e-9)
+            .unwrap_or_else(|| (delta.abs() - 1.0).abs() < 1e-9);
+        if evidence.workspace_guid != workspace
+            || evidence.item_guid != item
+            || evidence.actor_guid != user
+            || evidence.operation != expected_type
+            || evidence.created_at != created_at
+            || !quantity_matches
+            || !evidence.has_device_proof
+        {
+            anyhow::bail!("custody record is not semantically bound to ledger event");
+        }
+    }
+    Ok(())
+}
+
+fn verify_stored_custody(conn: &Connection) -> anyhow::Result<usize> {
+    let mut statement = conn.prepare(
+        "SELECT entry_hash,workspace_guid,item_guid,user_guid,quantity_delta,due_at,comment,
+                photo_url,ledger_hash,created_at FROM custody_entries",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, f64>(4)?,
+            row.get::<_, Option<String>>(5)?,
+            row.get::<_, Option<String>>(6)?,
+            row.get::<_, Option<String>>(7)?,
+            row.get::<_, String>(8)?,
+            row.get::<_, String>(9)?,
+        ))
+    })?;
+    let empty = HashMap::new();
+    let mut verified = 0;
+    for row in rows {
+        let (hash, workspace, item, user, delta, due, comment, photo, ledger_hash, created) = row?;
+        if custody_entry_hash(
+            &workspace,
+            &item,
+            &user,
+            delta,
+            due.as_deref(),
+            comment.as_deref(),
+            photo.as_deref(),
+            &ledger_hash,
+            &created,
+        ) != hash
+        {
+            anyhow::bail!("stored custody entry hash mismatch");
+        }
+        let evidence = custody_ledger_evidence(conn, &empty, &ledger_hash)?;
+        let expected = if delta > 0.0 {
+            "transfer_receive"
+        } else {
+            "transfer_send"
+        };
+        let quantity_matches = evidence
+            .quantity
+            .map(|quantity| (quantity.abs() - delta.abs()).abs() < 1e-9)
+            .unwrap_or_else(|| (delta.abs() - 1.0).abs() < 1e-9);
+        if evidence.workspace_guid != workspace
+            || evidence.item_guid != item
+            || evidence.actor_guid != user
+            || evidence.operation != expected
+            || evidence.created_at != created
+            || !quantity_matches
+            || !evidence.has_device_proof
+        {
+            anyhow::bail!("stored custody entry is not bound to ledger event");
         }
         verified += 1;
     }
@@ -2853,6 +3317,7 @@ pub fn integrity_audit(conn: &Connection) -> Value {
     let snapshot = export_journal(conn);
     let snapshot_result = ledger::verify_journal(&snapshot);
     let device_result = verify_stored_device_bindings(conn);
+    let custody_result = verify_stored_custody(conn);
     let membership_result = verify_membership_records(conn, &snapshot);
 
     let count = |table: &str| -> i64 {
@@ -2927,6 +3392,7 @@ pub fn integrity_audit(conn: &Connection) -> Value {
     let knowledge_error = knowledge_result.as_ref().err().map(ToString::to_string);
     let snapshot_error = snapshot_result.as_ref().err().map(ToString::to_string);
     let device_error = device_result.as_ref().err().map(ToString::to_string);
+    let custody_error = custody_result.as_ref().err().map(ToString::to_string);
     let membership_error = membership_result.as_ref().err().map(ToString::to_string);
     let healthy = database_check == "ok"
         && ledger_result.is_ok()
@@ -2935,11 +3401,22 @@ pub fn integrity_audit(conn: &Connection) -> Value {
         && knowledge_result.is_ok()
         && snapshot_result.is_ok()
         && device_result.is_ok()
+        && custody_result.is_ok()
         && membership_result.is_ok()
         && orphan_history == 0
         && missing_guids == 0
         && missing_blobs == 0
         && pending_downloads == 0;
+    let counts = json!({
+        "workspaces": count("workspaces"), "users": count("users"),
+        "devices": count("user_devices"), "custodyEntries": count("custody_entries"),
+        "items": count("items"), "history": count("history_entries"),
+        "messages": count("chat_messages"), "organizationNodes": count("organization_nodes"),
+        "blobs": count("content_blobs"), "accountingTransactions": count("accounting_transactions"),
+        "accountingLines": count("accounting_lines"), "knowledgePages": count("knowledge_pages"),
+        "knowledgeRevisions": count("knowledge_revisions"),
+        "membershipVersions": count("membership_versions"),
+    });
     json!({
         "healthy": healthy,
         "checkedAt": chrono::Utc::now().to_rfc3339(),
@@ -2956,6 +3433,9 @@ pub fn integrity_audit(conn: &Connection) -> Value {
         "deviceError": device_error,
         "deviceRegistryVerified": device_result.is_ok(),
         "deviceProofsVerified": device_result.unwrap_or(0),
+        "custodyError": custody_error,
+        "custodyVerified": custody_result.as_ref().is_ok(),
+        "custodyEntriesVerified": custody_result.unwrap_or(0),
         "membershipError": membership_error,
         "membershipVerified": membership_result.is_ok(),
         "snapshotHash": snapshot.get("journalHash"),
@@ -2965,21 +3445,7 @@ pub fn integrity_audit(conn: &Connection) -> Value {
         "missingBlobs": missing_blobs,
         "missingReferencedBlobs": missing_referenced_blobs,
         "pendingDownloads": pending_downloads,
-        "counts": {
-            "workspaces": count("workspaces"),
-            "users": count("users"),
-            "devices": count("user_devices"),
-            "items": count("items"),
-            "history": count("history_entries"),
-            "messages": count("chat_messages"),
-            "organizationNodes": count("organization_nodes"),
-            "blobs": count("content_blobs"),
-            "accountingTransactions": count("accounting_transactions"),
-            "accountingLines": count("accounting_lines"),
-            "knowledgePages": count("knowledge_pages"),
-            "knowledgeRevisions": count("knowledge_revisions"),
-            "membershipVersions": count("membership_versions"),
-        },
+        "counts": counts,
         "ledgerHeads": heads,
     })
 }
@@ -3162,6 +3628,115 @@ mod tests {
                 .unwrap()
                 .is_some(),
             "old offline snapshot must not resurrect a revoked device"
+        );
+
+        drop((source, target, rejected));
+        for path in [source_path, target_path, rejected_path] {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    #[test]
+    fn quantitative_custody_restores_from_ledger_and_rejects_forged_delta() {
+        let source_path =
+            std::env::temp_dir().join(format!("custody-source-{}.db", uuid::Uuid::new_v4()));
+        let target_path =
+            std::env::temp_dir().join(format!("custody-target-{}.db", uuid::Uuid::new_v4()));
+        let rejected_path =
+            std::env::temp_dir().join(format!("custody-rejected-{}.db", uuid::Uuid::new_v4()));
+        let mut source = crate::db::open(&source_path).unwrap();
+        let target = crate::db::open(&target_path).unwrap();
+        let rejected = crate::db::open(&rejected_path).unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        source.execute("INSERT INTO workspaces(name,internal_id_prefix,created_at,guid) VALUES('Org','O-',?1,'custody-workspace')",[&now]).unwrap();
+        let workspace = source.last_insert_rowid();
+        crate::db::ensure_workspace_statuses(&source, workspace).unwrap();
+        source.execute("INSERT INTO users(full_name,phone,status,created_at,guid) VALUES('Worker','+70000000401','active',?1,'custody-worker')",[&now]).unwrap();
+        let worker = source.last_insert_rowid();
+        source
+            .execute(
+                "INSERT INTO user_workspaces(user_id,workspace_id,rights_json) VALUES(?1,?2,?3)",
+                params![worker, workspace, crate::db::owner_rights().to_string()],
+            )
+            .unwrap();
+        record_membership_version(&source, workspace, worker, true, None, true).unwrap();
+        let status: i64 = source
+            .query_row(
+                "SELECT id FROM statuses WHERE workspace_id=?1 AND slug='in-stock'",
+                [workspace],
+                |row| row.get(0),
+            )
+            .unwrap();
+        source.execute(
+            "INSERT INTO items(internal_id,title,status_id,workspace_id,quantitative,quantity,created_at,guid)
+             VALUES('MAT-1','Кабель',?1,?2,1,10,?3,'custody-item')",
+            params![status,workspace,now],
+        ).unwrap();
+        let item = source.last_insert_rowid();
+        let key = SigningKey::generate(&mut OsRng);
+        let device_id = "custody-device-0001";
+        crate::device::register(
+            &source,
+            worker,
+            &json!({
+                "deviceId":device_id,"name":"Телефон рабочего",
+                "publicKey":URL_SAFE_NO_PAD.encode(key.verifying_key().to_bytes())
+            }),
+        )
+        .unwrap();
+        let proof = signed_device_proof(&key, device_id, "/api/trpc/transfers.take");
+        crate::device::set_pending(&source, worker, &proof).unwrap();
+        crate::api::dispatch(
+            &mut source,
+            "transfers.take",
+            &json!({"itemId":item,"quantity":4.0,"dueAt":"2026-09-10T12:00:00Z"}),
+            Some(worker),
+        )
+        .unwrap();
+
+        let journal = export_journal(&source);
+        assert_eq!(journal["custody"].as_array().unwrap().len(), 1);
+        let result = apply_remote_journal(&target, &journal, "");
+        assert_eq!(result["ok"], true, "{result}");
+        let restored: f64 = target.query_row(
+            "SELECT COALESCE(SUM(h.quantity),0) FROM item_holdings h JOIN items i ON i.id=h.item_id
+             WHERE i.guid='custody-item' AND h.returned_at IS NULL",
+            [],
+            |row| row.get(0),
+        ).unwrap();
+        assert!((restored - 4.0).abs() < 1e-9, "{restored}");
+
+        let mut forged = journal.clone();
+        let record = forged["custody"]
+            .as_array_mut()
+            .unwrap()
+            .first_mut()
+            .unwrap();
+        record["quantityDelta"] = json!(2.0);
+        record["entryHash"] = Value::String(custody_entry_hash(
+            record["workspaceGuid"].as_str().unwrap(),
+            record["itemGuid"].as_str().unwrap(),
+            record["userGuid"].as_str().unwrap(),
+            2.0,
+            record["dueAt"].as_str(),
+            record["comment"].as_str(),
+            record["photoUrl"].as_str(),
+            record["ledgerHash"].as_str().unwrap(),
+            record["createdAt"].as_str().unwrap(),
+        ));
+        ledger::sign_journal(&source, &mut forged).unwrap();
+        let result = apply_remote_journal(&rejected, &forged, "");
+        assert_eq!(result["ok"], false);
+        assert!(result["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("semantically bound"));
+        assert_eq!(
+            rejected
+                .query_row("SELECT COUNT(*) FROM custody_entries", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
         );
 
         drop((source, target, rejected));

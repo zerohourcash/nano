@@ -439,6 +439,25 @@ def main() -> int:
             },
         )
         check("предмет создан на узле", isinstance(created, dict) and "id" in created, str(created)[:140])
+        material = node.call(
+            "items.create",
+            {
+                "workspaceId": node_ws_id,
+                "title": "Кабель бухта с узла",
+                "quantitative": True,
+                "quantity": 10,
+                "unit": "м",
+            },
+        )
+        held_material = node.call(
+            "transfers.take",
+            {"itemId": material["id"], "quantity": 4, "dueAt": "2026-09-10T12:00:00Z"},
+        )
+        check(
+            "количественная QR-выдача создала локальную custody-проводку",
+            held_material.get("issuedQty") == 4 and held_material.get("stockQty") == 6,
+            str(held_material)[:180],
+        )
         node_me = node.call("meta.currentUser", None, mutation=False)
         minted = node.call(
             "bit.mint",
@@ -466,6 +485,20 @@ def main() -> int:
             and back_card.get("externalId") == "node-1"
             and back_card.get("metadata", {}).get("isKit") is True,
             str(back_card)[:180],
+        )
+        custody_synced = wait_for(
+            lambda: (
+                (item_named(server, ws_id, "Кабель бухта с узла") or {}).get("issuedQty") == 4
+                and (item_named(server, ws_id, "Кабель бухта с узла") or {}).get("stockQty") == 6
+            )
+        )
+        restored_material = item_named(server, ws_id, "Кабель бухта с узла") or {}
+        check(
+            "полная нода восстановила кто держит 4 единицы из custody-летописи",
+            custody_synced
+            and len(restored_material.get("holders", [])) == 1
+            and restored_material.get("holders", [{}])[0].get("quantity") == 4,
+            str(restored_material)[:220],
         )
         bit_synced = wait_for(
             lambda: server.call("bit.balance", {"workspaceId": ws_id, "userId": owner["id"]}, mutation=False).get("balance") == 100
