@@ -15,6 +15,7 @@ export const interorgRouter = createRouter({
     encryptionKey: z.string().min(40).max(64),
     signingKey: z.string().min(40).max(64),
   })).mutation(async ({ input }) => ({ guid: crypto.randomUUID(), destination: '', active: true, ...input } as Contact)),
+  revokeContact: publicQuery.input(z.object({ workspaceId: z.number().int().positive(), guid: z.string().uuid() })).mutation(async ({ input }) => ({ ok: true, guid: input.guid, remoteWorkspaceGuid: '', ledgerHash: '' })),
   inbox: publicQuery.input(z.object({ workspaceId: z.number().int().positive() })).query(async () => [] as Array<{
     envelopeId: string
     transactionId: string

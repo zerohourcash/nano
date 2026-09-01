@@ -229,6 +229,16 @@ pub fn list_contacts(conn: &Connection, workspace_id: i64) -> Result<serde_json:
     Ok(serde_json::Value::Array(rows.flatten().collect()))
 }
 
+pub fn revoke_contact(conn: &Connection, workspace_id: i64, guid: &str) -> Result<bool> {
+    if uuid::Uuid::parse_str(guid).is_err() {
+        bail!("invalid interorg contact GUID");
+    }
+    Ok(conn.execute(
+        "UPDATE interorg_contacts SET active=0 WHERE guid=?1 AND workspace_id=?2 AND active=1",
+        params![guid, workspace_id],
+    )? == 1)
+}
+
 pub fn send_to_contact(
     conn: &Connection,
     workspace_id: i64,
@@ -792,6 +802,20 @@ mod tests {
         .unwrap();
         assert_eq!(contact["remoteWorkspaceGuid"], "org-b");
         assert_eq!(list_contacts(&db, 1).unwrap().as_array().unwrap().len(), 1);
+        assert!(revoke_contact(&db, 1, contact["guid"].as_str().unwrap()).unwrap());
+        assert!(!list_contacts(&db, 1).unwrap()[0]["active"]
+            .as_bool()
+            .unwrap());
+        assert!(send_to_contact(
+            &db,
+            1,
+            contact["guid"].as_str().unwrap(),
+            "message.notice",
+            &uuid::Uuid::new_v4().to_string(),
+            serde_json::json!({"text":"blocked"}),
+            8,
+        )
+        .is_err());
         assert!(trust_contact(&db, 1, "Атака", "org-x", "bad", "bad").is_err());
     }
 

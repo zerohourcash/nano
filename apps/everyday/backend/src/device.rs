@@ -121,6 +121,7 @@ pub fn requires_signature(procedure: &str) -> bool {
             | "knowledge.save"
             | "interorg.ensureIdentity"
             | "interorg.trustContact"
+            | "interorg.revokeContact"
             | "interorg.send"
             | "interorg.accept"
             | "sync.importBundle"

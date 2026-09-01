@@ -1000,6 +1000,7 @@ fn dispatch_inner(
         "interorg.ensureIdentity" => interorg_ensure_identity(conn, input, user_id),
         "interorg.contacts" => interorg_contacts(conn, input),
         "interorg.trustContact" => interorg_trust_contact(conn, input, user_id),
+        "interorg.revokeContact" => interorg_revoke_contact(conn, input, user_id),
         "interorg.inbox" => interorg_inbox(conn, input),
         "interorg.send" => interorg_send(conn, input, user_id),
         "interorg.accept" => interorg_accept(conn, input, user_id),
@@ -6402,6 +6403,47 @@ fn interorg_trust_contact(conn: &mut Connection, input: &Value, user_id: Option<
     })
 }
 
+fn interorg_revoke_contact(
+    conn: &mut Connection,
+    input: &Value,
+    user_id: Option<i64>,
+) -> ApiResult {
+    let uid = require_user(conn, user_id)?;
+    let ws = i64v(input, "workspaceId").unwrap_or_else(|| ws_fallback(conn));
+    require_can_in_workspace(conn, uid, ws, "manageWorkspaces")?;
+    let guid = s(input, "guid").ok_or_else(|| ApiError::bad("guid"))?;
+    atomic(conn, |tx| {
+        let remote: Option<String> = tx
+            .query_row(
+                "SELECT remote_workspace_guid FROM interorg_contacts WHERE guid=?1 AND workspace_id=?2 AND active=1",
+                params![guid, ws],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(remote) = remote else {
+            return Err(ApiError::not_found("Активный контрагент не найден"));
+        };
+        if !crate::interorg::revoke_contact(tx, ws, &guid)
+            .map_err(|error| ApiError::bad(error.to_string()))?
+        {
+            return Err(ApiError::conflict("Контрагент уже отозван"));
+        }
+        let event = ledger::append(
+            tx,
+            ws,
+            uid,
+            None,
+            "interorg_contact_revoke",
+            Some(&guid),
+            Some(&remote),
+            None,
+            Some("Доверие к ключам контрагента отозвано"),
+        )
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+        Ok(json!({"ok":true,"guid":guid,"remoteWorkspaceGuid":remote,"ledgerHash":event["opId"]}))
+    })
+}
+
 fn interorg_inbox(conn: &Connection, input: &Value) -> ApiResult {
     let ws = i64v(input, "workspaceId").unwrap_or_else(|| ws_fallback(conn));
     crate::interorg::receive_local(conn, crate::interorg_work_bits())
@@ -8706,6 +8748,25 @@ mod tests {
         )
         .unwrap();
         assert_eq!(duplicate["duplicate"], true);
+        let revoked = dispatch(
+            &mut conn,
+            "interorg.revokeContact",
+            &json!({"workspaceId":ws,"guid":contact["guid"]}),
+            Some(users[0]),
+        )
+        .unwrap();
+        assert!(revoked["ledgerHash"].as_str().is_some());
+        let blocked = dispatch(
+            &mut conn,
+            "interorg.send",
+            &json!({
+                "workspaceId":ws,"contactGuid":contact["guid"],"kind":"message.notice",
+                "transactionId":Uuid::new_v4().to_string(),"body":{"text":"не доставлять"}
+            }),
+            Some(users[0]),
+        )
+        .unwrap_err();
+        assert_eq!(blocked.http, 400);
         let event_types: Vec<String> = conn
             .prepare("SELECT type FROM history_entries WHERE workspace_id=?1 AND type LIKE 'interorg_%' ORDER BY id")
             .unwrap()
@@ -8719,7 +8780,8 @@ mod tests {
                 "interorg_identity_create",
                 "interorg_contact_trust",
                 "interorg_send",
-                "interorg_accept"
+                "interorg_accept",
+                "interorg_contact_revoke"
             ]
         );
         assert!(crate::device::requires_signature("interorg.send"));

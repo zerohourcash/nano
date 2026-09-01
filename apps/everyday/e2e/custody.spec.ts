@@ -331,6 +331,29 @@ test('browser signs a real custody transaction and ledger retains its proof', as
     requestDeviceId: expect.any(String),
     requestHash: expect.stringMatching(/^[a-f0-9]{64}$/),
   });
+  const remoteKeys = await page.evaluate(async () => {
+    const signing = (await crypto.subtle.generateKey('Ed25519', true, ['sign', 'verify'])) as CryptoKeyPair;
+    const encode = (bytes: Uint8Array) => {
+      let binary = '';
+      for (const byte of bytes) binary += String.fromCharCode(byte);
+      return btoa(binary);
+    };
+    return {
+      encryptionKey: encode(crypto.getRandomValues(new Uint8Array(32))),
+      signingKey: encode(new Uint8Array(await crypto.subtle.exportKey('raw', signing.publicKey))),
+    };
+  });
+  await trpc(page, 'interorg.trustContact', {
+    workspaceId: workspaces[0].id,
+    name: 'E2E Контрагент',
+    remoteWorkspaceGuid: crypto.randomUUID(),
+    ...remoteKeys,
+  });
+  await page.reload();
+  await page.getByRole('button', { name: 'Сеть организаций' }).first().click();
+  await expect(page.getByTestId('interorg-contact')).toContainText('E2E Контрагент');
+  await page.getByRole('button', { name: 'Отозвать ключи' }).click();
+  await expect(page.getByTestId('interorg-contact')).toContainText('отозван');
   await page.getByRole('button', { name: 'Пространства', exact: true }).click();
   await expect(
     page.getByTitle('Скопировать GUID для organization scope ноды').first()

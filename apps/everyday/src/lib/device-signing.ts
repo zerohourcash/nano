@@ -102,6 +102,7 @@ const CRITICAL = [
   'knowledge.save',
   'interorg.ensureIdentity',
   'interorg.trustContact',
+  'interorg.revokeContact',
   'interorg.send',
   'interorg.accept',
   'sync.importBundle',

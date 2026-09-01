@@ -60,7 +60,7 @@ def main() -> int:
             "remoteWorkspaceGuid": ws_b["guid"],
             "encryptionKey": identity_b["publicKey"], "signingKey": identity_b["signingKey"],
         })
-        b.call("interorg.trustContact", {
+        contact_a = b.call("interorg.trustContact", {
             "workspaceId": ws_b["id"], "name": "Организация А",
             "remoteWorkspaceGuid": ws_a["guid"],
             "encryptionKey": identity_a["publicKey"], "signingKey": identity_a["signingKey"],
@@ -127,6 +127,20 @@ def main() -> int:
             foreign_items = database.execute("SELECT COUNT(*) FROM items WHERE title='Только А'").fetchone()[0]
         check("принятие существует ровно один раз, чужой склад не реплицирован",
               accepted_rows == 1 and foreign_items == 0, f"accept={accepted_rows} foreignItems={foreign_items}")
+
+        revoked = b.call("interorg.revokeContact", {
+            "workspaceId": ws_b["id"], "guid": contact_a["guid"],
+        })
+        blocked_tx = str(uuid.uuid4())
+        a.call("interorg.send", {
+            "workspaceId": ws_a["id"], "contactGuid": contact_b["guid"],
+            "transactionId": blocked_tx, "kind": "message.notice",
+            "body": {"text": "сообщение после отзыва"},
+        })
+        time.sleep(4)
+        check("после signed revoke новый конверт не становится входящей транзакцией",
+              len(revoked.get("ledgerHash", "")) == 64
+              and all(row["transactionId"] != blocked_tx for row in inbox_b()))
     finally:
         a.stop()
         b.stop()

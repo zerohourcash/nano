@@ -636,7 +636,7 @@ pub(crate) fn interorg_work_bits() -> u8 {
         .ok()
         .and_then(|value| value.parse::<u8>().ok())
         .filter(|bits| (8..=24).contains(bits))
-        .unwrap_or(18)
+        .unwrap_or(if cfg!(test) { 8 } else { 18 })
 }
 
 /// Public mesh ingress for opaque cross-organization envelopes. It has no

@@ -1,5 +1,5 @@
 import { useMemo, useState } from 'react'
-import { Check, Clipboard, KeyRound, Plus, Send, ShieldCheck } from 'lucide-react'
+import { Ban, Check, Clipboard, KeyRound, Plus, Send, ShieldCheck } from 'lucide-react'
 import { trpc } from '@/providers/trpc'
 import { useStore } from '@/lib/store'
 import InviteQrBlock from '@/components/InviteQrBlock'
@@ -33,6 +33,14 @@ export default function InterorgSection() {
       setCardText('')
       setContactName('')
       toast('Контрагент добавлен в доверенный каталог')
+    },
+    onError: (error) => toast(error.message, 'error'),
+  })
+  const revoke = trpc.interorg.revokeContact.useMutation({
+    onSuccess: () => {
+      void contactsQ.refetch()
+      setSelected('')
+      toast('Доверие к ключам контрагента отозвано')
     },
     onError: (error) => toast(error.message, 'error'),
   })
@@ -106,6 +114,22 @@ export default function InterorgSection() {
             </div>
           </div>
         )}
+      </section>
+
+      <section className={`${cardCls} overflow-hidden`}>
+        <div className="border-b border-brand-100 px-5 py-4"><h3 className="font-semibold text-ink-900">Доверенный каталог</h3></div>
+        <div className="divide-y divide-brand-100">
+          {(contactsQ.data ?? []).map((contact) => (
+            <div key={contact.guid} className="flex flex-col gap-3 p-5 sm:flex-row sm:items-center sm:justify-between" data-testid="interorg-contact">
+              <div className="min-w-0">
+                <div className="flex items-center gap-2"><span className="font-semibold text-ink-900">{contact.name}</span><span className={`rounded-full px-2 py-0.5 text-xs ${contact.active ? 'bg-teal/10 text-teal' : 'bg-danger/10 text-danger'}`}>{contact.active ? 'доверен' : 'отозван'}</span></div>
+                <p className="mt-1 truncate font-mono text-xs text-ink-500">{contact.remoteWorkspaceGuid}</p>
+              </div>
+              {contact.active && <button className={btnSecondaryCls} onClick={() => revoke.mutate({ workspaceId, guid: contact.guid })} disabled={revoke.isPending}><Ban size={16} /> Отозвать ключи</button>}
+            </div>
+          ))}
+          {!contactsQ.isLoading && !(contactsQ.data ?? []).length && <p className="p-6 text-center text-sm text-ink-500">Контрагентов пока нет</p>}
+        </div>
       </section>
 
       <section className={`${cardCls} p-5 sm:p-6`}>
