@@ -180,6 +180,11 @@ capability, затем применяют только её scope. Неверн�
   `createdAt/completedAt` берутся из переносимых create/complete records, а не
   из времени локальной материализации, поэтому акт побайтово воспроизводится
   другой нодой после partition/heal.
+  Offline CLI `--verify-inventory-act` вызывает тот же bounded verifier без
+  открытия SQLite и возвращает машинно-читаемый JSON и exit code `0/2`. Это
+  независимая проверка целостности файла и Ed25519 node-proof, но не утверждение
+  доверия к ключу: trust store, membership и локальная история доступны только
+  полному `inventory.verifyAct` внутри организации.
 - «Удаление» ТМЦ реализовано как delete-wins `itemTombstoneMode=monotonic/v1`.
   Tombstone коммитит GUID организации, карточки и автора, Ledger hash и время;
   связанное `item_archive` обязано иметь полный device-proof. Проверка проходит

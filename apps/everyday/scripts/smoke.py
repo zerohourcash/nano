@@ -1,6 +1,6 @@
 """Сценарии ТЗ через HTTP-API узла. Запускать через scripts/smoke_runner.py."""
 
-import json, os, uuid, urllib.error, urllib.parse, urllib.request, http.cookiejar
+import copy, http.cookiejar, json, os, subprocess, tempfile, uuid, urllib.error, urllib.parse, urllib.request
 from device_test_signing import CRITICAL, DeviceSigner
 
 BASE = os.environ.get("MK_BASE", "http://127.0.0.1:8098")
@@ -371,6 +371,39 @@ show("checkItem", chk)
 cmp1 = owner.call("inventory.complete", {"sessionId": sid})
 cmp2 = owner.call("inventory.complete", {"sessionId": sid})
 check("inventory complete idempotent/guarded", "__err" in cmp2 or cmp1 == cmp2, str(cmp2)[:120])
+act = owner.call("inventory.act", {"id": sid}, mutation=False)
+binary = os.environ.get("MK_BINARY")
+if binary and isinstance(act, dict) and act.get("format") == "everyday-inventory-act":
+    valid_path = forged_path = None
+    try:
+        with tempfile.NamedTemporaryFile("w", suffix=".json", encoding="utf-8", delete=False) as handle:
+            json.dump(act, handle, ensure_ascii=False)
+            valid_path = handle.name
+        valid_cli = subprocess.run(
+            [binary, "--verify-inventory-act", valid_path],
+            capture_output=True, text=True, encoding="utf-8", timeout=20,
+        )
+        valid_report = json.loads(valid_cli.stdout) if valid_cli.stdout else {}
+        check("standalone act verifier accepts real act", valid_cli.returncode == 0 and valid_report.get("cryptographicValid") is True and valid_report.get("number") == inv_s.get("number"), valid_cli.stderr[:160])
+        forged = copy.deepcopy(act)
+        forged["act"]["number"] = "ИНВ-ПОДМЕНА"
+        with tempfile.NamedTemporaryFile("w", suffix=".json", encoding="utf-8", delete=False) as handle:
+            json.dump(forged, handle, ensure_ascii=False)
+            forged_path = handle.name
+        forged_cli = subprocess.run(
+            [binary, "--verify-inventory-act", forged_path],
+            capture_output=True, text=True, encoding="utf-8", timeout=20,
+        )
+        check("standalone act verifier rejects tampering", forged_cli.returncode == 2, forged_cli.stdout[:160])
+    finally:
+        for path in (valid_path, forged_path):
+            if path:
+                try:
+                    os.unlink(path)
+                except FileNotFoundError:
+                    pass
+else:
+    check("standalone act verifier available", False, "MK_BINARY/act missing")
 
 print("\n== 13b. Причина смены статуса ==")
 stats = owner.call("admin.dictionaries.list", {"workspaceId": ws_id, "kind": "statuses"}, mutation=False)

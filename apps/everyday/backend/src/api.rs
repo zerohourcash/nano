@@ -4,13 +4,8 @@ use argon2::{
     password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
     Argon2,
 };
-use base64::{
-    engine::general_purpose::{
-        STANDARD as B64, STANDARD_NO_PAD as B64_NO_PAD, URL_SAFE_NO_PAD as URL_B64,
-    },
-    Engine,
-};
-use ed25519_dalek::{Signer, Verifier};
+use base64::{engine::general_purpose::STANDARD as B64, Engine};
+use ed25519_dalek::Signer;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -3816,70 +3811,21 @@ fn inv_act(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiResult 
     }))
 }
 
-fn decode_portable_base64(value: &str) -> Option<Vec<u8>> {
-    B64.decode(value)
-        .ok()
-        .or_else(|| B64_NO_PAD.decode(value).ok())
-        .or_else(|| URL_B64.decode(value).ok())
-}
-
 fn inv_verify_act(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
     let uid = require_user(conn, user_id)?;
     let document = input
         .get("document")
-        .and_then(Value::as_object)
+        .filter(|value| value.is_object())
         .ok_or_else(|| ApiError::bad("document"))?;
-    let canonical_text = document
+    if document
         .get("canonical")
         .and_then(Value::as_str)
-        .unwrap_or_default();
-    if canonical_text.len() > 8 * 1024 * 1024 {
+        .is_some_and(|value| value.len() > crate::inventory_act::MAX_ENCODED_ACT_BYTES)
+    {
         return Err(ApiError::bad("Акт превышает допустимый размер"));
     }
-    let canonical = decode_portable_base64(canonical_text).unwrap_or_default();
-    let parsed = serde_json::from_slice::<Value>(&canonical).ok();
-    let embedded = document.get("act");
-    let claimed_hash = document
-        .get("hash")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    let actual_hash = format!("{:x}", Sha256::digest(&canonical));
-    let canonical_matches = parsed.as_ref() == embedded;
-    let hash_matches = claimed_hash.len() == 64 && claimed_hash == actual_hash;
-    let domain_matches = document.get("format").and_then(Value::as_str)
-        == Some("everyday-inventory-act")
-        && document.get("version").and_then(Value::as_i64) == Some(1)
-        && document.get("signatureDomain").and_then(Value::as_str)
-            == Some("everyday/inventory-act/v1");
-    let public_key_bytes = document
-        .get("publicKey")
-        .and_then(Value::as_str)
-        .and_then(decode_portable_base64)
-        .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok());
-    let signature_bytes = document
-        .get("signature")
-        .and_then(Value::as_str)
-        .and_then(decode_portable_base64)
-        .and_then(|bytes| <[u8; 64]>::try_from(bytes).ok());
-    let signature_valid = match (public_key_bytes, signature_bytes) {
-        (Some(key), Some(signature)) if hash_matches && domain_matches => {
-            ed25519_dalek::VerifyingKey::from_bytes(&key)
-                .and_then(|verifier| {
-                    verifier.verify(
-                        format!("everyday/inventory-act/v1\n{claimed_hash}").as_bytes(),
-                        &ed25519_dalek::Signature::from_bytes(&signature),
-                    )
-                })
-                .is_ok()
-        }
-        _ => false,
-    };
-    let cryptographic_valid = !canonical.is_empty()
-        && canonical_matches
-        && hash_matches
-        && domain_matches
-        && signature_valid;
-    if !cryptographic_valid {
+    let cryptographic = crate::inventory_act::verify(document);
+    if !cryptographic.valid {
         return Ok(json!({
             "verdict":"invalid","cryptographicValid":false,"trustedKey":false,
             "workspaceKnown":false,"localSession":false,"localMatch":false,
@@ -3887,10 +3833,10 @@ fn inv_verify_act(conn: &Connection, input: &Value, user_id: Option<i64>) -> Api
         }));
     }
 
-    let key = public_key_bytes.expect("validated key");
+    let key = cryptographic.public_key.expect("validated key");
     let mut trusted_key = ledger::node_public_key(conn)
         .ok()
-        .and_then(|encoded| decode_portable_base64(&encoded))
+        .and_then(|encoded| crate::inventory_act::decode_base64(&encoded))
         .as_deref()
         == Some(key.as_slice());
     let mut trusted = conn.prepare("SELECT public_key FROM trusted_node_keys")?;
@@ -3898,12 +3844,12 @@ fn inv_verify_act(conn: &Connection, input: &Value, user_id: Option<i64>) -> Api
         .query_map([], |row| row.get::<_, String>(0))?
         .flatten()
     {
-        if decode_portable_base64(&encoded).as_deref() == Some(key.as_slice()) {
+        if crate::inventory_act::decode_base64(&encoded).as_deref() == Some(key.as_slice()) {
             trusted_key = true;
             break;
         }
     }
-    let act = parsed.expect("validated canonical JSON");
+    let act = cryptographic.act.expect("validated canonical JSON");
     let workspace_guid = act
         .get("workspaceGuid")
         .and_then(Value::as_str)

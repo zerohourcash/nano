@@ -7,6 +7,7 @@ mod device;
 mod diagnostics;
 mod discovery;
 pub mod interorg;
+pub mod inventory_act;
 mod json;
 mod knowledge;
 mod ledger;

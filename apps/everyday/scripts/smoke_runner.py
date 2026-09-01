@@ -79,7 +79,7 @@ def main() -> int:
         result = subprocess.run(
             [sys.executable, str(Path(__file__).with_name("smoke.py"))],
             cwd=str(ROOT),
-            env={**env, "MK_BASE": base, "PYTHONIOENCODING": "utf-8"},
+            env={**env, "MK_BASE": base, "MK_BINARY": str(binary), "PYTHONIOENCODING": "utf-8"},
         )
         return result.returncode
     finally:
