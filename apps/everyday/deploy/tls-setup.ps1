@@ -53,6 +53,7 @@ function Encode-File([string]$name) {
     [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($text))
 }
 $backupSh = Encode-File 'meshkeeper-backup.sh'
+$restoreSh = Encode-File 'meshkeeper-restore.sh'
 $backupService = Encode-File 'meshkeeper-backup.service'
 $backupTimer = Encode-File 'meshkeeper-backup.timer'
 
@@ -71,7 +72,7 @@ if ! command -v certbot >/dev/null 2>&1; then
   apt-get install -y -qq certbot python3-certbot-nginx >/dev/null
 fi
 
-command -v sqlite3 >/dev/null 2>&1 || apt-get install -y -qq sqlite3 >/dev/null || true
+command -v sqlite3 >/dev/null 2>&1 || apt-get install -y -qq sqlite3 >/dev/null
 
 mkdir -p /var/lib/meshkeeper /etc/meshkeeper
 chown meshkeeper:meshkeeper /var/lib/meshkeeper
@@ -145,9 +146,10 @@ systemctl enable --now certbot.timer >/dev/null 2>&1 || true
 
 # ── Резервное копирование ───────────────────────────────────────────────────
 echo '__B_SH__'     | base64 -d > /usr/local/sbin/meshkeeper-backup
+echo '__R_SH__'     | base64 -d > /usr/local/sbin/meshkeeper-restore
 echo '__B_SERVICE__' | base64 -d > /etc/systemd/system/meshkeeper-backup.service
 echo '__B_TIMER__'   | base64 -d > /etc/systemd/system/meshkeeper-backup.timer
-chmod 0755 /usr/local/sbin/meshkeeper-backup
+chmod 0755 /usr/local/sbin/meshkeeper-backup /usr/local/sbin/meshkeeper-restore
 chmod 0644 /etc/systemd/system/meshkeeper-backup.service /etc/systemd/system/meshkeeper-backup.timer
 
 # Пароль архивов создаём один раз и больше не трогаем: иначе старые копии
@@ -175,6 +177,7 @@ $remote = $template.
     Replace('__DOMAIN__', $Domain).
     Replace('__EMAIL_ARG__', $emailArg).
     Replace('__B_SH__', $backupSh).
+    Replace('__R_SH__', $restoreSh).
     Replace('__B_SERVICE__', $backupService).
     Replace('__B_TIMER__', $backupTimer).
     Replace("`r`n", "`n")

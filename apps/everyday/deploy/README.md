@@ -105,6 +105,27 @@ sudo nginx -t && sudo systemctl reload nginx
 заголовок `Host` в `proxy_set_header`: узел сверяет с ним `Origin`, и подмена
 приведёт к отказу всех изменяющих запросов.
 
+### Проверка резервной копии и восстановление
+
+Backup всегда снимается командой SQLite `.backup`, проходит
+`PRAGMA integrity_check` и шифруется AES-256-CBC/PBKDF2. Без `sqlite3`, OpenSSL
+или `MESHKEEPER_BACKUP_PASS` задача завершается ошибкой и не публикует
+plaintext-копию. Восстанавливайте только в новый файл:
+
+```bash
+set -a
+. /etc/meshkeeper/meshkeeper.env
+set +a
+sudo -E meshkeeper-restore \
+  /var/backups/meshkeeper/meshkeeper-YYYYMMDD-HHMMSS.db.gz.enc \
+  /var/lib/meshkeeper/meshkeeper-restored.db
+```
+
+Скрипт сначала расшифровывает во временный каталог, проверяет gzip и SQLite
+integrity, и только затем устанавливает файл с mode `0600`. Неверный пароль,
+повреждённый архив и существующий target отклоняются. Автоматическая проверка:
+`npm run backup:restore:test`.
+
 ## 3. Сборка и выкладка
 
 Бинарник нужен под Linux. Со стороны Windows удобнее собрать его на самом

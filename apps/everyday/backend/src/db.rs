@@ -55,7 +55,9 @@ fn apply_encryption_key(conn: &Connection) -> Result<()> {
 #[cfg(not(feature = "encrypted-db"))]
 fn apply_encryption_key(_conn: &Connection) -> Result<()> {
     if std::env::var("MESHKEEPER_DB_KEY").is_ok() {
-        eprintln!("MESHKEEPER_DB_KEY задан, но сборка без шифрования — база останется открытой");
+        anyhow::bail!(
+            "MESHKEEPER_DB_KEY задан, но бинарник собран без encrypted-db; отказ вместо открытия незашифрованной базы"
+        );
     }
     Ok(())
 }

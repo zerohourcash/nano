@@ -340,6 +340,8 @@ SQLite `quick_check`, повторно проверяет все Ed25519 account
 
 Пошагово — [deploy/README.md](deploy/README.md), доступ по SSH-ключу —
 [deploy/SSH.md](deploy/SSH.md).
+Матрица требований, исполняемых доказательств и честно незакрытых платформ —
+[docs/PRODUCTION_AUDIT.md](docs/PRODUCTION_AUDIT.md).
 
 Коротко: `deploy/bootstrap.ps1` готовит сервер, `deploy/tls-setup.ps1`
 выпускает сертификат Let's Encrypt и включает ежедневные шифрованные копии,
@@ -358,6 +360,8 @@ cargo build --release --features encrypted-db
 локальном узле, который может быть потерян вместе с ноутбуком; на сервере ключ
 лежит на том же диске, что и база, поэтому там работают права доступа и
 изоляция сервиса.
+Обычный бинарник теперь отказывается запускаться, если ему передан
+`MESHKEEPER_DB_KEY`: ошибочная сборка не сможет молча открыть plaintext SQLite.
 
 Приватный Ed25519 seed ноды можно вынести из SQLite через
 `MESHKEEPER_NODE_SIGNING_KEY` (32 байта, base64 без padding) и передавать из

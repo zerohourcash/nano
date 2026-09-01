@@ -111,6 +111,13 @@ capability, затем применяют только её scope. Неверн�
    SQLCipher и отдельный `MESHKEEPER_DB_KEY`.
 5. Запускаются `npm run verify`, резервное копирование и проверка восстановления.
 
+Если `MESHKEEPER_DB_KEY` задан обычному бинарнику без feature `encrypted-db`,
+узел прекращает запуск. Это fail-closed защита от ошибочного развёртывания
+plaintext SQLite вместо ожидаемой SQLCipher-базы.
+Server backup также fail-closed: отсутствие пароля, OpenSSL или `sqlite3`
+прерывает задачу. Опубликованный архив всегда зашифрован, а restore сначала
+проверяет пароль, gzip и `PRAGMA integrity_check`, не перезаписывая рабочую БД.
+
 Android-приложение хранит общий mesh-токен как AES-256-GCM ciphertext. Неэкспортируемый
 ключ создаётся в `AndroidKeyStore` (аппаратная защита используется устройством, если
 доступна), ciphertext привязан AAD к приложению и назначению ключа. Старое plaintext-
