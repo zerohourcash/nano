@@ -388,6 +388,12 @@ capability, затем применяют только её scope. Неверн�
   ограниченный 128 элементами `GET /mesh/gossip` доступны на sync-only
   listener; тот же ciphertext имеет отдельный MTU payload kind и может идти
   через IP, BLE, Wi-Fi Direct, LoRa или ручной store-and-forward.
+  Пользовательский `interorg.gossip` ограничен 32 envelope и выбранным workspace:
+  администратор одной организации не получает даже opaque-заголовки другой из
+  той же БД. Android маркирует gossip отдельным Rust transport kind `3`, а
+  `interorg.importGossip` требует device-proof и применяет batch в одной
+  SQLite-транзакции: неверная Ed25519-подпись, TTL, PoW либо структура любого
+  envelope откатывает все новые строки и не подтверждает durable BLE spool.
   Фоновый IP-gossip включается отдельным `MESHKEEPER_RELAY_PEERS`; эти связи не
   получают capability какой-либо организации и переносят только конверты.
   Адрес gateway создаётся подписанной операцией `interorg.ensureIdentity`, а

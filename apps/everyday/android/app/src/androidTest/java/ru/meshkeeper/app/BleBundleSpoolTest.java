@@ -87,6 +87,22 @@ public class BleBundleSpoolTest {
         }
     }
 
+    @Test public void bleFramingKeepsSyncAndInterorgPayloadKindsSeparate() {
+        assertEquals(1, BleMeshTransport.transportKind(
+                "{\"format\":\"everyday-sync-bundle\",\"version\":2}"
+                        .getBytes(StandardCharsets.UTF_8)));
+        assertEquals(3, BleMeshTransport.transportKind(
+                "{\"format\":\"everyday-interorg-gossip\",\"version\":1,\"envelopes\":[]}"
+                        .getBytes(StandardCharsets.UTF_8)));
+        try {
+            BleMeshTransport.transportKind(
+                    "{\"format\":\"attacker-payload\"}".getBytes(StandardCharsets.UTF_8));
+            fail("unknown payload kind must fail closed");
+        } catch (IllegalArgumentException expected) {
+            // expected
+        }
+    }
+
     private void clear() {
         if (!directory.isDirectory()) return;
         File[] files = directory.listFiles();

@@ -1042,6 +1042,37 @@ pub fn gossip_batch(conn: &Connection, limit: usize) -> Result<Vec<Envelope>> {
     rows.map(|row| Ok(serde_json::from_str(&row?)?)).collect()
 }
 
+/// User-facing transport export for one organization. Unlike the node-level
+/// relay endpoint this does not expose even opaque headers belonging only to a
+/// different tenant in the same SQLite database.
+pub fn gossip_batch_scoped(
+    conn: &Connection,
+    workspace_id: i64,
+    limit: usize,
+) -> Result<Vec<Envelope>> {
+    if limit == 0 || limit > 256 {
+        bail!("invalid interorg gossip limit");
+    }
+    conn.query_row(
+        "SELECT 1 FROM workspaces WHERE id=?1",
+        [workspace_id],
+        |_| Ok(()),
+    )?;
+    let mut statement = conn.prepare(
+        "SELECT DISTINCT e.envelope_json,e.received_at FROM interorg_envelopes e
+         WHERE e.expires_at>?1 AND (
+           e.destination IN (SELECT destination FROM interorg_identities WHERE workspace_id=?2)
+           OR e.destination IN (SELECT destination FROM interorg_contacts WHERE workspace_id=?2)
+           OR e.id IN (SELECT envelope_id FROM interorg_outbox WHERE workspace_id=?2)
+         ) ORDER BY e.received_at DESC LIMIT ?3",
+    )?;
+    let rows = statement.query_map(
+        params![Utc::now().to_rfc3339(), workspace_id, limit as i64],
+        |row| row.get::<_, String>(0),
+    )?;
+    rows.map(|row| Ok(serde_json::from_str(&row?)?)).collect()
+}
+
 pub fn open(envelope: &Envelope, recipient_secret: &[u8; 32], work_bits: u8) -> Result<Payload> {
     validate(envelope, Utc::now(), work_bits)?;
     decrypt_payload(envelope, recipient_secret)
@@ -1229,6 +1260,69 @@ mod tests {
             no_work.pow_nonce += 1;
         }
         assert!(relay_store(&db, &no_work, 8).is_err());
+    }
+
+    #[test]
+    fn user_facing_gossip_does_not_expose_another_tenants_envelopes() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(
+            "CREATE TABLE workspaces(id INTEGER PRIMARY KEY,guid TEXT NOT NULL);
+             INSERT INTO workspaces VALUES(1,'org-a');
+             INSERT INTO workspaces VALUES(2,'org-b');",
+        )
+        .unwrap();
+        init_schema(&db).unwrap();
+        let sender = SigningKey::generate(&mut OsRng);
+        let recipient_a = StaticSecret::random_from_rng(OsRng);
+        let recipient_b = StaticSecret::random_from_rng(OsRng);
+        let envelope_a = seal(
+            &payload(),
+            XPublicKey::from(&recipient_a).as_bytes(),
+            &sender,
+            24,
+            8,
+        )
+        .unwrap();
+        let envelope_b = seal(
+            &payload(),
+            XPublicKey::from(&recipient_b).as_bytes(),
+            &sender,
+            24,
+            8,
+        )
+        .unwrap();
+        relay_store(&db, &envelope_a, 8).unwrap();
+        relay_store(&db, &envelope_b, 8).unwrap();
+        for (workspace_id, envelope) in [(1, &envelope_a), (2, &envelope_b)] {
+            db.execute(
+                "INSERT INTO interorg_contacts(guid,workspace_id,name,remote_workspace_guid,destination,encryption_key,signing_key,created_at)
+                 VALUES(?1,?2,'remote',?3,?4,'key','signing',?5)",
+                params![
+                    uuid::Uuid::new_v4().to_string(),
+                    workspace_id,
+                    format!("remote-{workspace_id}"),
+                    envelope.destination,
+                    Utc::now().to_rfc3339()
+                ],
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            gossip_batch_scoped(&db, 1, 32)
+                .unwrap()
+                .into_iter()
+                .map(|envelope| envelope.id)
+                .collect::<Vec<_>>(),
+            [envelope_a.id]
+        );
+        assert_eq!(
+            gossip_batch_scoped(&db, 2, 32)
+                .unwrap()
+                .into_iter()
+                .map(|envelope| envelope.id)
+                .collect::<Vec<_>>(),
+            [envelope_b.id]
+        );
     }
 
     #[test]

@@ -80,7 +80,6 @@ def main() -> int:
         # Partition: B is physically absent. A queues a device-signed transaction.
         b.stop(cleanup=False)
         a.stop(cleanup=False)
-        a.env["MESHKEEPER_RELAY_PEERS"] = b.base
         a.restart()
         check("A перезапущена с недоступным relay и сохранила историю", a.wait_ready())
         transaction_id = str(uuid.uuid4())
@@ -97,10 +96,25 @@ def main() -> int:
         check("relay-конверт не раскрывает текст и GUID организаций",
               text not in raw and ws_a["guid"] not in raw and ws_b["guid"] not in raw)
 
-        # Connectivity returns. No journal capability is introduced: only opaque gossip.
-        b.env["MESHKEEPER_RELAY_PEERS"] = a.base
+        # Connectivity returns. No journal capability is introduced. The same
+        # bounded bundle used by Android BLE is carried explicitly here.
         b.restart()
         check("B вернулась после разделения", b.wait_ready())
+
+        def carry(source: Node, workspace_id: int, target: Node):
+            bundle = source.call(
+                "interorg.gossip", {"workspaceId": workspace_id}, mutation=False)
+            check("transport выдаёт bounded opaque interorg gossip",
+                  bundle.get("format") == "everyday-interorg-gossip"
+                  and bundle.get("version") == 1
+                  and 0 < len(bundle.get("envelopes", [])) <= 32)
+            return target.call("interorg.importGossip", {"bundle": bundle})
+
+        first_delivery = carry(a, ws_a["id"], b)
+        check("BLE-совместимый gossip атомарно проверен и доставлен",
+              first_delivery.get("stored", 0) >= 1
+              and first_delivery.get("delivered", 0) >= 1,
+              str(first_delivery))
 
         def inbox_b():
             value = b.call("interorg.inbox", {"workspaceId": ws_b["id"]}, mutation=False)
@@ -150,6 +164,9 @@ def main() -> int:
               len(accepted.get("ledgerHash", "")) == 64
               and accepted.get("receiptQueued") is True
               and duplicate.get("duplicate") is True)
+        receipt_delivery = carry(b, ws_b["id"], a)
+        check("обратная квитанция перенесена тем же transport bundle",
+              receipt_delivery.get("stored", 0) >= 1, str(receipt_delivery))
 
         def accepted_outbox_a():
             rows = a.call("interorg.outbox", {"workspaceId": ws_a["id"]}, mutation=False)
@@ -212,6 +229,7 @@ def main() -> int:
             "transactionId": transaction_id, "kind": "invoice.offer",
             "body": {"text": "подмена уже принятой транзакции", "amount": 999999},
         })
+        carry(a, ws_a["id"], b)
 
         def replay_quarantined():
             with sqlite3.connect(b.db) as database:
@@ -240,6 +258,9 @@ def main() -> int:
             "workspaceId": ws_a["id"], "contactGuid": contact_b["guid"],
             "transactionId": file_tx, "kind": "message.file", "body": file_body,
         })
+        file_delivery = carry(a, ws_a["id"], b)
+        check("файловый envelope принят через тот же BLE-совместимый gossip",
+              file_delivery.get("stored", 0) >= 1, str(file_delivery))
         with sqlite3.connect(a.db) as database:
             file_wire = database.execute(
                 "SELECT envelope_json FROM interorg_envelopes WHERE id=?",
@@ -277,7 +298,7 @@ def main() -> int:
             "transactionId": blocked_tx, "kind": "message.notice",
             "body": {"text": "сообщение после отзыва"},
         })
-        time.sleep(4)
+        carry(a, ws_a["id"], b)
         check("после signed revoke новый конверт не становится входящей транзакцией",
               len(revoked.get("ledgerHash", "")) == 64
               and all(row["transactionId"] != blocked_tx for row in inbox_b()))

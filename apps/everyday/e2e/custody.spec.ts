@@ -587,6 +587,7 @@ test('browser signs a real custody transaction and ledger retains its proof', as
   await page.goto('/admin');
   await page.getByRole('button', { name: 'Сеть организаций' }).first().click();
   await expect(page.getByTestId('interorg-network')).toBeVisible();
+  await expect(page.getByTestId('interorg-ble-send')).toBeVisible();
   await page.getByRole('button', { name: 'Создать адрес' }).click();
   await expect(page.getByTestId('organization-card')).toContainText(
     'everyday:org:',

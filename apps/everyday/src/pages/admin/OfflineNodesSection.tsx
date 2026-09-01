@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useState } from 'react'
 import { Database, GitBranch, Network, Radio, RefreshCw, ShieldAlert, ShieldCheck, Download, Upload, Trash2 } from 'lucide-react'
 import { trpc } from '@/providers/trpc'
 import { cn } from '@/lib/utils'
@@ -19,13 +19,6 @@ function fmtBytes(value: number): string {
   return `${(value / 1024 / 1024 / 1024).toFixed(1)} ГБ`
 }
 
-function acknowledgeNativeBundle(accepted: boolean) {
-  const bridge = (window as Window & {
-    MeshKeeperNative?: { acknowledgePendingSyncBundle?: (accepted: boolean) => void }
-  }).MeshKeeperNative
-  bridge?.acknowledgePendingSyncBundle?.(accepted)
-}
-
 export default function OfflineNodesSection() {
   const { workspace } = useStore()
   const toast = useToast()
@@ -42,7 +35,6 @@ export default function OfflineNodesSection() {
   )
   const [peerUrl, setPeerUrl] = useState('')
   const [password, setPassword] = useState('')
-  const nativeImportPending = useRef(false)
   const [bleStatus, setBleStatus] = useState<{ message: string; error: boolean } | null>(null)
   const nativeBle = typeof window !== 'undefined' && Boolean((window as Window & {
     MeshKeeperNative?: { enableBleTransport?: () => void; disableBleTransport?: () => void; sendSyncBundleOverBle?: (json: string) => void }
@@ -108,36 +100,6 @@ export default function OfflineNodesSection() {
     onError: (e) => toast(e.message, 'error'),
   })
 
-  useEffect(() => {
-    const consumeNativeBundle = () => {
-      if (nativeImportPending.current) return
-      const bridge = (window as Window & {
-        MeshKeeperNative?: { takePendingSyncBundle?: () => string }
-      }).MeshKeeperNative
-      const raw = bridge?.takePendingSyncBundle?.()
-      if (!raw) return
-      nativeImportPending.current = true
-      try {
-        importBundle.mutate({ bundle: JSON.parse(raw) }, {
-          onSuccess: () => {
-            nativeImportPending.current = false
-            acknowledgeNativeBundle(true)
-          },
-          onError: () => {
-            nativeImportPending.current = false
-            acknowledgeNativeBundle(false)
-          },
-        })
-      } catch {
-        nativeImportPending.current = false
-        acknowledgeNativeBundle(false)
-        toast('Android передал некорректный пакет Everyday', 'error')
-      }
-    }
-    consumeNativeBundle()
-    window.addEventListener('meshkeeper-native-bundle', consumeNativeBundle)
-    return () => window.removeEventListener('meshkeeper-native-bundle', consumeNativeBundle)
-  }, [importBundle, toast])
   useEffect(() => {
     const onBleStatus = (event: Event) => {
       const detail = (event as CustomEvent<{ message?: unknown; error?: unknown }>).detail

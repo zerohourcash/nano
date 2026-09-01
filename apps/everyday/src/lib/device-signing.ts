@@ -108,6 +108,7 @@ const CRITICAL = [
   'interorg.revokeContact',
   'interorg.send',
   'interorg.accept',
+  'interorg.importGossip',
   'sync.importBundle',
   'sync.approveNodeKey',
   'sync.revokeNodeKey',

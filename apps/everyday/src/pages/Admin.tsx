@@ -13,6 +13,7 @@ import OfflineNodesSection from './admin/OfflineNodesSection'
 import RequestsSection from './admin/RequestsSection'
 import OrganizationSection from './admin/OrganizationSection'
 import InterorgSection from './admin/InterorgSection'
+import NativeTransportInbox from './admin/NativeTransportInbox'
 
 type SectionId = 'users' | 'workspaces' | 'organization' | 'storages' | 'sites' | 'dictionaries' | 'requests' | 'offline' | 'network'
 
@@ -89,6 +90,7 @@ export default function Admin() {
 
   return (
     <ToastProvider>
+      <NativeTransportInbox />
       <div className="space-y-4 lg:space-y-6">
         <h1 className="text-2xl lg:text-[28px] leading-9 font-bold tracking-[-0.01em] text-ink-900">
           Панель управления

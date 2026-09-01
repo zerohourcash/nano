@@ -1,5 +1,5 @@
 import { useMemo, useState } from 'react'
-import { Ban, Check, Clipboard, Download, KeyRound, Paperclip, Plus, Send, ShieldCheck, X } from 'lucide-react'
+import { Ban, Check, Clipboard, Download, KeyRound, Paperclip, Plus, Radio, Send, ShieldCheck, X } from 'lucide-react'
 import { trpc } from '@/providers/trpc'
 import { useStore } from '@/lib/store'
 import InviteQrBlock from '@/components/InviteQrBlock'
@@ -58,6 +58,7 @@ export default function InterorgSection() {
     { workspaceId },
     { enabled: workspaceId > 0, refetchInterval: 5000 },
   )
+  const gossipQ = trpc.interorg.gossip.useQuery({ workspaceId }, { enabled: false })
   const [cardText, setCardText] = useState('')
   const [contactName, setContactName] = useState('')
   const [selected, setSelected] = useState('')
@@ -167,6 +168,32 @@ export default function InterorgSection() {
     }
   }
 
+  const sendGossipOverBle = async () => {
+    const native = (window as Window & {
+      MeshKeeperNative?: {
+        sendTransportOverBle?: (json: string) => void
+        sendSyncBundleOverBle?: (json: string) => void
+      }
+    }).MeshKeeperNative
+    if (!native?.sendTransportOverBle && !native?.sendSyncBundleOverBle) {
+      toast('BLE mesh доступен только в Android-приложении', 'error')
+      return
+    }
+    const result = await gossipQ.refetch()
+    if (!result.data) {
+      toast(result.error?.message ?? 'Не удалось собрать interorg gossip', 'error')
+      return
+    }
+    if (result.data.envelopes.length === 0) {
+      toast('В межорганизационной очереди пока нет конвертов')
+      return
+    }
+    const encoded = JSON.stringify(result.data)
+    if (native.sendTransportOverBle) native.sendTransportOverBle(encoded)
+    else native.sendSyncBundleOverBle?.(encoded)
+    toast(`BLE передаёт opaque-конверты: ${result.data.envelopes.length}`)
+  }
+
   if (!workspaceId) return <div className={cardCls + ' p-6 text-sm text-ink-500'}>Выберите организацию.</div>
 
   return (
@@ -203,7 +230,12 @@ export default function InterorgSection() {
       </section>
 
       <section className={`${cardCls} overflow-hidden`}>
-        <div className="border-b border-brand-100 px-5 py-4"><h3 className="font-semibold text-ink-900">Исходящие и квитанции</h3></div>
+        <div className="flex flex-wrap items-center justify-between gap-3 border-b border-brand-100 px-5 py-4">
+          <h3 className="font-semibold text-ink-900">Исходящие и квитанции</h3>
+          <button type="button" className={btnSecondaryCls} onClick={() => void sendGossipOverBle()} disabled={gossipQ.isFetching} data-testid="interorg-ble-send">
+            <Radio size={16} /> Передать очередь по BLE
+          </button>
+        </div>
         <div className="divide-y divide-brand-100">
           {(outboxQ.data ?? []).map((item) => (
             <article key={item.transactionId} className="flex flex-col gap-2 p-5 sm:flex-row sm:items-center sm:justify-between" data-testid="interorg-outbox-item">

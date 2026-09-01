@@ -318,6 +318,11 @@ public class MainActivity extends AppCompatActivity {
 
         @android.webkit.JavascriptInterface
         public void sendSyncBundleOverBle(String json) {
+            sendTransportOverBle(json);
+        }
+
+        @android.webkit.JavascriptInterface
+        public void sendTransportOverBle(String json) {
             if (json == null) return;
             byte[] bytes = json.getBytes(StandardCharsets.UTF_8);
             runOnUiThread(() -> enableBle(true, bytes));
@@ -327,13 +332,7 @@ public class MainActivity extends AppCompatActivity {
     private void enableBle(boolean send, byte[] bundle) {
         if (send) {
             try {
-                if (bundle == null || bundle.length > MAX_SYNC_BUNDLE_BYTES) {
-                    throw new IllegalArgumentException("Пакет превышает лимит 30 МБ");
-                }
-                org.json.JSONObject parsed = new org.json.JSONObject(new String(bundle, StandardCharsets.UTF_8));
-                if (!"everyday-sync-bundle".equals(parsed.optString("format"))) {
-                    throw new IllegalArgumentException("Это не пакет Everyday");
-                }
+                validateTransportPayload(bundle);
             } catch (Exception error) {
                 Toast.makeText(this, "BLE: " + error.getMessage(), Toast.LENGTH_LONG).show();
                 return;
@@ -421,10 +420,7 @@ public class MainActivity extends AppCompatActivity {
                     output.write(buffer, 0, read);
                 }
                 String json = output.toString(StandardCharsets.UTF_8.name());
-                org.json.JSONObject parsed = new org.json.JSONObject(json);
-                if (!"everyday-sync-bundle".equals(parsed.optString("format"))) {
-                    throw new IllegalArgumentException("Это не пакет Everyday");
-                }
+                validateTransportPayload(output.toByteArray());
                 pendingSyncBundle = json;
                 runOnUiThread(() -> {
                     Toast.makeText(this, "Пакет принят — откройте «Офлайн-узлы» для проверки", Toast.LENGTH_LONG).show();
@@ -435,6 +431,19 @@ public class MainActivity extends AppCompatActivity {
                         "Не удалось принять пакет: " + error.getMessage(), Toast.LENGTH_LONG).show());
             }
         }, "meshkeeper-shared-bundle").start();
+    }
+
+    private static void validateTransportPayload(byte[] payload) throws Exception {
+        if (payload == null || payload.length == 0 || payload.length > MAX_SYNC_BUNDLE_BYTES) {
+            throw new IllegalArgumentException("Пакет превышает лимит 30 МБ или пуст");
+        }
+        org.json.JSONObject parsed = new org.json.JSONObject(
+                new String(payload, StandardCharsets.UTF_8));
+        String format = parsed.optString("format");
+        if (!"everyday-sync-bundle".equals(format)
+                && !"everyday-interorg-gossip".equals(format)) {
+            throw new IllegalArgumentException("Это не transport-пакет Everyday");
+        }
     }
 
     private void showSetupHint() {

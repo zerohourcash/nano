@@ -160,6 +160,7 @@ pub fn requires_signature(procedure: &str) -> bool {
             | "interorg.revokeContact"
             | "interorg.send"
             | "interorg.accept"
+            | "interorg.importGossip"
             | "sync.importBundle"
             | "sync.approveNodeKey"
             | "sync.revokeNodeKey"

@@ -10,6 +10,7 @@ type OutboxEntry = {
   acceptanceProof: Record<string, unknown> | null; acceptanceProofVerified: boolean
   contact: { guid: string; name: string; remoteWorkspaceGuid: string }
 }
+type GossipBundle = { format: 'everyday-interorg-gossip'; version: 1; envelopes: unknown[] }
 
 export const interorgRouter = createRouter({
   identity: publicQuery.input(z.object({ workspaceId: z.number().int().positive() })).query(async () => null as Identity | null),
@@ -33,6 +34,12 @@ export const interorgRouter = createRouter({
     contact: { guid: string; name: string; remoteWorkspaceGuid: string }
   }>),
   outbox: publicQuery.input(z.object({ workspaceId: z.number().int().positive() })).query(async () => [] as OutboxEntry[]),
+  gossip: publicQuery.input(z.object({ workspaceId: z.number().int().positive() })).query(async () => ({ format: 'everyday-interorg-gossip', version: 1, envelopes: [] } as GossipBundle)),
+  importGossip: publicQuery.input(z.object({ bundle: z.object({
+    format: z.literal('everyday-interorg-gossip'),
+    version: z.literal(1),
+    envelopes: z.array(z.unknown()).max(32),
+  }) })).mutation(async () => ({ ok: true, stored: 0, duplicates: 0, delivered: 0 })),
   send: publicQuery.input(z.object({
     workspaceId: z.number().int().positive(),
     contactGuid: z.string().uuid(),

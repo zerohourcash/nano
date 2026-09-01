@@ -108,6 +108,9 @@ required = {
     "capabilities absent from Intent": "EXTRA_CAPABILITIES" not in service and "EXTRA_CAPABILITIES" not in activity,
     "system Share receive": "android.intent.action.SEND" in manifest and "takePendingSyncBundle" in activity,
     "incoming bundle bounded": "MAX_SYNC_BUNDLE_BYTES" in activity and "content\".equalsIgnoreCase" in activity,
+    "BLE interorg payload routing": "everyday-interorg-gossip" in activity
+        and "everyday-interorg-gossip" in (android / "src/main/java/ru/meshkeeper/app/BleMeshTransport.java").read_text()
+        and "return 3" in (android / "src/main/java/ru/meshkeeper/app/BleMeshTransport.java").read_text(),
 }
 missing = [name for name, present in required.items() if not present]
 if missing:

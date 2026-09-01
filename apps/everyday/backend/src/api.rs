@@ -110,6 +110,7 @@ pub fn is_mutation(procedure: &str) -> bool {
             | "interorg.contacts"
             | "interorg.inbox"
             | "interorg.outbox"
+            | "interorg.gossip"
             | "transfers.outgoing"
             | "transfers.incoming"
             | "transfers.byId"
@@ -1272,6 +1273,8 @@ fn dispatch_inner(
         "interorg.revokeContact" => interorg_revoke_contact(conn, input, user_id),
         "interorg.inbox" => interorg_inbox(conn, input),
         "interorg.outbox" => interorg_outbox(conn, input),
+        "interorg.gossip" => interorg_gossip(conn, input),
+        "interorg.importGossip" => interorg_import_gossip(conn, input),
         "interorg.send" => interorg_send(conn, input, user_id),
         "interorg.accept" => interorg_accept(conn, input, user_id),
         "sync.addPeer" => {
@@ -7741,6 +7744,60 @@ fn interorg_outbox(conn: &Connection, input: &Value) -> ApiResult {
     crate::interorg::outbox(conn, ws).map_err(|error| ApiError::internal(error.to_string()))
 }
 
+const MAX_INTERORG_GOSSIP_ENVELOPES: usize = 32;
+
+fn interorg_gossip(conn: &Connection, input: &Value) -> ApiResult {
+    let ws = i64v(input, "workspaceId").unwrap_or_else(|| ws_fallback(conn));
+    let envelopes = crate::interorg::gossip_batch_scoped(conn, ws, MAX_INTERORG_GOSSIP_ENVELOPES)
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    Ok(json!({
+        "format":"everyday-interorg-gossip",
+        "version":1,
+        "envelopes":envelopes
+    }))
+}
+
+fn interorg_import_gossip(conn: &mut Connection, input: &Value) -> ApiResult {
+    let bundle = input
+        .get("bundle")
+        .and_then(Value::as_object)
+        .ok_or_else(|| ApiError::bad("Нет interorg gossip bundle"))?;
+    if bundle.get("format").and_then(Value::as_str) != Some("everyday-interorg-gossip")
+        || bundle.get("version").and_then(Value::as_u64) != Some(1)
+    {
+        return Err(ApiError::bad("Неподдерживаемый interorg gossip bundle"));
+    }
+    let envelopes = bundle
+        .get("envelopes")
+        .and_then(Value::as_array)
+        .ok_or_else(|| ApiError::bad("В gossip bundle нет envelopes"))?;
+    if envelopes.len() > MAX_INTERORG_GOSSIP_ENVELOPES {
+        return Err(ApiError::bad("Слишком много interorg envelopes"));
+    }
+    atomic(conn, |tx| {
+        let mut stored = 0_usize;
+        let mut duplicates = 0_usize;
+        for raw in envelopes {
+            let envelope: crate::interorg::Envelope =
+                serde_json::from_value(raw.clone()).map_err(|error| {
+                    ApiError::bad(format!("Некорректный interorg envelope: {error}"))
+                })?;
+            match crate::interorg::relay_store(tx, &envelope, crate::interorg_work_bits()) {
+                Ok(true) => stored += 1,
+                Ok(false) => duplicates += 1,
+                Err(error) => {
+                    return Err(ApiError::bad(format!(
+                        "Interorg envelope отклонён: {error}"
+                    )))
+                }
+            }
+        }
+        let delivered = crate::interorg::receive_local(tx, crate::interorg_work_bits())
+            .map_err(|error| ApiError::bad(error.to_string()))?;
+        Ok(json!({"ok":true,"stored":stored,"duplicates":duplicates,"delivered":delivered}))
+    })
+}
+
 fn interorg_send(conn: &mut Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
     let uid = require_user(conn, user_id)?;
     let ws = i64v(input, "workspaceId").unwrap_or_else(|| ws_fallback(conn));
@@ -10983,6 +11040,69 @@ mod tests {
         assert!(sent["ledgerHash"]
             .as_str()
             .is_some_and(|hash| hash.len() == 64));
+        let gossip = dispatch(
+            &mut conn,
+            "interorg.gossip",
+            &json!({"workspaceId":ws}),
+            Some(users[0]),
+        )
+        .unwrap();
+        assert_eq!(gossip["format"], "everyday-interorg-gossip");
+        assert_eq!(gossip["version"], 1);
+        assert_eq!(gossip["envelopes"].as_array().unwrap().len(), 1);
+        let imported = dispatch(
+            &mut conn,
+            "interorg.importGossip",
+            &json!({"bundle":gossip}),
+            Some(users[0]),
+        )
+        .unwrap();
+        assert_eq!(imported["duplicates"], 1);
+        assert_eq!(imported["stored"], 0);
+        let local_encryption: [u8; 32] = STANDARD
+            .decode(identity["publicKey"].as_str().unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let workspace_guid: String = conn
+            .query_row("SELECT guid FROM workspaces WHERE id=?1", [ws], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let valid_incoming = crate::interorg::seal(
+            &crate::interorg::Payload {
+                sender_workspace: "org-b".into(),
+                recipient_workspace: workspace_guid,
+                kind: "message.notice".into(),
+                transaction_id: Uuid::new_v4().to_string(),
+                body: json!({"text":"atomic BLE gossip"}),
+            },
+            &local_encryption,
+            &remote_signer,
+            24,
+            crate::interorg_work_bits(),
+        )
+        .unwrap();
+        let mut forged = valid_incoming.clone();
+        forged.signature = STANDARD.encode([0_u8; 64]);
+        let rejected_gossip = dispatch(
+            &mut conn,
+            "interorg.importGossip",
+            &json!({"bundle":{"format":"everyday-interorg-gossip","version":1,"envelopes":[valid_incoming.clone(),forged]}}),
+            Some(users[0]),
+        )
+        .unwrap_err();
+        assert_eq!(rejected_gossip.http, 400);
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM interorg_envelopes WHERE id=?1",
+                [&valid_incoming.id],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            0,
+            "one forged envelope must roll back the whole BLE gossip batch"
+        );
         let incoming_id = Uuid::new_v4().to_string();
         conn.execute(
             "INSERT INTO interorg_inbox(envelope_id,workspace_id,contact_guid,transaction_id,kind,body_json,received_at) VALUES(?1,?2,?3,?4,'invoice.offer','{}',?5)",
@@ -11101,6 +11221,7 @@ mod tests {
             ]
         );
         assert!(crate::device::requires_signature("interorg.send"));
+        assert!(crate::device::requires_signature("interorg.importGossip"));
         cleanup(conn, path);
     }
 }

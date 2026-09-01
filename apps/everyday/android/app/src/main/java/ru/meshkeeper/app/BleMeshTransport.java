@@ -113,6 +113,7 @@ final class BleMeshTransport {
             throw new IllegalArgumentException("Некорректный размер BLE bundle");
         }
         outgoing = encryptedBundle.clone();
+        transportKind(encryptedBundle);
         delivered.clear();
         retryPlans.clear();
         enableReceiver();
@@ -293,7 +294,7 @@ final class BleMeshTransport {
                 synchronized (BleMeshTransport.this) {
                     frames = retryPlans.get(address);
                     if (frames == null) {
-                        frames = RustNode.fragmentTransport(payload, mtu - 3, 1);
+                        frames = RustNode.fragmentTransport(payload, mtu - 3, transportKind(payload));
                         retryPlans.put(address, frames);
                     } else if (frames.length > 0 && frames[0].length > mtu - 3) {
                         throw new IllegalStateException("BLE MTU уменьшился; удалённый partial transfer нужно сбросить");
@@ -343,6 +344,17 @@ final class BleMeshTransport {
             queued = gatt.writeCharacteristic(state.characteristic);
         }
         if (!queued) fail(gatt, "BLE write queue отклонила кадр");
+    }
+
+    static int transportKind(byte[] payload) {
+        try {
+            org.json.JSONObject object = new org.json.JSONObject(
+                    new String(payload, java.nio.charset.StandardCharsets.UTF_8));
+            String format = object.optString("format");
+            if ("everyday-sync-bundle".equals(format)) return 1;
+            if ("everyday-interorg-gossip".equals(format)) return 3;
+        } catch (Exception ignored) {}
+        throw new IllegalArgumentException("Неподдерживаемый BLE payload");
     }
 
     @SuppressLint("MissingPermission")
