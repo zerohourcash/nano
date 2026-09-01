@@ -354,7 +354,7 @@ fn require_member(conn: &Connection, uid: i64, workspace_id: i64) -> Result<(), 
 fn require_item_access(conn: &Connection, uid: i64, item_id: i64) -> Result<i64, ApiError> {
     let ws = conn
         .query_row(
-            "SELECT workspace_id FROM items WHERE id=?1",
+            "SELECT workspace_id FROM items WHERE id=?1 AND archived=0",
             params![item_id],
             |r| r.get(0),
         )
@@ -1637,7 +1637,7 @@ fn items_list(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiResu
     let limit = i64v(input, "limit").unwrap_or(20).clamp(1, 500);
     let search = s(input, "search").map(|q| q.to_lowercase());
     let only_mine = b(input, "onlyMine").unwrap_or(false);
-    let mut stmt = conn.prepare("SELECT id, title, internal_id, serial_number, responsible_user_id FROM items WHERE workspace_id=?1 ORDER BY created_at DESC, id DESC")?;
+    let mut stmt = conn.prepare("SELECT id, title, internal_id, serial_number, responsible_user_id FROM items WHERE workspace_id=?1 AND archived=0 ORDER BY created_at DESC, id DESC")?;
     let mut ids: Vec<i64> = Vec::new();
     let rows = stmt.query_map(params![ws], |r| {
         Ok((
@@ -1701,7 +1701,7 @@ fn items_by_code(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiR
          FROM items i
          JOIN user_workspaces m ON m.workspace_id=i.workspace_id
          JOIN users u ON u.id=m.user_id
-         WHERE m.user_id=?2 AND u.status='active'
+         WHERE m.user_id=?2 AND u.status='active' AND i.archived=0
            AND ((?3 IS NOT NULL AND i.guid=?3) OR (?3 IS NULL AND (i.qr_code=?1 OR i.internal_id=?1 OR UPPER(i.qr_code)=UPPER(?1) OR UPPER(i.internal_id)=UPPER(?1))))
          ORDER BY CASE WHEN ?3 IS NOT NULL THEN 0 WHEN i.qr_code=?1 THEN 1 WHEN i.internal_id=?1 THEN 2 ELSE 3 END, i.id
          LIMIT 1",
@@ -1952,15 +1952,63 @@ fn items_update_atomic(conn: &Connection, input: &Value, user_id: Option<i64>) -
     jsn::item_json(conn, id, true).ok_or_else(|| ApiError::not_found("нет"))
 }
 
-fn items_remove(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
+fn items_remove(conn: &mut Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
+    atomic(conn, |conn| items_remove_atomic(conn, input, user_id))
+}
+
+fn items_remove_atomic(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
     let uid = require_user(conn, user_id)?;
     require_can(conn, uid, "deleteItems")?;
-    let _ = uid;
     let id = i64v(input, "id").ok_or_else(|| ApiError::bad("id"))?;
-    require_item_access(conn, uid, id)?;
-    conn.execute("DELETE FROM item_photos WHERE item_id=?1", params![id])?;
-    conn.execute("DELETE FROM items WHERE id=?1", params![id])?;
-    Ok(json!({"ok": true}))
+    let ws: i64 = conn
+        .query_row("SELECT workspace_id FROM items WHERE id=?1", [id], |row| {
+            row.get(0)
+        })
+        .optional()?
+        .ok_or_else(|| ApiError::not_found("Инструмент не найден"))?;
+    require_member(conn, uid, ws)?;
+    let guid =
+        ledger::guid(conn, "items", id).map_err(|error| ApiError::internal(error.to_string()))?;
+    let (title, responsible, archived): (String, Option<i64>, bool) = conn
+        .query_row(
+            "SELECT title,responsible_user_id,archived!=0 FROM items WHERE id=?1",
+            [id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .map_err(|_| ApiError::not_found("Инструмент не найден"))?;
+    if archived {
+        return Ok(json!({"ok":true,"archived":true,"id":id,"guid":guid,"duplicate":true}));
+    }
+    let active_holding: i64 = conn.query_row(
+        "SELECT count(*) FROM item_holdings WHERE item_id=?1 AND returned_at IS NULL",
+        [id],
+        |row| row.get(0),
+    )?;
+    let pending_transfer: i64 = conn.query_row(
+        "SELECT count(*) FROM transfers WHERE item_id=?1 AND status IN ('draft','pending')",
+        [id],
+        |row| row.get(0),
+    )?;
+    if responsible.is_some() || active_holding > 0 || pending_transfer > 0 {
+        return Err(ApiError::conflict(
+            "Нельзя архивировать выданный или передаваемый инструмент; сначала верните его",
+        ));
+    }
+    let event = ledger::append(
+        conn,
+        ws,
+        uid,
+        Some(id),
+        "item_archive",
+        Some(&guid),
+        None,
+        None,
+        Some(&format!("Карточка ТМЦ архивирована: {title}")),
+    )
+    .map_err(|error| ApiError::internal(format!("Ошибка журнала: {error}")))?;
+    let tombstone = crate::sync::record_item_tombstone(conn, ws, id, uid, &event)
+        .map_err(|error| ApiError::internal(format!("Ошибка tombstone: {error}")))?;
+    Ok(json!({"ok":true,"archived":true,"id":id,"guid":guid,"tombstone":tombstone}))
 }
 
 /// Контрольная сумма вложения (ТЗ §5): по ней видно подмену снимка.
@@ -3227,8 +3275,9 @@ fn inv_create(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiResu
     let number = format!("ИНВ-{:03}", n + 1);
     conn.execute("INSERT INTO inventory_sessions (number, workspace_id, started_by, created_at) VALUES (?1,?2,?3,?4)", params![number, ws, uid, now()])?;
     let sid = conn.last_insert_rowid();
-    let mut sql =
-        String::from("SELECT id, quantity, quantitative FROM items WHERE workspace_id=?1");
+    let mut sql = String::from(
+        "SELECT id, quantity, quantitative FROM items WHERE workspace_id=?1 AND archived=0",
+    );
     if let Some(st) = i64v(input, "storageId") {
         sql.push_str(&format!(" AND storage_id={st}"));
     }
@@ -3379,7 +3428,7 @@ fn inv_complete_atomic(conn: &Connection, input: &Value, user_id: Option<i64>) -
 
 fn emit_overdue_and_stock(conn: &Connection) {
     let nows = now();
-    if let Ok(mut stmt) = conn.prepare("SELECT id, workspace_id, title, responsible_user_id, due_at FROM items WHERE due_at IS NOT NULL AND responsible_user_id IS NOT NULL") {
+    if let Ok(mut stmt) = conn.prepare("SELECT id, workspace_id, title, responsible_user_id, due_at FROM items WHERE archived=0 AND due_at IS NOT NULL AND responsible_user_id IS NOT NULL") {
         let rows: Vec<(i64, i64, String, i64, String)> = stmt.query_map([], |r| {
             Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
         }).ok().map(|x| x.filter_map(|y| y.ok()).collect()).unwrap_or_default();
@@ -3400,7 +3449,7 @@ fn emit_overdue_and_stock(conn: &Connection) {
             }
         }
     }
-    if let Ok(mut stmt) = conn.prepare("SELECT id, workspace_id, title, quantity, min_quantity FROM items WHERE quantitative=1 AND min_quantity IS NOT NULL AND quantity IS NOT NULL AND quantity < min_quantity") {
+    if let Ok(mut stmt) = conn.prepare("SELECT id, workspace_id, title, quantity, min_quantity FROM items WHERE archived=0 AND quantitative=1 AND min_quantity IS NOT NULL AND quantity IS NOT NULL AND quantity < min_quantity") {
         let rows: Vec<(i64, i64, String, f64, f64)> = stmt.query_map([], |r| {
             Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
         }).ok().map(|x| x.filter_map(|y| y.ok()).collect()).unwrap_or_default();
@@ -3414,7 +3463,7 @@ fn emit_overdue_and_stock(conn: &Connection) {
             }
         }
     }
-    if let Ok(mut stmt) = conn.prepare("SELECT id, workspace_id, title, calibrated_until FROM items WHERE calibrated_until IS NOT NULL") {
+    if let Ok(mut stmt) = conn.prepare("SELECT id, workspace_id, title, calibrated_until FROM items WHERE archived=0 AND calibrated_until IS NOT NULL") {
         let rows: Vec<(i64, i64, String, String)> = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
             .ok().map(|x| x.filter_map(|y| y.ok()).collect()).unwrap_or_default();
         for (id, ws, title, until) in rows {
@@ -3479,15 +3528,16 @@ fn notif_mark(conn: &Connection, input: &Value, all: bool, user_id: Option<i64>)
 
 fn reports_by_users(conn: &Connection, input: &Value) -> ApiResult {
     let ws = i64v(input, "workspaceId").unwrap_or_else(|| ws_fallback(conn));
-    let mut stmt =
-        conn.prepare("SELECT DISTINCT responsible_user_id FROM items WHERE workspace_id=?1")?;
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT responsible_user_id FROM items WHERE workspace_id=?1 AND archived=0",
+    )?;
     let uids: Vec<Option<i64>> = stmt
         .query_map(params![ws], |r| r.get(0))?
         .filter_map(|x| x.ok())
         .collect();
     let mut out = Vec::new();
     for uid in uids {
-        let mut st = conn.prepare("SELECT id FROM items WHERE workspace_id=?1 AND ((?2 IS NULL AND responsible_user_id IS NULL) OR responsible_user_id=?2)")?;
+        let mut st = conn.prepare("SELECT id FROM items WHERE workspace_id=?1 AND archived=0 AND ((?2 IS NULL AND responsible_user_id IS NULL) OR responsible_user_id=?2)")?;
         let ids: Vec<i64> = st
             .query_map(params![ws, uid], |r| r.get(0))?
             .filter_map(|x| x.ok())
@@ -3512,8 +3562,9 @@ fn reports_by_users(conn: &Connection, input: &Value) -> ApiResult {
 }
 fn reports_all(conn: &Connection, input: &Value) -> ApiResult {
     let ws = i64v(input, "workspaceId").unwrap_or_else(|| ws_fallback(conn));
-    let mut stmt =
-        conn.prepare("SELECT id FROM items WHERE workspace_id=?1 ORDER BY created_at DESC")?;
+    let mut stmt = conn.prepare(
+        "SELECT id FROM items WHERE workspace_id=?1 AND archived=0 ORDER BY created_at DESC",
+    )?;
     let ids: Vec<i64> = stmt
         .query_map(params![ws], |r| r.get(0))?
         .filter_map(|x| x.ok())

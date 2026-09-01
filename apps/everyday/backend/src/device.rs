@@ -25,6 +25,7 @@ pub fn requires_signature(procedure: &str) -> bool {
         procedure,
         "items.create"
             | "items.update"
+            | "items.remove"
             | "transfers.take"
             | "transfers.takeMany"
             | "transfers.returnItem"
@@ -316,7 +317,12 @@ mod tests {
 
     #[test]
     fn inventory_master_data_changes_require_device_signature() {
-        for procedure in ["items.create", "items.update", "items.addDocument"] {
+        for procedure in [
+            "items.create",
+            "items.update",
+            "items.remove",
+            "items.addDocument",
+        ] {
             assert!(requires_signature(procedure), "unsigned {procedure}");
         }
         assert!(!requires_signature("items.list"));

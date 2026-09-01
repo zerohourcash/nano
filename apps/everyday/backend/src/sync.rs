@@ -173,6 +173,66 @@ pub fn record_custody_entry(
     }))
 }
 
+fn item_tombstone_hash(
+    workspace_guid: &str,
+    item_guid: &str,
+    actor_guid: &str,
+    ledger_hash: &str,
+    deleted_at: &str,
+) -> String {
+    let canonical = json!([
+        "everyday/item-tombstone/v1",
+        workspace_guid,
+        item_guid,
+        actor_guid,
+        ledger_hash,
+        deleted_at
+    ]);
+    hex::encode(Sha256::digest(
+        serde_json::to_vec(&canonical).unwrap_or_default(),
+    ))
+}
+
+pub fn record_item_tombstone(
+    conn: &Connection,
+    workspace_id: i64,
+    item_id: i64,
+    actor_id: i64,
+    ledger_event: &Value,
+) -> anyhow::Result<Value> {
+    let workspace_guid = ledger::guid(conn, "workspaces", workspace_id)?;
+    let item_guid = ledger::guid(conn, "items", item_id)?;
+    let actor_guid = ledger::guid(conn, "users", actor_id)?;
+    let ledger_hash = ledger_event
+        .get("opId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("item tombstone has no ledger hash"))?;
+    let deleted_at = ledger_event
+        .get("createdAt")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("item tombstone has no timestamp"))?;
+    let tombstone_hash = item_tombstone_hash(
+        &workspace_guid,
+        &item_guid,
+        &actor_guid,
+        ledger_hash,
+        deleted_at,
+    );
+    conn.execute(
+        "INSERT INTO item_tombstones(item_guid,workspace_guid,actor_guid,ledger_hash,deleted_at,tombstone_hash)
+         VALUES(?1,?2,?3,?4,?5,?6)",
+        params![item_guid,workspace_guid,actor_guid,ledger_hash,deleted_at,tombstone_hash],
+    )?;
+    conn.execute(
+        "UPDATE items SET archived=1,archived_at=?1 WHERE id=?2",
+        params![deleted_at, item_id],
+    )?;
+    Ok(json!({
+        "itemGuid":item_guid,"workspaceGuid":workspace_guid,"actorGuid":actor_guid,
+        "ledgerHash":ledger_hash,"deletedAt":deleted_at,"tombstoneHash":tombstone_hash
+    }))
+}
+
 struct StoredMembershipVersion {
     revision: i64,
     version_hash: String,
@@ -475,7 +535,7 @@ pub fn export_journal_since(conn: &Connection, recipient_frontier: Option<&Value
     }
     let mut items = Vec::new();
     if let Ok(mut stmt) = conn.prepare(
-        "SELECT id, internal_id, title, category_id, status_id, responsible_user_id, workspace_id, serial_number, qr_code, due_at, guid, calibrated_until, min_quantity, quantitative, quantity, unit, cost, comment, source_system, external_id, metadata_json, organization_node_id FROM items",
+        "SELECT id, internal_id, title, category_id, status_id, responsible_user_id, workspace_id, serial_number, qr_code, due_at, guid, calibrated_until, min_quantity, quantitative, quantity, unit, cost, comment, source_system, external_id, metadata_json, organization_node_id,archived,archived_at FROM items",
     ) {
         for row in stmt.query_map([], |r| {
             let id: i64 = r.get(0)?;
@@ -508,6 +568,8 @@ pub fn export_journal_since(conn: &Connection, recipient_frontier: Option<&Value
                     .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
                     .unwrap_or_else(|| json!({})),
                 "statusSlug": slug,
+                "archived": r.get::<_,i64>(22)? != 0,
+                "archivedAt": r.get::<_,Option<String>>(23)?,
                 "localId": id,
             }))
         }).into_iter().flatten().flatten() {
@@ -678,6 +740,21 @@ pub fn export_journal_since(conn: &Connection, recipient_frontier: Option<&Value
             custody.extend(rows.flatten());
         }
     }
+    let mut item_tombstones = Vec::new();
+    if let Ok(mut statement) = conn.prepare(
+        "SELECT item_guid,workspace_guid,actor_guid,ledger_hash,deleted_at,tombstone_hash
+         FROM item_tombstones ORDER BY deleted_at,item_guid",
+    ) {
+        if let Ok(rows) = statement.query_map([], |row| {
+            Ok(json!({
+                "itemGuid":row.get::<_,String>(0)?,"workspaceGuid":row.get::<_,String>(1)?,
+                "actorGuid":row.get::<_,String>(2)?,"ledgerHash":row.get::<_,String>(3)?,
+                "deletedAt":row.get::<_,String>(4)?,"tombstoneHash":row.get::<_,String>(5)?,
+            }))
+        }) {
+            item_tombstones.extend(rows.flatten());
+        }
+    }
     let mut messages = Vec::new();
     if let Ok(mut stmt) = conn.prepare(
         "SELECT guid,workspace_id,user_id,text,ledger_hash,created_at
@@ -754,6 +831,7 @@ pub fn export_journal_since(conn: &Connection, recipient_frontier: Option<&Value
         "journalScope": "*",
         "membershipMode": "versioned-tombstones/v1",
         "custodyMode": "ledger-delta/v1",
+        "itemTombstoneMode": "monotonic/v1",
         "historyMode": if recipient_frontier.is_some() { "delta" } else { "full" },
         "frontier": frontier(conn),
         "workspaces": workspaces,
@@ -765,6 +843,7 @@ pub fn export_journal_since(conn: &Connection, recipient_frontier: Option<&Value
         "invites": invites,
         "memberships": memberships,
         "custody": custody,
+        "itemTombstones": item_tombstones,
         "messages": messages,
         "photos": photos,
         "documents": documents,
@@ -829,6 +908,7 @@ fn filter_journal_scope(journal: &mut Value, allowed: &HashSet<String>) {
         "invites",
         "memberships",
         "custody",
+        "itemTombstones",
         "messages",
         "frontier",
     ] {
@@ -1701,6 +1781,53 @@ pub fn import_journal(conn: &Connection, journal: &Value) -> Value {
             items_n += 1;
         }
     }
+    if let Some(records) = journal.get("itemTombstones").and_then(Value::as_array) {
+        for record in records {
+            let Some(item_guid) = record.get("itemGuid").and_then(Value::as_str) else {
+                skipped += 1;
+                continue;
+            };
+            let Some(workspace_guid) = record.get("workspaceGuid").and_then(Value::as_str) else {
+                skipped += 1;
+                continue;
+            };
+            let Some(actor_guid) = record.get("actorGuid").and_then(Value::as_str) else {
+                skipped += 1;
+                continue;
+            };
+            let Some(ledger_hash) = record.get("ledgerHash").and_then(Value::as_str) else {
+                skipped += 1;
+                continue;
+            };
+            let Some(deleted_at) = record.get("deletedAt").and_then(Value::as_str) else {
+                skipped += 1;
+                continue;
+            };
+            let expected = item_tombstone_hash(
+                workspace_guid,
+                item_guid,
+                actor_guid,
+                ledger_hash,
+                deleted_at,
+            );
+            if record.get("tombstoneHash").and_then(Value::as_str) != Some(expected.as_str()) {
+                skipped += 1;
+                continue;
+            }
+            let inserted = conn.execute(
+                "INSERT OR IGNORE INTO item_tombstones(item_guid,workspace_guid,actor_guid,ledger_hash,deleted_at,tombstone_hash)
+                 VALUES(?1,?2,?3,?4,?5,?6)",
+                params![item_guid,workspace_guid,actor_guid,ledger_hash,deleted_at,expected],
+            ).unwrap_or(0);
+            let _ = conn.execute(
+                "UPDATE items SET archived=1,archived_at=COALESCE(archived_at,?1) WHERE guid=?2",
+                params![deleted_at, item_guid],
+            );
+            if inserted == 0 {
+                skipped += 1;
+            }
+        }
+    }
     if let Some(arr) = journal.get("photos").and_then(Value::as_array) {
         for photo in arr {
             let guid = photo.get("guid").and_then(Value::as_str).unwrap_or("");
@@ -2289,6 +2416,9 @@ pub fn apply_remote_journal(conn: &Connection, journal: &Value, peer_url: &str) 
     if let Err(error) = verify_membership_records(conn, journal) {
         return json!({"ok":false,"error":format!("Проверка членства: {error}")});
     }
+    if let Err(error) = verify_item_tombstones(conn, journal) {
+        return json!({"ok":false,"error":format!("Проверка tombstone ТМЦ: {error}")});
+    }
     if let Err(error) = crate::accounting::verify_journal_links(conn, journal) {
         return json!({"ok":false,"error":format!("Проверка Bit-летописи: {error}")});
     }
@@ -2339,6 +2469,10 @@ pub fn apply_remote_journal(conn: &Connection, journal: &Value, peer_url: &str) 
     if let Err(error) = verify_stored_custody(conn) {
         let _ = conn.execute_batch("ROLLBACK TO verified_sync; RELEASE verified_sync");
         return json!({"ok":false,"error":format!("Проверка сохранённой custody-летописи: {error}")});
+    }
+    if let Err(error) = verify_stored_item_tombstones(conn) {
+        let _ = conn.execute_batch("ROLLBACK TO verified_sync; RELEASE verified_sync");
+        return json!({"ok":false,"error":format!("Проверка сохранённых tombstone ТМЦ: {error}")});
     }
     if let Err(error) = ledger::verify_chat_links(conn) {
         let _ = conn.execute_batch("ROLLBACK TO verified_sync; RELEASE verified_sync");
@@ -3022,6 +3156,157 @@ fn verify_membership_records(conn: &Connection, journal: &Value) -> anyhow::Resu
     Ok(())
 }
 
+fn verify_item_tombstones(conn: &Connection, journal: &Value) -> anyhow::Result<()> {
+    if journal.get("itemTombstoneMode").and_then(Value::as_str) != Some("monotonic/v1") {
+        anyhow::bail!("journal does not provide item tombstones");
+    }
+    let incoming_history: HashMap<&str, &Value> = journal
+        .get("history")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|event| {
+            event
+                .get("opId")
+                .and_then(Value::as_str)
+                .map(|hash| (hash, event))
+        })
+        .collect();
+    let archived_items: HashSet<&str> = journal
+        .get("items")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|item| item.get("archived").and_then(Value::as_bool) == Some(true))
+        .filter_map(|item| item.get("guid").and_then(Value::as_str))
+        .collect();
+    let mut seen = HashSet::new();
+    for record in journal
+        .get("itemTombstones")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("journal has no item tombstone array"))?
+    {
+        let field = |name: &str| {
+            record
+                .get(name)
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| anyhow::anyhow!("item tombstone has no {name}"))
+        };
+        let item = field("itemGuid")?;
+        let workspace = field("workspaceGuid")?;
+        let actor = field("actorGuid")?;
+        let ledger_hash = field("ledgerHash")?;
+        let deleted_at = field("deletedAt")?;
+        let tombstone_hash = field("tombstoneHash")?;
+        if !seen.insert(item) {
+            anyhow::bail!("duplicate item tombstone");
+        }
+        if !archived_items.contains(item) {
+            anyhow::bail!("item tombstone is not reflected in archived state");
+        }
+        let expected = item_tombstone_hash(workspace, item, actor, ledger_hash, deleted_at);
+        if expected != tombstone_hash {
+            anyhow::bail!("item tombstone hash mismatch");
+        }
+        if let Some(event) = incoming_history.get(ledger_hash) {
+            let proof_fields = [
+                "requestDeviceId",
+                "requestPublicKey",
+                "requestNonce",
+                "requestSignature",
+                "requestHash",
+                "requestTimestamp",
+                "requestPath",
+            ];
+            let valid = event.get("type").and_then(Value::as_str) == Some("item_archive")
+                && event.get("workspaceGuid").and_then(Value::as_str) == Some(workspace)
+                && event.get("itemGuid").and_then(Value::as_str) == Some(item)
+                && event.get("actorGuid").and_then(Value::as_str) == Some(actor)
+                && event.get("fromLabel").and_then(Value::as_str) == Some(item)
+                && event.get("toLabel").is_none_or(Value::is_null)
+                && event.get("createdAt").and_then(Value::as_str) == Some(deleted_at)
+                && proof_fields.iter().all(|name| {
+                    event
+                        .get(*name)
+                        .and_then(Value::as_str)
+                        .is_some_and(|value| !value.is_empty())
+                });
+            if !valid {
+                anyhow::bail!("item tombstone ledger evidence mismatch");
+            }
+        } else {
+            let exists: i64 = conn.query_row(
+                "SELECT count(*) FROM history_entries h JOIN workspaces w ON w.id=h.workspace_id JOIN users u ON u.id=h.actor_user_id JOIN items i ON i.id=h.item_id
+                 WHERE h.hash=?1 AND h.type='item_archive' AND w.guid=?2 AND i.guid=?3 AND u.guid=?4
+                   AND h.from_label=?3 AND h.to_label IS NULL AND h.created_at=?5
+                   AND h.request_device_id IS NOT NULL AND h.request_signature IS NOT NULL",
+                params![ledger_hash,workspace,item,actor,deleted_at],
+                |row| row.get(0),
+            )?;
+            if exists == 0 {
+                anyhow::bail!("item tombstone ledger event is unavailable");
+            }
+        }
+    }
+    if archived_items.len() != seen.len() {
+        anyhow::bail!("archived item has no monotonic tombstone");
+    }
+    Ok(())
+}
+
+fn verify_stored_item_tombstones(conn: &Connection) -> anyhow::Result<usize> {
+    let mut statement = conn.prepare(
+        "SELECT t.item_guid,t.workspace_guid,t.actor_guid,t.ledger_hash,t.deleted_at,t.tombstone_hash,
+                i.archived,w.guid,u.guid,h.type,h.from_label,h.to_label,h.created_at,
+                h.request_device_id,h.request_public_key,h.request_nonce,h.request_signature,
+                h.request_hash,h.request_timestamp,h.request_path
+         FROM item_tombstones t
+         LEFT JOIN items i ON i.guid=t.item_guid
+         LEFT JOIN workspaces w ON w.id=i.workspace_id
+         LEFT JOIN history_entries h ON h.hash=t.ledger_hash AND h.item_id=i.id
+         LEFT JOIN users u ON u.id=h.actor_user_id",
+    )?;
+    let mut rows = statement.query([])?;
+    let mut verified = 0usize;
+    while let Some(row) = rows.next()? {
+        let item: String = row.get(0)?;
+        let workspace: String = row.get(1)?;
+        let actor: String = row.get(2)?;
+        let ledger_hash: String = row.get(3)?;
+        let deleted_at: String = row.get(4)?;
+        let stored_hash: String = row.get(5)?;
+        let proof_complete = (13..20).all(|index| {
+            row.get::<_, Option<String>>(index)
+                .ok()
+                .flatten()
+                .is_some_and(|value| !value.is_empty())
+        });
+        let valid = stored_hash
+            == item_tombstone_hash(&workspace, &item, &actor, &ledger_hash, &deleted_at)
+            && row.get::<_, Option<i64>>(6)? == Some(1)
+            && row.get::<_, Option<String>>(7)?.as_deref() == Some(workspace.as_str())
+            && row.get::<_, Option<String>>(8)?.as_deref() == Some(actor.as_str())
+            && row.get::<_, Option<String>>(9)?.as_deref() == Some("item_archive")
+            && row.get::<_, Option<String>>(10)?.as_deref() == Some(item.as_str())
+            && row.get::<_, Option<String>>(11)?.is_none()
+            && row.get::<_, Option<String>>(12)?.as_deref() == Some(deleted_at.as_str())
+            && proof_complete;
+        if !valid {
+            anyhow::bail!("stored item tombstone is not bound to its ledger event");
+        }
+        verified += 1;
+    }
+    let archived: i64 =
+        conn.query_row("SELECT count(*) FROM items WHERE archived=1", [], |row| {
+            row.get(0)
+        })?;
+    if archived != verified as i64 {
+        anyhow::bail!("archived item has no stored tombstone");
+    }
+    Ok(verified)
+}
+
 struct JournalReceipt {
     public_key: String,
     scope: String,
@@ -3331,6 +3616,7 @@ pub fn integrity_audit(conn: &Connection) -> Value {
     let snapshot_result = ledger::verify_journal(&snapshot);
     let device_result = verify_stored_device_bindings(conn);
     let custody_result = verify_stored_custody(conn);
+    let item_tombstone_result = verify_stored_item_tombstones(conn);
     let membership_result = verify_membership_records(conn, &snapshot);
 
     let count = |table: &str| -> i64 {
@@ -3406,6 +3692,10 @@ pub fn integrity_audit(conn: &Connection) -> Value {
     let snapshot_error = snapshot_result.as_ref().err().map(ToString::to_string);
     let device_error = device_result.as_ref().err().map(ToString::to_string);
     let custody_error = custody_result.as_ref().err().map(ToString::to_string);
+    let item_tombstone_error = item_tombstone_result
+        .as_ref()
+        .err()
+        .map(ToString::to_string);
     let membership_error = membership_result.as_ref().err().map(ToString::to_string);
     let healthy = database_check == "ok"
         && ledger_result.is_ok()
@@ -3415,6 +3705,7 @@ pub fn integrity_audit(conn: &Connection) -> Value {
         && snapshot_result.is_ok()
         && device_result.is_ok()
         && custody_result.is_ok()
+        && item_tombstone_result.is_ok()
         && membership_result.is_ok()
         && orphan_history == 0
         && missing_guids == 0
@@ -3429,6 +3720,7 @@ pub fn integrity_audit(conn: &Connection) -> Value {
         "accountingLines": count("accounting_lines"), "knowledgePages": count("knowledge_pages"),
         "knowledgeRevisions": count("knowledge_revisions"),
         "membershipVersions": count("membership_versions"),
+        "itemTombstones": count("item_tombstones"),
     });
     json!({
         "healthy": healthy,
@@ -3449,6 +3741,8 @@ pub fn integrity_audit(conn: &Connection) -> Value {
         "custodyError": custody_error,
         "custodyVerified": custody_result.as_ref().is_ok(),
         "custodyEntriesVerified": custody_result.unwrap_or(0),
+        "itemTombstoneError": item_tombstone_error,
+        "itemTombstonesVerified": item_tombstone_result.unwrap_or(0),
         "membershipError": membership_error,
         "membershipVerified": membership_result.is_ok(),
         "snapshotHash": snapshot.get("journalHash"),
@@ -3641,6 +3935,106 @@ mod tests {
                 .unwrap()
                 .is_some(),
             "old offline snapshot must not resurrect a revoked device"
+        );
+
+        drop((source, target, rejected));
+        for path in [source_path, target_path, rejected_path] {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    #[test]
+    fn item_tombstone_is_monotonic_and_rejects_node_signed_falsification() {
+        let source_path =
+            std::env::temp_dir().join(format!("item-tombstone-source-{}.db", uuid::Uuid::new_v4()));
+        let target_path =
+            std::env::temp_dir().join(format!("item-tombstone-target-{}.db", uuid::Uuid::new_v4()));
+        let rejected_path = std::env::temp_dir().join(format!(
+            "item-tombstone-rejected-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let source = crate::db::open(&source_path).unwrap();
+        let target = crate::db::open(&target_path).unwrap();
+        let rejected = crate::db::open(&rejected_path).unwrap();
+        let created = chrono::Utc::now().to_rfc3339();
+        source.execute("INSERT INTO workspaces(name,internal_id_prefix,created_at,guid) VALUES('Org','O-',?1,'tombstone-workspace')",[&created]).unwrap();
+        let workspace = source.last_insert_rowid();
+        source.execute("INSERT INTO users(full_name,phone,status,role_rights,created_at,guid) VALUES('Owner','+70000000991','active',?1,?2,'tombstone-owner')",params![crate::db::owner_rights().to_string(),created]).unwrap();
+        let owner = source.last_insert_rowid();
+        source
+            .execute(
+                "INSERT INTO user_workspaces(user_id,workspace_id,rights_json) VALUES(?1,?2,?3)",
+                params![owner, workspace, crate::db::owner_rights().to_string()],
+            )
+            .unwrap();
+        record_membership_version(&source, workspace, owner, true, None, true).unwrap();
+        source.execute("INSERT INTO items(internal_id,title,workspace_id,created_at,guid) VALUES('O-1','Archive me',?1,?2,'tombstone-item')",params![workspace,created]).unwrap();
+        let item = source.last_insert_rowid();
+
+        let key = SigningKey::generate(&mut OsRng);
+        let device = "tombstone-device-0001";
+        crate::device::register(
+            &source,
+            owner,
+            &json!({
+                "deviceId":device,"name":"Owner phone",
+                "publicKey":URL_SAFE_NO_PAD.encode(key.verifying_key().to_bytes())
+            }),
+        )
+        .unwrap();
+        let proof = signed_device_proof(&key, device, "/api/trpc/items.remove");
+        crate::device::set_pending(&source, owner, &proof).unwrap();
+        let event = ledger::append(
+            &source,
+            workspace,
+            owner,
+            Some(item),
+            "item_archive",
+            Some("tombstone-item"),
+            None,
+            None,
+            Some("archive"),
+        )
+        .unwrap();
+        record_item_tombstone(&source, workspace, item, owner, &event).unwrap();
+        let valid = export_journal(&source);
+        assert_eq!(apply_remote_journal(&target, &valid, "")["ok"], true);
+        assert_eq!(
+            target
+                .query_row(
+                    "SELECT archived FROM items WHERE guid='tombstone-item'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1
+        );
+        verify_stored_item_tombstones(&target).unwrap();
+
+        // Даже нода, владеющая своим snapshot-ключом, не может переписать
+        // время/смысл удаления без несовпадения с device-signed Ledger event.
+        let mut forged = valid;
+        forged["itemTombstones"][0]["deletedAt"] = json!("2099-01-01T00:00:00Z");
+        let hash = item_tombstone_hash(
+            "tombstone-workspace",
+            "tombstone-item",
+            "tombstone-owner",
+            forged["itemTombstones"][0]["ledgerHash"].as_str().unwrap(),
+            "2099-01-01T00:00:00Z",
+        );
+        forged["itemTombstones"][0]["tombstoneHash"] = json!(hash);
+        ledger::sign_journal(&source, &mut forged).unwrap();
+        let result = apply_remote_journal(&rejected, &forged, "");
+        assert_eq!(result["ok"], false);
+        assert!(result["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("tombstone"));
+        assert_eq!(
+            rejected
+                .query_row("SELECT count(*) FROM items", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            0
         );
 
         drop((source, target, rejected));

@@ -74,6 +74,7 @@ async function registerDevice(current: DeviceIdentity): Promise<void> {
 const CRITICAL = [
   'items.create',
   'items.update',
+  'items.remove',
   'transfers.take',
   'transfers.takeMany',
   'transfers.returnItem',

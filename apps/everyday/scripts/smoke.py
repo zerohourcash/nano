@@ -324,8 +324,57 @@ else:
     check("in-repair status present", False, "no in-repair status")
 
 print("\n== 14. Отчёты ==")
+held_candidate = owner.call(
+    "items.create",
+    {"workspaceId": ws_id, "title": "Выданная карточка не удаляется", "storageId": st_id},
+)
+owner.call("transfers.take", {"itemId": held_candidate.get("id")})
+held_archive = owner.call("items.remove", {"id": held_candidate.get("id")})
+check(
+    "issued item cannot be archived",
+    held_archive.get("__code") == "CONFLICT",
+    str(held_archive),
+)
+owner.call("transfers.returnItem", {"itemId": held_candidate.get("id")})
+archive_candidate = owner.call(
+    "items.create",
+    {"workspaceId": ws_id, "title": "Карточка для архива", "storageId": st_id},
+)
+archive_id = archive_candidate.get("id") if isinstance(archive_candidate, dict) else None
+unsigned_archive = owner.call("items.remove", {"id": archive_id}, signed=False)
+check(
+    "unsigned item archive rejected",
+    unsigned_archive.get("__http") == 403
+    and "DEVICE_SIGNATURE_REQUIRED" in unsigned_archive.get("__body", ""),
+    str(unsigned_archive)[:160],
+)
+archived = owner.call("items.remove", {"id": archive_id})
+check(
+    "item archive creates monotonic tombstone",
+    archived.get("archived") is True
+    and archived.get("tombstone", {}).get("tombstoneHash"),
+    str(archived)[:220],
+)
+archived_lookup = owner.call("items.byId", {"id": archive_id}, mutation=False)
+check("archived item is hidden from working API", "__err" in archived_lookup, str(archived_lookup))
+archive_history = owner.call("history.all", {"workspaceId": ws_id}, mutation=False)
+archive_event = next(
+    (event for event in archive_history if event.get("type") == "item_archive"),
+    {},
+) if isinstance(archive_history, list) else {}
+check(
+    "item tombstone is bound to device-signed ledger event",
+    archive_event.get("requestDeviceId") == owner.signer.device_id
+    and archive_event.get("fromLabel") == archive_candidate.get("guid")
+    and bool(archive_event.get("requestHash")),
+    str(archive_event)[:220],
+)
 rep = owner.call("reports.allItems", {"workspaceId": ws_id}, mutation=False)
-check("reports.allItems works", isinstance(rep, list), str(rep)[:120])
+check(
+    "reports exclude archived item",
+    isinstance(rep, list) and all(row.get("id") != archive_id for row in rep),
+    str(rep)[:120],
+)
 
 print("\n== 15. Чат ==")
 unsigned_chat = owner.call(

@@ -74,6 +74,11 @@ fn migrate(conn: &Connection) -> Result<()> {
         "ALTER TABLE items ADD COLUMN organization_node_id INTEGER",
         [],
     );
+    let _ = conn.execute(
+        "ALTER TABLE items ADD COLUMN archived INTEGER NOT NULL DEFAULT 0",
+        [],
+    );
+    let _ = conn.execute("ALTER TABLE items ADD COLUMN archived_at TEXT", []);
     let _ = conn.execute("ALTER TABLE users ADD COLUMN guid TEXT", []);
     let _ = conn.execute("ALTER TABLE users ADD COLUMN checkout_policy TEXT", []);
     let _ = conn.execute("ALTER TABLE workspaces ADD COLUMN guid TEXT", []);
@@ -269,6 +274,16 @@ fn migrate(conn: &Connection) -> Result<()> {
          );
          CREATE INDEX IF NOT EXISTS custody_item_user_idx
            ON custody_entries(item_guid,user_guid,created_at,entry_hash);",
+    )?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS item_tombstones(
+           item_guid TEXT PRIMARY KEY,
+           workspace_guid TEXT NOT NULL,
+           actor_guid TEXT NOT NULL,
+           ledger_hash TEXT NOT NULL UNIQUE,
+           deleted_at TEXT NOT NULL,
+           tombstone_hash TEXT NOT NULL UNIQUE
+         );",
     )?;
     conn.execute(
         "UPDATE user_workspaces SET rights_json=(SELECT role_rights FROM users WHERE users.id=user_workspaces.user_id) WHERE rights_json IS NULL",

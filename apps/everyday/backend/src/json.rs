@@ -266,7 +266,7 @@ fn attach_stock_and_holders(conn: &Connection, id: i64, base: &mut Map<String, V
     let mut members = Vec::new();
     if let (Some(ws), Some(title)) = (ws, title) {
         if let Ok(mut stmt) = conn.prepare(
-            "SELECT id, internal_id, responsible_user_id, status_id FROM items WHERE workspace_id=?1 AND title=?2 ORDER BY id",
+            "SELECT id, internal_id, responsible_user_id, status_id FROM items WHERE workspace_id=?1 AND title=?2 AND archived=0 ORDER BY id",
         ) {
             if let Ok(rows) = stmt.query_map(params![ws, title], |r| {
                 Ok((

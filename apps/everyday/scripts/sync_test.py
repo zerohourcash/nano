@@ -192,6 +192,18 @@ def journal_from(node: Node) -> dict:
         return json.loads(response.read().decode())
 
 
+def push_journal(node: Node, journal: dict) -> dict:
+    request = urllib.request.Request(
+        f"{node.base}/sync/journal",
+        data=json.dumps(journal).encode(),
+        method="POST",
+    )
+    request.add_header("authorization", f"Bearer {TOKEN}")
+    request.add_header("content-type", "application/json")
+    with urllib.request.urlopen(request, timeout=15) as response:
+        return json.loads(response.read().decode())
+
+
 def wait_for(predicate, timeout: float = 40.0, step: float = 1.0) -> bool:
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -438,6 +450,42 @@ def main() -> int:
             len(compact_snapshot.get("blobs", [])) == 1
             and compact_snapshot.get("photos", [{}])[0].get("url", "").startswith("cas:")
             and PHOTO_DATA_URL not in json.dumps(compact_snapshot),
+        )
+
+        tombstone_item = server.call(
+            "items.create",
+            {"workspaceId": ws_id, "title": "Не воскресать после офлайна"},
+        )
+        server.call("sync.pullNow", {})
+        check(
+            "карточка дошла до ноды до разделения сети",
+            wait_for(lambda: "Не воскресать после офлайна" in titles(node, node_ws_id or 1)),
+        )
+        stale_active_snapshot = journal_from(node)
+        archived = server.call("items.remove", {"id": tombstone_item["id"]})
+        check(
+            "удаление стало подписанным monotonic tombstone",
+            archived.get("tombstone", {}).get("tombstoneHash") is not None,
+            str(archived)[:220],
+        )
+        stale_result = push_journal(server, stale_active_snapshot)
+        check(
+            "старый активный snapshot принят идемпотентно, но не воскресил ТМЦ",
+            stale_result.get("ok") is True
+            and "Не воскресать после офлайна" not in titles(server, ws_id),
+            str(stale_result),
+        )
+        server.call("sync.pullNow", {})
+        check(
+            "tombstone скрыл карточку и на вернувшейся офлайн-ноде",
+            wait_for(lambda: "Не воскресать после офлайна" not in titles(node, node_ws_id or 1)),
+        )
+        tombstone_snapshot = journal_from(node)
+        check(
+            "tombstone и исходная история доступны на восстановленной ноде",
+            len(tombstone_snapshot.get("itemTombstones", [])) == 1
+            and any(event.get("type") == "item_archive" for event in tombstone_snapshot.get("history", [])),
+            str(tombstone_snapshot.get("itemTombstones")),
         )
 
         print("\n== 5. Узел → сервер ==")
