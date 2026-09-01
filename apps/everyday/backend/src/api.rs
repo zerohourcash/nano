@@ -467,9 +467,8 @@ fn required_admin_right(procedure: &str) -> Option<&'static str> {
         Some("manageWorkspaces")
     } else if procedure.starts_with("admin.dictionaries.") {
         Some("manageDictionaries")
-    } else if procedure.starts_with("interorg.") {
-        Some("manageWorkspaces")
-    } else if procedure.starts_with("sync.")
+    } else if procedure.starts_with("interorg.")
+        || procedure.starts_with("sync.")
         || procedure.starts_with("backup.")
         || (procedure.starts_with("content.") && procedure != "content.ingest")
     {
@@ -1918,13 +1917,14 @@ fn record_item_state_version(
 }
 
 fn adopt_item_config_references(conn: &Connection, id: i64, uid: i64) -> Result<(), ApiError> {
-    let refs: (
+    type ConfigReferences = (
         Option<i64>,
         Option<i64>,
         Option<i64>,
         Option<i64>,
         Option<i64>,
-    ) = conn.query_row(
+    );
+    let refs: ConfigReferences = conn.query_row(
         "SELECT category_id,brand_id,status_id,building_site_id,storage_id FROM items WHERE id=?1",
         [id],
         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
@@ -5496,18 +5496,20 @@ fn config_fields(
     Ok((ws, guid, fields, archived != 0))
 }
 
-fn config_payload_hash(
-    kind: &str,
-    guid: &str,
-    parent: Option<&str>,
+struct ConfigPayload<'a> {
+    kind: &'a str,
+    guid: &'a str,
+    parent: Option<&'a str>,
     depth: i64,
-    workspace: &str,
-    actor: &str,
+    workspace: &'a str,
+    actor: &'a str,
     active: bool,
-    fields: &Value,
-    updated_at: &str,
-) -> String {
-    let payload = json!({"domain":"everyday/config-version/v1","kind":kind,"entityGuid":guid,"parentHash":parent,"depth":depth,"workspaceGuid":workspace,"actorGuid":actor,"active":active,"fields":fields,"updatedAt":updated_at});
+    fields: &'a Value,
+    updated_at: &'a str,
+}
+
+fn config_payload_hash(record: ConfigPayload<'_>) -> String {
+    let payload = json!({"domain":"everyday/config-version/v1","kind":record.kind,"entityGuid":record.guid,"parentHash":record.parent,"depth":record.depth,"workspaceGuid":record.workspace,"actorGuid":record.actor,"active":record.active,"fields":record.fields,"updatedAt":record.updated_at});
     format!(
         "{:x}",
         Sha256::digest(serde_json::to_vec(&payload).expect("JSON serialization"))
@@ -5562,17 +5564,17 @@ fn record_config_version(
     let actor_guid =
         ledger::guid(conn, "users", uid).map_err(|e| ApiError::internal(e.to_string()))?;
     let updated_at = now();
-    let payload_hash = config_payload_hash(
+    let payload_hash = config_payload_hash(ConfigPayload {
         kind,
-        &guid,
-        parent_hash.as_deref(),
+        guid: &guid,
+        parent: parent_hash.as_deref(),
         depth,
-        &workspace_guid,
-        &actor_guid,
-        !archived,
-        &fields,
-        &updated_at,
-    );
+        workspace: &workspace_guid,
+        actor: &actor_guid,
+        active: !archived,
+        fields: &fields,
+        updated_at: &updated_at,
+    });
     let event = ledger::append(
         conn,
         ws,

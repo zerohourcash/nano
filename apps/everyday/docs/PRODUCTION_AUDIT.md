@@ -36,7 +36,7 @@
 | Смена Wi‑Fi/hotspot | NetworkCallback → JNI, динамический HMAC-анонс | Android contract, `npm run discovery:test` | Проверено на host/JNI build |
 | SQLCipher | отдельный feature, обязательный ключ, wrong-key rejection | `npm run encrypted-db:test` | Проверено Linux |
 | Backup/restore | online `.backup`, шифрование, integrity-check, новый target | `npm run backup:restore:test` | Проверено Linux |
-| Потоковый transport core | MTU frames, out-of-order, duplicate, missing ranges, SHA-256, Android JNI | Rust `stream_transport::tests`, encrypted bundle round-trip, APK symbols | Проверено |
+| Потоковый transport core | MTU frames, out-of-order, duplicate, missing ranges, SHA-256, Android JNI и безключевой `meshkeeper-frame` stdin/stdout bridge для serial/LoRa/USB | Rust `stream_transport::tests`, encrypted bundle round-trip, APK symbols; `npm run transport:test` запускает отдельные CLI-процессы, переставляет/теряет/дублирует/портит кадры | Проверено |
 | Android BLE GATT | foreground advertiser/server + scanner/client, MTU/retry, bounded crash-safe ciphertext spool, authorized import handoff, persistent diagnostics | Rust API regression, Android compile/lint, API 34 emulator instrumentation gate, APK | Реализовано; KVM CI gate настроен, но ещё не зафиксирован внешний успешный run; RF-тест на двух телефонах не выполнен |
 
 ## Release gates
@@ -69,9 +69,9 @@ npm run release:candidate:audit
 
 - Android BLE GATT adapter и foreground lifecycle реализованы, но ещё не
   проверены между двумя физическими телефонами с убийством Activity/процесса.
-  Bluetooth Mesh managed flooding и LoRa radio adapter
-  пока не реализованы. Общий bounded MTU framing, out-of-order сборка и resume
-  готовы и тестируются; без IP также работает
+  Bluetooth Mesh managed flooding и конкретный LoRa radio driver
+  пока не интегрированы. Общий bounded MTU framing, out-of-order сборка, resume
+  и production CLI pipe/serial bridge готовы и тестируются; без IP также работает
   зашифрованный store-and-forward bundle через системный Bluetooth/Wi‑Fi
   Direct/USB Share, но это ручной перенос, не фоновый BLE gossip.
 - iOS native shell и его Keychain/lifecycle тест отсутствуют; на iOS доступна

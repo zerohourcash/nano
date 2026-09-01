@@ -6,6 +6,8 @@ ROOT = Path(__file__).resolve().parents[3]
 transport = (ROOT / "docs" / "TRANSPORT.md").read_text(encoding="utf-8")
 architecture = (ROOT / "docs" / "ARCHITECTURE.md").read_text(encoding="utf-8")
 main = (ROOT / "apps" / "everyday" / "backend" / "src" / "lib.rs").read_text(encoding="utf-8")
+frame_cli = (ROOT / "apps" / "everyday" / "backend" / "src" / "bin" / "meshkeeper-frame.rs").read_text(encoding="utf-8")
+readme = (ROOT / "apps" / "everyday" / "README.md").read_text(encoding="utf-8")
 
 required_docs = {
     "/sync/journal": "journal endpoint",
@@ -36,5 +38,11 @@ required_routes = (
 for route in required_routes:
     if route not in main:
         raise SystemExit(f"main.rs больше не содержит документированный route {route}")
+
+for marker in ("fragment", "verify", "assemble", "MAX_TRANSFER_BYTES"):
+    if marker not in frame_cli:
+        raise SystemExit(f"meshkeeper-frame потерял документированный контракт: {marker}")
+if "meshkeeper-frame fragment bundle 255" not in readme:
+    raise SystemExit("README больше не документирует универсальный MKST CLI")
 
 print("Transport documentation check passed: protocol markers match production routes.")

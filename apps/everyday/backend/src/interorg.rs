@@ -949,7 +949,7 @@ mod tests {
                 &envelope,
                 recipient.as_bytes(),
                 "org-b",
-                &[envelope.sender_signing_key.clone()],
+                std::slice::from_ref(&envelope.sender_signing_key),
                 8
             )
             .unwrap(),

@@ -339,6 +339,22 @@ encrypted bundle или CAS object делится под заданный MTU, �
 порядке, принимает одинаковые retries и сообщает missing ranges. Кадры
 ограничены по размеру/числу и проверяются chunk tag плюс полным SHA-256; после
 сборки остаются обязательными AEAD и Ed25519 проверки существующего importer.
+Production-бинарник `meshkeeper-frame` предоставляет этот слой любому
+последовательному, LoRa, USB или файловому драйверу через stdin/stdout. Он не
+имеет ключей и не разбирает journal: одна base64url-строка равна одному
+непрозрачному кадру. Например:
+
+```bash
+meshkeeper-frame fragment bundle 255 < everyday-sync-bundle.json > frames.mkst64
+# frames.mkst64 переносится любым radio/serial/store-and-forward каналом
+meshkeeper-frame verify < frames.mkst64
+meshkeeper-frame assemble < frames.mkst64 > received-bundle.json
+```
+
+Строки можно доставлять в любом порядке и повторять. При неполной доставке
+`assemble` завершается с кодом 2 и печатает missing ranges; импорт
+`received-bundle.json` по-прежнему выполняется только авторизованным API после
+AEAD, Ed25519 и capability-проверок.
 Android-приложение также содержит opt-in GATT advertiser/server и
 scanner/client: кнопки в «Офлайн-узлах» включают приём или отправляют пакет
 соседним телефонам. После явного включения радио принадлежит foreground
@@ -404,6 +420,7 @@ npm run discovery:test # LAN discovery и отбрасывание анонса 
 npm run adversarial:test # повторы, replay, фальсификация и полное восстановление
 npm run interorg:test # две изолированные организации, partition и opaque relay
 npm run spam:test     # реальный HTTP flooding, дубль, restart и атомарный отказ
+npm run transport:test # MKST CLI: reorder/loss/retry/corruption через subprocess
 npm run scale:test   # 100 реальных процессов и отказ 10 узлов
 npm run test:e2e     # production-сборка + Chromium/Playwright
 npm run release:candidate:audit # все gates + 100 нод + свежий Android APK
