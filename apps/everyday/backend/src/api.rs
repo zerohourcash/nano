@@ -843,6 +843,29 @@ fn dispatch_inner(
         "sync.nodeKeys" => Ok(crate::sync::node_keys(conn)),
         "sync.diagnostics" => Ok(crate::diagnostics::list(conn)),
         "sync.clearDiagnostics" => Ok(crate::diagnostics::clear_resolved(conn)),
+        "sync.reportTransportStatus" => {
+            require_user(conn, user_id)?;
+            let transport = s(input, "transport").ok_or_else(|| ApiError::bad("transport"))?;
+            if transport != "ble" {
+                return Err(ApiError::bad("Неизвестный локальный транспорт"));
+            }
+            let failed = input.get("error").and_then(Value::as_bool).unwrap_or(false);
+            if failed {
+                let message = s(input, "message")
+                    .unwrap_or_else(|| "Ошибка локального BLE-транспорта".to_string());
+                crate::diagnostics::record(
+                    conn,
+                    "warning",
+                    "transport",
+                    "ble_transport",
+                    &message,
+                    None,
+                );
+            } else {
+                crate::diagnostics::resolve(conn, "transport", "ble_transport", None);
+            }
+            Ok(json!({"ok":true,"active":failed}))
+        }
         "sync.exportBundle" => {
             let workspace_guid = s(input, "workspaceGuid");
             let (token, scope) = crate::sync_bundle_export_capability(workspace_guid.as_deref())
@@ -4718,6 +4741,60 @@ mod tests {
             .unwrap();
         }
         (conn, path, users, ws)
+    }
+
+    #[test]
+    fn ble_transport_diagnostics_require_auth_deduplicate_and_resolve() {
+        let (mut conn, path, users, _) = test_db();
+        let report = json!({
+            "transport":"ble",
+            "error":true,
+            "message":"Соединение потеряно\nповтор"
+        });
+        assert_eq!(
+            dispatch(&mut conn, "sync.reportTransportStatus", &report, None)
+                .unwrap_err()
+                .http,
+            401
+        );
+        dispatch(
+            &mut conn,
+            "sync.reportTransportStatus",
+            &report,
+            Some(users[0]),
+        )
+        .unwrap();
+        dispatch(
+            &mut conn,
+            "sync.reportTransportStatus",
+            &report,
+            Some(users[0]),
+        )
+        .unwrap();
+        let active = crate::diagnostics::list(&conn);
+        assert_eq!(active["unresolved"], 1);
+        assert_eq!(active["events"][0]["component"], "transport");
+        assert_eq!(active["events"][0]["code"], "ble_transport");
+        assert_eq!(active["events"][0]["count"], 2);
+        assert_eq!(active["events"][0]["message"], "Соединение потеряноповтор");
+
+        dispatch(
+            &mut conn,
+            "sync.reportTransportStatus",
+            &json!({"transport":"ble","error":false,"message":"Связь восстановлена"}),
+            Some(users[0]),
+        )
+        .unwrap();
+        assert_eq!(crate::diagnostics::list(&conn)["unresolved"], 0);
+        assert!(dispatch(
+            &mut conn,
+            "sync.reportTransportStatus",
+            &json!({"transport":"unknown","error":true}),
+            Some(users[0]),
+        )
+        .is_err());
+        drop(conn);
+        let _ = std::fs::remove_file(path);
     }
 
     fn insert_item(

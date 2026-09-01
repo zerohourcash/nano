@@ -81,6 +81,9 @@ export default function OfflineNodesSection() {
     onSuccess: () => { diagnosticsQ.refetch(); toast('Закрытые записи диагностики удалены') },
     onError: (e) => toast(e.message, 'error'),
   })
+  const { mutate: reportTransportStatus } = trpc.sync.reportTransportStatus.useMutation({
+    onSuccess: () => { void diagnosticsQ.refetch() },
+  })
   const importBundle = trpc.sync.importBundle.useMutation({
     onSuccess: (result) => {
       utils.invalidate()
@@ -118,12 +121,15 @@ export default function OfflineNodesSection() {
     const onBleStatus = (event: Event) => {
       const detail = (event as CustomEvent<{ message?: unknown; error?: unknown }>).detail
       if (typeof detail?.message === 'string') {
-        setBleStatus({ message: detail.message.slice(0, 500), error: detail.error === true })
+        const message = detail.message.slice(0, 500)
+        const error = detail.error === true
+        setBleStatus({ message, error })
+        reportTransportStatus({ transport: 'ble', message, error })
       }
     }
     window.addEventListener('meshkeeper-ble-status', onBleStatus)
     return () => window.removeEventListener('meshkeeper-ble-status', onBleStatus)
-  }, [])
+  }, [reportTransportStatus])
   const exp = trpc.backup.export.useMutation({
     onSuccess: (blob) => {
       const a = document.createElement('a')

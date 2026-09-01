@@ -165,7 +165,9 @@ scanner/client. Пользователь явно включает приём и
 запрашивает MTU 185, последовательно пишет кадры с GATT response и при reconnect
 повторяет тот же transfer ID. Receiver сохраняет только проверенные кадры в
 bounded inbox, а собранный bundle возвращает в обычный авторизованный import UI.
-Radio-код не имеет API записи SQLite.
+Radio-код не имеет API записи SQLite. Ошибка адаптера передаётся через
+подписанную device-proof операцию в локальную bounded-диагностику; одинаковые
+ошибки дедуплицируются, успешный статус помечает проблему закрытой.
 Android APK экспортирует это ядро через JNI-методы `fragmentTransport`,
 `missingTransportRanges` и `assembleTransport`: Java/Kotlin radio layer не
 реализует framing повторно и получает payload только после нативной проверки.

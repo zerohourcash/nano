@@ -91,6 +91,7 @@ const CRITICAL = [
   'knowledge.save',
   'sync.importBundle',
   'sync.clearDiagnostics',
+  'sync.reportTransportStatus',
   'content.setMode',
 ]
 

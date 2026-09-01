@@ -81,6 +81,11 @@ export const syncRouter = createRouter({
     }>,
   })),
   clearDiagnostics: publicQuery.input(z.object({}).optional()).mutation(async () => ({ ok: true, removed: 0 })),
+  reportTransportStatus: publicQuery.input(z.object({
+    transport: z.literal('ble'),
+    message: z.string().max(500),
+    error: z.boolean(),
+  })).mutation(async ({ input }) => ({ ok: true, active: input.error })),
   exportBundle: publicQuery.input(z.object({ workspaceGuid: z.string().max(128).optional() }).optional()).query(async () => ({
     format: "everyday-sync-bundle" as const,
     version: 2 as const,

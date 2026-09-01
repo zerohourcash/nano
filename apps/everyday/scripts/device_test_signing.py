@@ -15,7 +15,7 @@ CRITICAL = {
     "history.writeOff", "history.replenish", "history.move",
     "inventory.checkItem", "inventory.complete",
     "chat.send", "items.addDocument", "bit.transfer", "bit.sale", "bit.mint", "knowledge.save", "sync.importBundle",
-    "sync.clearDiagnostics", "content.setMode",
+    "sync.clearDiagnostics", "sync.reportTransportStatus", "content.setMode",
 }
 
 

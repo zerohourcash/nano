@@ -42,6 +42,7 @@ pub fn requires_signature(procedure: &str) -> bool {
             | "knowledge.save"
             | "sync.importBundle"
             | "sync.clearDiagnostics"
+            | "sync.reportTransportStatus"
             | "content.setMode"
     )
 }
@@ -227,6 +228,7 @@ mod tests {
 
     #[test]
     fn verifies_exact_request_and_rejects_replay_or_tampering() {
+        assert!(requires_signature("sync.reportTransportStatus"));
         let db = database();
         let key = SigningKey::generate(&mut OsRng);
         register(

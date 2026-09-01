@@ -23,7 +23,7 @@
 | SQLCipher | отдельный feature, обязательный ключ, wrong-key rejection | `npm run encrypted-db:test` | Проверено Linux |
 | Backup/restore | online `.backup`, шифрование, integrity-check, новый target | `npm run backup:restore:test` | Проверено Linux |
 | Потоковый transport core | MTU frames, out-of-order, duplicate, missing ranges, SHA-256, Android JNI | Rust `stream_transport::tests`, encrypted bundle round-trip, APK symbols | Проверено |
-| Android BLE GATT | opt-in advertiser/server + scanner/client, MTU/retry, authorized import handoff | Android compile, manifest/static contract, APK | Реализовано; RF-тест на двух телефонах не выполнен |
+| Android BLE GATT | opt-in advertiser/server + scanner/client, MTU/retry, authorized import handoff, persistent diagnostics | Rust API regression, Android compile, manifest/static contract, APK | Реализовано; RF-тест на двух телефонах не выполнен |
 
 ## Release gates
 

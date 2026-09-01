@@ -84,6 +84,36 @@ anon = Client("anon")
 me2 = anon.call("auth.me", None, mutation=False)
 check("anonymous has no session", me2 in (None, {}) or "__err" in me2, json.dumps(me2, ensure_ascii=False)[:120])
 
+unsigned_ble_status = owner.call(
+    "sync.reportTransportStatus",
+    {"transport": "ble", "message": "Тестовый разрыв BLE", "error": True},
+    signed=False,
+)
+check(
+    "unsigned BLE diagnostic rejected",
+    unsigned_ble_status.get("__http") == 403
+    and "DEVICE_SIGNATURE_REQUIRED" in unsigned_ble_status.get("__body", ""),
+    str(unsigned_ble_status)[:160],
+)
+ble_failure = owner.call(
+    "sync.reportTransportStatus",
+    {"transport": "ble", "message": "Тестовый разрыв BLE", "error": True},
+)
+diagnostics = owner.call("sync.diagnostics", None, mutation=False)
+check(
+    "signed BLE failure appears in owner diagnostics",
+    ble_failure.get("active") is True
+    and diagnostics.get("unresolved") == 1
+    and diagnostics.get("events", [{}])[0].get("code") == "ble_transport",
+    str(diagnostics)[:180],
+)
+owner.call(
+    "sync.reportTransportStatus",
+    {"transport": "ble", "message": "BLE восстановлен", "error": False},
+)
+diagnostics = owner.call("sync.diagnostics", None, mutation=False)
+check("BLE recovery resolves persistent diagnostic", diagnostics.get("unresolved") == 0)
+
 print("\n== 3. Повторная открытая регистрация закрыта ==")
 r2 = Client("x").call("auth.register", {"fullName": "Чужой", "phone": "+7 900 999-00-11", "password": "SuperSecret123"})
 check("open registration closed after bootstrap", "__err" in r2, str(r2)[:120])
