@@ -734,20 +734,15 @@ function SessionView({
     setScannerOpen(true)
   }
 
-  const handleScannedCode = (raw: string) => {
-    const code = raw.trim().toLowerCase()
-    const canonical = code.match(/^everyday:item:([0-9a-f-]{36})$/)?.[1]
-    const match = sortedResults.find((row) => {
-      const item = row.item
-      if (!item) return false
-      // Rust includes the globally portable GUID; the legacy TypeScript
-      // adapter only declares the local catalog fields.
-      const identity = item as typeof item & { guid?: string; qrCode?: string }
-      const guid = String(identity.guid ?? '').toLowerCase()
-      const internalId = String(identity.internalId ?? '').toLowerCase()
-      const qrCode = String(identity.qrCode ?? '').toLowerCase()
-      return canonical ? guid === canonical : code === internalId || code === qrCode || code === guid
-    })
+  const handleScannedCode = async (raw: string) => {
+    let verified: { id: number } | null = null
+    try {
+      verified = await utils.items.byCode.fetch({ code: raw.trim() })
+    } catch {
+      showToast('QR не прошёл проверку или относится к другой организации', 'error')
+      return
+    }
+    const match = sortedResults.find((row) => row.itemId === verified?.id)
     if (!match) {
       showToast('QR не относится к позиции этой инвентаризации', 'error')
       return

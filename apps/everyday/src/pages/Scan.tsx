@@ -185,6 +185,11 @@ export default function Scan() {
                 {last.name} · {last.vn}
                 {last.assigneeName ? ` · у ${last.assigneeName}` : ' · на складе'}
               </div>
+              <p className={`text-xs font-semibold ${item.qrVerification.authenticity === 'trusted-node' ? 'text-success' : 'text-warning'}`}>
+                {item.qrVerification.authenticity === 'trusted-node'
+                  ? 'Подпись бирки проверена'
+                  : 'Старая неподписанная бирка — сверьте название и номер'}
+              </p>
               {isMine && (
                 <button
                   onClick={() => ret.mutate({ itemId: item.id })}

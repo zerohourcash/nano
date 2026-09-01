@@ -592,9 +592,8 @@ function TransferModal({
 }
 
 function QrModal({ open, onClose, item }: { open: boolean; onClose: () => void; item: ItemFull }) {
-  // GUID делает бирку однозначной между организациями и после P2P-слияния.
-  // Backend продолжает принимать старые бирки с qrCode/internalId.
-  const value = item.guid ? `everyday:item:${item.guid}` : (item.qrCode ?? item.internalId)
+  const labelQ = trpc.items.qrLabel.useQuery({ itemId: item.id }, { enabled: open, retry: false })
+  const value = labelQ.data?.label
 
   const downloadPng = () => {
     const canvas = document.getElementById('item-qr-canvas') as HTMLCanvasElement | null
@@ -625,16 +624,21 @@ function QrModal({ open, onClose, item }: { open: boolean; onClose: () => void; 
   return (
     <Modal open={open} onClose={onClose} title="QR-код инструмента">
       <div className="flex flex-col items-center gap-4">
-        <div className="bg-white rounded-card border border-brand-100 p-5 shadow-card">
-          <QRCodeSVG value={value} size={200} level="M" />
-        </div>
-        {/* Скрытый canvas для экспорта PNG */}
-        <div className="hidden">
-          <QRCodeCanvas id="item-qr-canvas" value={value} size={512} level="M" />
-        </div>
+        {value ? <>
+          <div className="bg-white rounded-card border border-brand-100 p-5 shadow-card">
+            <QRCodeSVG value={value} size={200} level="M" />
+          </div>
+          {/* Скрытый canvas для экспорта PNG */}
+          <div className="hidden">
+            <QRCodeCanvas id="item-qr-canvas" value={value} size={512} level="M" />
+          </div>
+        </> : <div className="flex h-60 items-center justify-center text-ink-500">
+          {labelQ.isError ? 'Не удалось подписать QR' : <Loader2 className="animate-spin" size={24} />}
+        </div>}
         <div className="font-mono-num text-ink-900">{item.internalId}</div>
         <p className="text-[13px] text-ink-500 text-center">
-          Наклейте этикетку на корпус — сканирование открывает эту карточку.
+          Метка подписана Ed25519 и привязана к организации и карточке. Копию
+          настоящей наклейки всё равно можно сделать — сверяйте название и номер на корпусе.
         </p>
         <div className="flex gap-2 w-full">
           <SecondaryButton onClick={downloadPng} className="flex-1">

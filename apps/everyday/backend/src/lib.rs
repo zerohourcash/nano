@@ -11,6 +11,7 @@ pub mod inventory_act;
 mod json;
 mod knowledge;
 mod ledger;
+pub mod qr_label;
 pub mod stream_transport;
 mod sync;
 

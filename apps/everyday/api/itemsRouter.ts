@@ -79,7 +79,27 @@ export const itemsRouter = createRouter({
     .query(async ({ input }) => {
       const item = await findItemByCode(input.code);
       if (!item) throw new TRPCError({ code: "NOT_FOUND", message: "Инструмент с таким QR/номером не найден" });
-      return item;
+      return {
+        ...item,
+        qrVerification: {
+          version: 1,
+          authenticity: 'legacy-unverified' as 'legacy-unverified' | 'trusted-node',
+        },
+      };
+    }),
+
+  qrLabel: publicQuery
+    .input(z.object({ itemId: z.number().int().positive() }))
+    .query(async ({ input }) => {
+      const item = await findItemById(input.itemId);
+      if (!item) throw new TRPCError({ code: "NOT_FOUND", message: "Инструмент не найден" });
+      const guid = (item as typeof item & { guid?: string | null }).guid;
+      return {
+        label: guid ? `everyday:item:${guid}` : (item.qrCode ?? item.internalId),
+        version: 1,
+        algorithm: 'legacy',
+        cloneResistant: false,
+      };
     }),
 
   nextInternalId: publicQuery

@@ -194,6 +194,7 @@ test('browser signs a real custody transaction and ledger retains its proof', as
     qrItem.history.find(entry => entry.type === 'item_state_create')?.requestDeviceId
   ).toBeTruthy();
   await page.getByRole('button', { name: 'Печать QR' }).click();
+  await expect(page.locator('#item-qr-canvas')).toBeAttached({ timeout: 10_000 });
   const qrPngData = await page.evaluate(() => {
     const canvas = document.getElementById('item-qr-canvas') as HTMLCanvasElement | null;
     if (!canvas) throw new Error('export QR canvas is missing');
@@ -259,7 +260,7 @@ test('browser signs a real custody transaction and ledger retains its proof', as
   const inventoryCode = inventoryScanner.getByPlaceholder('Или вставьте ссылку / токен');
   await inventoryCode.fill('everyday:item:00000000-0000-4000-8000-000000000000');
   await inventoryScanner.getByRole('button', { name: 'Далее' }).click();
-  await expect(page.getByText('QR не относится к позиции этой инвентаризации')).toBeVisible();
+  await expect(page.getByText('QR не прошёл проверку или относится к другой организации')).toBeVisible();
   await inventoryScanner.locator('input[type="file"]').setInputFiles({
     name: 'real-tool-qr.png',
     mimeType: 'image/png',

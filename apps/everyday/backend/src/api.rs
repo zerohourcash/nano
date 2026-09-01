@@ -86,6 +86,7 @@ pub fn is_mutation(procedure: &str) -> bool {
             | "items.list"
             | "items.byId"
             | "items.byCode"
+            | "items.qrLabel"
             | "items.nextInternalId"
             | "items.faults"
             | "items.changeRequests"
@@ -849,6 +850,7 @@ fn dispatch_inner(
         "items.list" => items_list(conn, input, user_id),
         "items.byId" => items_by_id(conn, input, user_id),
         "items.byCode" => items_by_code(conn, input, user_id),
+        "items.qrLabel" => items_qr_label(conn, input, user_id),
         "items.nextInternalId" => items_next_id(conn, input),
         "items.create" => items_create(conn, input, user_id),
         "items.update" => items_update(conn, input, user_id),
@@ -1737,13 +1739,25 @@ fn items_by_id(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiRes
 fn items_by_code(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
     let uid = require_user(conn, user_id)?;
     let code = s(input, "code").ok_or_else(|| ApiError::bad("code"))?;
+    let signed = if code.trim().starts_with("everyday:item:v2:") {
+        Some(
+            crate::qr_label::verify(conn, &code)
+                .map_err(|error| ApiError::bad(format!("Подписанный QR отклонён: {error}")))?,
+        )
+    } else {
+        None
+    };
     let canonical_guid = code
         .trim()
         .strip_prefix("everyday:item:")
-        .filter(|guid| Uuid::parse_str(guid).is_ok());
-    if code.trim().starts_with("everyday:item:") && canonical_guid.is_none() {
+        .filter(|guid| !guid.starts_with("v2:") && Uuid::parse_str(guid).is_ok());
+    if code.trim().starts_with("everyday:item:") && canonical_guid.is_none() && signed.is_none() {
         return Err(ApiError::bad("Некорректный GUID в QR-коде Everyday"));
     }
+    let lookup_guid = signed
+        .as_ref()
+        .map(|label| label.item_guid.as_str())
+        .or(canonical_guid);
     let id: Option<i64> = conn.query_row(
         "SELECT i.id
          FROM items i
@@ -1753,11 +1767,28 @@ fn items_by_code(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiR
            AND ((?3 IS NOT NULL AND i.guid=?3) OR (?3 IS NULL AND (i.qr_code=?1 OR i.internal_id=?1 OR UPPER(i.qr_code)=UPPER(?1) OR UPPER(i.internal_id)=UPPER(?1))))
          ORDER BY CASE WHEN ?3 IS NOT NULL THEN 0 WHEN i.qr_code=?1 THEN 1 WHEN i.internal_id=?1 THEN 2 ELSE 3 END, i.id
          LIMIT 1",
-        params![code, uid, canonical_guid], |r| r.get(0),
+        params![code, uid, lookup_guid], |r| r.get(0),
     ).optional().ok().flatten();
     let id = id.ok_or_else(|| ApiError::not_found("Инструмент с таким QR/номером не найден"))?;
     require_item_access(conn, uid, id)?;
-    jsn::item_json(conn, id, false).ok_or_else(|| ApiError::not_found("Инструмент не найден"))
+    let mut item = jsn::item_json(conn, id, false)
+        .ok_or_else(|| ApiError::not_found("Инструмент не найден"))?;
+    item["qrVerification"] = if let Some(label) = signed {
+        json!({"version":2,"authenticity":"trusted-node","workspaceGuid":label.workspace_guid,
+            "internalId":label.internal_id,"issuedAt":label.issued_at,"publicKey":label.public_key})
+    } else {
+        json!({"version":1,"authenticity":"legacy-unverified"})
+    };
+    Ok(item)
+}
+
+fn items_qr_label(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
+    let uid = require_user(conn, user_id)?;
+    let item_id = i64v(input, "itemId").ok_or_else(|| ApiError::bad("itemId"))?;
+    require_item_access(conn, uid, item_id)?;
+    let label = crate::qr_label::issue(conn, item_id)
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    Ok(json!({"label":label,"version":2,"algorithm":"Ed25519","cloneResistant":false}))
 }
 
 fn items_next_id(conn: &Connection, input: &Value) -> ApiResult {
@@ -7977,6 +8008,7 @@ mod tests {
         .unwrap();
         assert_eq!(found["id"], own);
         assert_eq!(found["workspaceId"], ws);
+        assert_eq!(found["qrVerification"]["authenticity"], "legacy-unverified");
         let guid = Uuid::new_v4().to_string();
         conn.execute("UPDATE items SET guid=?1 WHERE id=?2", params![guid, own])
             .unwrap();
@@ -7988,6 +8020,48 @@ mod tests {
         )
         .unwrap();
         assert_eq!(canonical["id"], own);
+        let issued = dispatch(
+            &mut conn,
+            "items.qrLabel",
+            &json!({"itemId":own}),
+            Some(users[0]),
+        )
+        .unwrap();
+        assert_eq!(issued["version"], 2);
+        let signed_label = issued["label"].as_str().unwrap();
+        assert!(signed_label.starts_with("everyday:item:v2:"));
+        let signed = dispatch(
+            &mut conn,
+            "items.byCode",
+            &json!({"code":signed_label}),
+            Some(users[0]),
+        )
+        .unwrap();
+        assert_eq!(signed["id"], own);
+        assert_eq!(signed["qrVerification"]["authenticity"], "trusted-node");
+        ledger::guid(&conn, "workspaces", foreign_ws).unwrap();
+        ledger::guid(&conn, "items", foreign).unwrap();
+        let foreign_label = crate::qr_label::issue(&conn, foreign).unwrap();
+        let hidden = dispatch(
+            &mut conn,
+            "items.byCode",
+            &json!({"code":foreign_label}),
+            Some(users[0]),
+        )
+        .unwrap_err();
+        assert_eq!(hidden.http, 404, "подписанная бирка не обходит tenant ACL");
+        let mut tampered = signed_label.as_bytes().to_vec();
+        let last = tampered.len() - 1;
+        tampered[last] = if tampered[last] == b'A' { b'B' } else { b'A' };
+        let tampered = String::from_utf8(tampered).unwrap();
+        let rejected = dispatch(
+            &mut conn,
+            "items.byCode",
+            &json!({"code":tampered}),
+            Some(users[0]),
+        )
+        .unwrap_err();
+        assert_eq!(rejected.http, 400);
         let malformed = dispatch(
             &mut conn,
             "items.byCode",
