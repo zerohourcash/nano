@@ -241,9 +241,12 @@ pub fn verify_request(
         timestamp: timestamp.to_owned(),
         path: path.to_owned(),
         request_body: (path.starts_with("/api/trpc/inventory.")
-            || path == "/api/trpc/items.addPhoto")
-            .then(|| String::from_utf8(body.to_vec()))
-            .transpose()?,
+            || matches!(
+                path,
+                "/api/trpc/items.addPhoto" | "/api/trpc/items.addDocument"
+            ))
+        .then(|| String::from_utf8(body.to_vec()))
+        .transpose()?,
     })
 }
 

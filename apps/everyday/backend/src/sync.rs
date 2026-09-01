@@ -1044,7 +1044,11 @@ pub fn export_journal_since(conn: &Connection, recipient_frontier: Option<&Value
     }
     let mut documents = Vec::new();
     if let Ok(mut statement) = conn.prepare(
-        "SELECT d.guid,d.item_id,d.name,d.url,d.mime,d.sha256,d.author_id,d.access_level
+        "SELECT d.guid,d.item_id,d.name,d.url,d.mime,d.sha256,d.author_id,d.access_level,
+                (SELECT h.hash FROM history_entries h
+                 WHERE h.item_id=d.item_id AND h.type='document_add' AND h.from_label=d.guid
+                   AND h.event_version=3 AND h.request_body IS NOT NULL
+                 ORDER BY h.id DESC LIMIT 1)
          FROM item_documents d ORDER BY d.id",
     ) {
         if let Ok(rows) = statement.query_map([], |row| {
@@ -1059,6 +1063,7 @@ pub fn export_journal_since(conn: &Connection, recipient_frontier: Option<&Value
                 "sha256": row.get::<_, Option<String>>(5)?,
                 "authorGuid": author_id.map(|id| guid_of(conn,"users",id)),
                 "accessLevel": row.get::<_, String>(7)?,
+                "ledgerHash": row.get::<_, Option<String>>(8)?,
             }))
         }) {
             documents.extend(rows.flatten());
@@ -1108,6 +1113,10 @@ pub fn export_journal_since(conn: &Connection, recipient_frontier: Option<&Value
         "knowledge": crate::knowledge::export(conn),
     });
     if let Some(object) = journal.as_object_mut() {
+        object.insert(
+            "documentMode".into(),
+            json!("intent-bound-with-explicit-legacy/v1"),
+        );
         object.insert("inventoryMode".into(), json!("append-only-records/v1"));
         object.insert("inventoryRecords".into(), Value::Array(inventory_records));
         object.insert("organizationNodeMode".into(), json!("portable-branches/v1"));
@@ -3291,6 +3300,9 @@ pub fn apply_remote_journal(conn: &Connection, journal: &Value, peer_url: &str) 
     if let Err(error) = verify_photo_records(conn, journal) {
         return json!({"ok":false,"error":format!("Проверка фото-летописи: {error}")});
     }
+    if let Err(error) = verify_document_records(conn, journal) {
+        return json!({"ok":false,"error":format!("Проверка летописи документов: {error}")});
+    }
     if let Err(error) = crate::accounting::verify_journal_links(conn, journal) {
         return json!({"ok":false,"error":format!("Проверка Bit-летописи: {error}")});
     }
@@ -3377,6 +3389,10 @@ pub fn apply_remote_journal(conn: &Connection, journal: &Value, peer_url: &str) 
     if let Err(error) = verify_photo_records(conn, &export_journal(conn)) {
         let _ = conn.execute_batch("ROLLBACK TO verified_sync; RELEASE verified_sync");
         return json!({"ok":false,"error":format!("Проверка сохранённой фото-летописи: {error}")});
+    }
+    if let Err(error) = verify_document_records(conn, &export_journal(conn)) {
+        let _ = conn.execute_batch("ROLLBACK TO verified_sync; RELEASE verified_sync");
+        return json!({"ok":false,"error":format!("Проверка сохранённой летописи документов: {error}")});
     }
     if let Err(error) = ledger::verify_chat_links(conn) {
         let _ = conn.execute_batch("ROLLBACK TO verified_sync; RELEASE verified_sync");
@@ -4638,6 +4654,137 @@ fn verify_photo_records(conn: &Connection, journal: &Value) -> anyhow::Result<()
             stored
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("photo ledger event unavailable"))?,
+        )?;
+    }
+    Ok(())
+}
+
+fn document_commitment(document: &Value) -> anyhow::Result<String> {
+    let required = |field: &str| {
+        document
+            .get(field)
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("document has no {field}"))
+    };
+    let guid = required("guid")?;
+    let item = required("itemGuid")?;
+    let author = required("authorGuid")?;
+    let name = required("name")?;
+    let url = required("url")?;
+    let checksum = required("sha256")?;
+    let access = required("accessLevel")?;
+    if url.strip_prefix("cas:") != Some(checksum)
+        || !matches!(access, "members" | "accounting" | "managers")
+    {
+        anyhow::bail!("document CAS or ACL mismatch")
+    }
+    let payload = json!({
+        "domain":"everyday/item-document/v1","guid":guid,"itemGuid":item,
+        "authorGuid":author,"name":name,"url":url,"mime":document.get("mime"),
+        "sha256":checksum,"accessLevel":access,
+    });
+    Ok(hex::encode(Sha256::digest(serde_json::to_vec(&payload)?)))
+}
+
+fn verify_document_intent(document: &Value, event: &Value) -> anyhow::Result<()> {
+    let payload_hash = document_commitment(document)?;
+    let guid = document["guid"].as_str().unwrap_or_default();
+    let item = document["itemGuid"].as_str().unwrap_or_default();
+    let author = document["authorGuid"].as_str().unwrap_or_default();
+    if event.get("eventVersion").and_then(Value::as_i64) != Some(3)
+        || event.get("type").and_then(Value::as_str) != Some("document_add")
+        || event.get("itemGuid").and_then(Value::as_str) != Some(item)
+        || event.get("actorGuid").and_then(Value::as_str) != Some(author)
+        || event.get("fromLabel").and_then(Value::as_str) != Some(guid)
+        || event.get("toLabel").and_then(Value::as_str) != Some(payload_hash.as_str())
+        || event.get("requestPath").and_then(Value::as_str) != Some("/api/trpc/items.addDocument")
+    {
+        anyhow::bail!("document ledger evidence mismatch")
+    }
+    let body = event
+        .get("requestBody")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("document event has no signed intent"))?;
+    let request_hash = hex::encode(Sha256::digest(body.as_bytes()));
+    if event.get("requestHash").and_then(Value::as_str) != Some(request_hash.as_str()) {
+        anyhow::bail!("document request body hash mismatch")
+    }
+    let envelope: Value = serde_json::from_str(body)?;
+    let input = trpc_request_input(&envelope)?;
+    for (input_field, record_field) in [
+        ("itemGuid", "itemGuid"),
+        ("documentGuid", "guid"),
+        ("name", "name"),
+        ("url", "url"),
+        ("mime", "mime"),
+        ("accessLevel", "accessLevel"),
+    ] {
+        let default_access = Value::String("members".into());
+        let input_value = if input_field == "accessLevel" {
+            input.get(input_field).unwrap_or(&default_access)
+        } else {
+            input.get(input_field).unwrap_or(&Value::Null)
+        };
+        if input_value != document.get(record_field).unwrap_or(&Value::Null) {
+            anyhow::bail!("document differs from signed user intent")
+        }
+    }
+    Ok(())
+}
+
+fn verify_document_records(conn: &Connection, journal: &Value) -> anyhow::Result<()> {
+    if journal.get("documentMode").and_then(Value::as_str)
+        != Some("intent-bound-with-explicit-legacy/v1")
+    {
+        anyhow::bail!("journal does not declare document verification mode")
+    }
+    let history: HashMap<&str, &Value> = journal
+        .get("history")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|event| {
+            event
+                .get("opId")
+                .and_then(Value::as_str)
+                .map(|hash| (hash, event))
+        })
+        .collect();
+    for document in journal
+        .get("documents")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let Some(ledger_hash) = document.get("ledgerHash").and_then(Value::as_str) else {
+            continue;
+        };
+        if let Some(event) = history.get(ledger_hash) {
+            verify_document_intent(document, event)?;
+            continue;
+        }
+        let stored: Option<Value> = conn
+            .query_row(
+                "SELECT h.event_version,i.guid,u.guid,h.type,h.from_label,h.to_label,
+                        h.request_hash,h.request_path,h.request_body
+                 FROM history_entries h JOIN items i ON i.id=h.item_id
+                 JOIN users u ON u.id=h.actor_user_id WHERE h.hash=?1",
+                [ledger_hash],
+                |row| Ok(json!({
+                    "eventVersion":row.get::<_,i64>(0)?,"itemGuid":row.get::<_,String>(1)?,
+                    "actorGuid":row.get::<_,String>(2)?,"type":row.get::<_,String>(3)?,
+                    "fromLabel":row.get::<_,Option<String>>(4)?,"toLabel":row.get::<_,Option<String>>(5)?,
+                    "requestHash":row.get::<_,Option<String>>(6)?,"requestPath":row.get::<_,Option<String>>(7)?,
+                    "requestBody":row.get::<_,Option<String>>(8)?,
+                })),
+            )
+            .optional()?;
+        verify_document_intent(
+            document,
+            stored
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("document ledger event unavailable"))?,
         )?;
     }
     Ok(())
@@ -6119,6 +6266,7 @@ pub fn integrity_audit(conn: &Connection) -> Value {
     let organization_node_result = verify_stored_organization_node_versions(conn);
     let inventory_result = verify_stored_inventory_records(conn);
     let photo_result = verify_photo_records(conn, &snapshot);
+    let document_result = verify_document_records(conn, &snapshot);
     let membership_result = verify_membership_records(conn, &snapshot);
 
     let count = |table: &str| -> i64 {
@@ -6215,6 +6363,7 @@ pub fn integrity_audit(conn: &Connection) -> Value {
         .map(ToString::to_string);
     let inventory_error = inventory_result.as_ref().err().map(ToString::to_string);
     let photo_error = photo_result.as_ref().err().map(ToString::to_string);
+    let document_error = document_result.as_ref().err().map(ToString::to_string);
     let membership_error = membership_result.as_ref().err().map(ToString::to_string);
     let healthy = database_check == "ok"
         && ledger_result.is_ok()
@@ -6233,6 +6382,7 @@ pub fn integrity_audit(conn: &Connection) -> Value {
         && organization_node_result.is_ok()
         && inventory_result.is_ok()
         && photo_result.is_ok()
+        && document_result.is_ok()
         && membership_result.is_ok()
         && orphan_history == 0
         && missing_guids == 0
@@ -6256,6 +6406,7 @@ pub fn integrity_audit(conn: &Connection) -> Value {
         "organizationNodeVersions":count("organization_node_versions"),
         "inventoryRecords":count("inventory_records"),
         "photos":count("item_photos"),
+        "documents":count("item_documents"),
     });
     let mut audit = json!({
         "healthy": healthy,
@@ -6314,6 +6465,14 @@ pub fn integrity_audit(conn: &Connection) -> Value {
             photo_error.map(Value::String).unwrap_or(Value::Null),
         );
         object.insert("photoIntentVerified".into(), json!(photo_result.is_ok()));
+        object.insert(
+            "documentError".into(),
+            document_error.map(Value::String).unwrap_or(Value::Null),
+        );
+        object.insert(
+            "documentIntentVerified".into(),
+            json!(document_result.is_ok()),
+        );
         object.insert(
             "organizationNodeError".into(),
             organization_node_error
@@ -7990,6 +8149,67 @@ mod tests {
         ledger::sign_journal(&conn, &mut forged).unwrap();
         ledger::verify_journal(&forged).unwrap();
         let error = verify_photo_records(&conn, &forged).unwrap_err();
+        assert!(error.to_string().contains("ledger evidence mismatch"));
+
+        drop(conn);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn document_intent_rejects_trusted_node_snapshot_rewrite() {
+        let path =
+            std::env::temp_dir().join(format!("document-intent-{}.db", uuid::Uuid::new_v4()));
+        let conn = crate::db::open(&path).unwrap();
+        let created = chrono::Utc::now().to_rfc3339();
+        conn.execute("INSERT INTO workspaces(name,internal_id_prefix,created_at,guid) VALUES('Docs org','D-',?1,'docs-workspace')",[&created]).unwrap();
+        let workspace = conn.last_insert_rowid();
+        conn.execute("INSERT INTO users(full_name,phone,status,role_rights,created_at,guid) VALUES('Owner','+70000000992','active',?1,?2,'docs-owner')",params![crate::db::owner_rights().to_string(),created]).unwrap();
+        let owner = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO user_workspaces(user_id,workspace_id,rights_json) VALUES(?1,?2,?3)",
+            params![owner, workspace, crate::db::owner_rights().to_string()],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO items(internal_id,title,workspace_id,qr_code,created_at,guid) VALUES('D-1','Manual',?1,'D-1',?2,'docs-item')",params![workspace,created]).unwrap();
+        let item = conn.last_insert_rowid();
+        let key = SigningKey::generate(&mut OsRng);
+        let device = "docs-device-0001";
+        crate::device::register(&conn,owner,&json!({"deviceId":device,"name":"Docs phone","publicKey":URL_SAFE_NO_PAD.encode(key.verifying_key().to_bytes())})).unwrap();
+        let cas = crate::content::ingest_data_url(&conn, "data:application/pdf;base64,QUJD")
+            .unwrap()
+            .unwrap();
+        let document_guid = uuid::Uuid::new_v4().to_string();
+        let checksum = cas.trim_start_matches("cas:");
+        conn.execute("INSERT INTO item_documents(item_id,name,url,guid,mime,sha256,author_id,access_level) VALUES(?1,'Manual.pdf',?2,?3,'application/pdf',?4,?5,'members')",params![item,cas,document_guid,checksum,owner]).unwrap();
+        let document = json!({"guid":document_guid,"itemGuid":"docs-item",
+            "name":"Manual.pdf","url":cas,"mime":"application/pdf","sha256":checksum,
+            "authorGuid":"docs-owner","accessLevel":"members"});
+        let payload_hash = document_commitment(&document).unwrap();
+        let body = json!({"json":{"itemId":item,"itemGuid":"docs-item",
+            "documentGuid":document_guid,"name":"Manual.pdf","url":cas,
+            "mime":"application/pdf","accessLevel":"members"}});
+        let proof = signed_device_proof_body(&key, device, "/api/trpc/items.addDocument", &body);
+        crate::device::set_pending(&conn, owner, &proof).unwrap();
+        ledger::append(
+            &conn,
+            workspace,
+            owner,
+            Some(item),
+            "document_add",
+            Some(&document_guid),
+            Some(&payload_hash),
+            None,
+            Some("Document added"),
+        )
+        .unwrap();
+
+        let valid = export_journal(&conn);
+        verify_document_records(&conn, &valid).unwrap();
+        let mut forged = valid;
+        forged["documents"][0]["accessLevel"] = json!("accounting");
+        ledger::sign_journal(&conn, &mut forged).unwrap();
+        ledger::verify_journal(&forged).unwrap();
+        let error = verify_document_records(&conn, &forged).unwrap_err();
         assert!(error.to_string().contains("ledger evidence mismatch"));
 
         drop(conn);

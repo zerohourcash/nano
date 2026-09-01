@@ -250,8 +250,8 @@ export default function CreateTool() {
   const titleFileRef = useRef<HTMLInputElement>(null)
   const extraFileRef = useRef<HTMLInputElement>(null)
 
-  // Документы (локальный список имён — загрузка файлов в демо недоступна)
-  const [docs, setDocs] = useState<{ name: string; size: number }[]>([])
+  // Байты остаются локальными до создания карточки, затем попадают в CAS.
+  const [docs, setDocs] = useState<{ name: string; size: number; file: File }[]>([])
   const docFileRef = useRef<HTMLInputElement>(null)
 
   // Автоподсказки брендов при вводе наименования
@@ -264,6 +264,7 @@ export default function CreateTool() {
   const create = trpc.items.create.useMutation()
   const ingestContent = trpc.content.ingest.useMutation()
   const addPhoto = trpc.items.addPhoto.useMutation()
+  const addDocument = trpc.items.addDocument.useMutation()
 
   const doSubmit = (values: FormValues, andMore: boolean) => {
     const costNum = values.cost ? Number(values.cost.replace(/[^\d]/g, '')) : undefined
@@ -324,9 +325,27 @@ export default function CreateTool() {
                   isTitle: index === 0,
                 })
               }
+              for (const document of docs) {
+                const dataUrl = await new Promise<string>((resolve, reject) => {
+                  const reader = new FileReader()
+                  reader.onerror = () => reject(reader.error ?? new Error('Не удалось прочитать документ'))
+                  reader.onload = () => resolve(String(reader.result))
+                  reader.readAsDataURL(document.file)
+                })
+                const uploaded = await ingestContent.mutateAsync({ workspaceId: item.workspaceId, dataUrl })
+                await addDocument.mutateAsync({
+                  itemId: item.id,
+                  itemGuid,
+                  documentGuid: crypto.randomUUID(),
+                  name: document.name,
+                  url: uploaded.url,
+                  mime: uploaded.mime,
+                  accessLevel: 'members',
+                })
+              }
             }
           } catch (error) {
-            setToast(error instanceof Error ? `Карточка создана, но фото не добавлено: ${error.message}` : 'Карточка создана, но фото не добавлено')
+            setToast(error instanceof Error ? `Карточка создана, но вложение не добавлено: ${error.message}` : 'Карточка создана, но вложение не добавлено')
           }
           utils.items.list.invalidate()
           utils.items.nextInternalId.invalidate()
@@ -989,7 +1008,7 @@ export default function CreateTool() {
                   className="hidden"
                   onChange={(e) => {
                     const files = Array.from(e.target.files ?? [])
-                    if (files.length) setDocs((p) => [...p, ...files.map((f) => ({ name: f.name, size: f.size }))])
+                    if (files.length) setDocs((p) => [...p, ...files.map((file) => ({ name: file.name, size: file.size, file }))])
                     e.target.value = ''
                   }}
                 />

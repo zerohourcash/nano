@@ -219,6 +219,18 @@ export const itemsRouter = createRouter({
     )
     .mutation(({ input }) => addItemPhoto(input.itemId, input.url, input.isTitle)),
 
+  addDocument: publicQuery
+    .input(z.object({
+      itemId: z.number().int().positive(),
+      itemGuid: z.string().uuid(),
+      documentGuid: z.string().uuid(),
+      name: z.string().min(1).max(200),
+      url: z.string().regex(/^cas:[a-f0-9]{64}$/i),
+      mime: z.string().min(1).max(100),
+      accessLevel: z.enum(['members', 'accounting', 'managers']).default('members'),
+    }))
+    .mutation(async ({ input }) => ({ id: 0, guid: input.documentGuid, ...input, sha256: input.url.slice(4) })),
+
   addComment: publicQuery
     .input(
       z.object({

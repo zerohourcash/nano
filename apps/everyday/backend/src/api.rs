@@ -2176,6 +2176,22 @@ fn photo_checksum(url: &str) -> String {
     hex::encode(Sha256::digest(url.as_bytes()))
 }
 
+fn validate_known_cas(conn: &Connection, value: &str) -> Result<String, ApiError> {
+    let hash = value.strip_prefix("cas:").unwrap_or_default();
+    if hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(ApiError::bad("Некорректная CAS-ссылка"));
+    }
+    let known: i64 = conn.query_row(
+        "SELECT count(*) FROM content_catalog WHERE hash=?1",
+        [hash],
+        |row| row.get(0),
+    )?;
+    if known != 1 {
+        return Err(ApiError::bad("CAS-объект не загружен на эту ноду"));
+    }
+    Ok(hash.to_ascii_lowercase())
+}
+
 fn insert_photo(
     conn: &Connection,
     item_id: i64,
@@ -2233,22 +2249,7 @@ fn items_add_photo_atomic(conn: &Connection, input: &Value, user_id: Option<i64>
             "Сначала загрузите фото через content.ingest; в летопись передаётся только cas:hash",
         ));
     }
-    let validate_cas = |value: &str| -> Result<(), ApiError> {
-        let hash = value.strip_prefix("cas:").unwrap_or_default();
-        if hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-            return Err(ApiError::bad("Некорректная CAS-ссылка"));
-        }
-        let known: i64 = conn.query_row(
-            "SELECT count(*) FROM content_catalog WHERE hash=?1",
-            [hash],
-            |row| row.get(0),
-        )?;
-        if known != 1 {
-            return Err(ApiError::bad("CAS-объект не загружен на эту ноду"));
-        }
-        Ok(())
-    };
-    validate_cas(&url)?;
+    validate_known_cas(conn, &url)?;
     let is_title = b(input, "isTitle").unwrap_or(false);
     let thumb = s(input, "thumbUrl");
     if thumb
@@ -2258,7 +2259,7 @@ fn items_add_photo_atomic(conn: &Connection, input: &Value, user_id: Option<i64>
         return Err(ApiError::bad("thumbUrl должен быть ссылкой cas:hash"));
     }
     if let Some(value) = thumb.as_deref() {
-        validate_cas(value)?;
+        validate_known_cas(conn, value)?;
     }
     let id = insert_photo(
         conn,
@@ -2311,57 +2312,80 @@ fn items_add_document(conn: &mut Connection, input: &Value, user_id: Option<i64>
 fn items_add_document_atomic(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
     let uid = require_user(conn, user_id)?;
     let item_id = i64v(input, "itemId").ok_or_else(|| ApiError::bad("itemId"))?;
-    require_item_access(conn, uid, item_id)?;
-    require_can(conn, uid, "manageDocuments")?;
+    let ws = require_item_access(conn, uid, item_id)?;
+    require_can_in_workspace(conn, uid, ws, "manageDocuments")?;
+    let item_guid = s(input, "itemGuid").ok_or_else(|| ApiError::bad("itemGuid"))?;
+    let expected_item_guid = ledger::guid(conn, "items", item_id)
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    if item_guid != expected_item_guid {
+        return Err(ApiError::bad("itemGuid не соответствует карточке"));
+    }
+    let document_guid = s(input, "documentGuid").ok_or_else(|| ApiError::bad("documentGuid"))?;
+    Uuid::parse_str(&document_guid).map_err(|_| ApiError::bad("Некорректный documentGuid"))?;
     let name = s(input, "name").ok_or_else(|| ApiError::bad("Название документа обязательно"))?;
     if name.chars().count() > 200 {
         return Err(ApiError::bad("Название документа длиннее 200 символов"));
     }
     let source =
-        s(input, "url").ok_or_else(|| ApiError::bad("Содержимое документа обязательно"))?;
+        s(input, "url").ok_or_else(|| ApiError::bad("CAS-ссылка документа обязательна"))?;
+    let checksum = validate_known_cas(conn, &source)?;
     let access = s(input, "accessLevel").unwrap_or_else(|| "members".into());
     if !matches!(access.as_str(), "members" | "accounting" | "managers") {
         return Err(ApiError::bad(
             "accessLevel: members, accounting или managers",
         ));
     }
-    let stored = crate::content::ingest_data_url(conn, &source)
-        .map_err(|error| ApiError::bad(format!("Некорректный документ: {error}")))?
-        .unwrap_or_else(|| source.clone());
-    let checksum = stored
-        .strip_prefix("cas:")
-        .map(str::to_string)
-        .unwrap_or_else(|| photo_checksum(&source));
-    let mime = s(input, "mime").or_else(|| {
-        source
-            .strip_prefix("data:")
-            .and_then(|value| value.split_once(';'))
-            .map(|(mime, _)| mime.to_string())
+    let mime = s(input, "mime").ok_or_else(|| ApiError::bad("MIME документа обязателен"))?;
+    let catalog_mime: String = conn
+        .query_row(
+            "SELECT mime FROM content_catalog WHERE hash=?1",
+            [&checksum],
+            |row| row.get(0),
+        )
+        .map_err(|_| ApiError::bad("Документ отсутствует в локальном CAS"))?;
+    if mime != catalog_mime {
+        return Err(ApiError::bad("MIME документа не совпадает с CAS-каталогом"));
+    }
+    let author_guid =
+        ledger::guid(conn, "users", uid).map_err(|error| ApiError::internal(error.to_string()))?;
+    let commitment = json!({
+        "domain":"everyday/item-document/v1","guid":document_guid,
+        "itemGuid":item_guid,"authorGuid":author_guid,"name":name,
+        "url":source,"mime":mime,"sha256":checksum,"accessLevel":access,
     });
-    let guid = Uuid::new_v4().to_string();
+    let payload_hash = hex::encode(Sha256::digest(
+        serde_json::to_vec(&commitment).expect("JSON serialization"),
+    ));
     conn.execute(
         "INSERT INTO item_documents(item_id,name,url,guid,mime,sha256,author_id,access_level)
          VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
-        params![item_id, name, stored, guid, mime, checksum, uid, access],
+        params![
+            item_id,
+            name,
+            source,
+            document_guid,
+            mime,
+            checksum,
+            uid,
+            access
+        ],
     )?;
-    let item = jsn::item_json(conn, item_id, false)
-        .ok_or_else(|| ApiError::not_found("Инструмент не найден"))?;
-    let ws = item["workspaceId"].as_i64().unwrap_or(1);
     ledger::append(
         conn,
         ws,
         uid,
         Some(item_id),
         "document_add",
-        Some(&guid),
-        Some(&checksum),
+        Some(&document_guid),
+        Some(&payload_hash),
         None,
         Some(&format!("Документ добавлен: {name}; доступ: {access}")),
     )
     .map_err(|error| ApiError::internal(format!("Ошибка журнала: {error}")))?;
     Ok(json!({
-        "id":conn.last_insert_rowid(),"guid":guid,"itemId":item_id,"name":name,
-        "url":source,"mime":mime,"sha256":checksum,"authorId":uid,"accessLevel":access
+        "id":conn.last_insert_rowid(),"guid":document_guid,"itemId":item_id,"name":name,
+        "url":source,"mime":mime,"sha256":checksum,"authorId":uid,"accessLevel":access,
+        "ledgerCommitment":payload_hash
     }))
 }
 
@@ -7625,6 +7649,64 @@ mod tests {
             )
             .unwrap();
         assert_eq!(photos, 1, "фото без Ledger не должно сохраняться");
+        cleanup(conn, path);
+    }
+
+    #[test]
+    fn adding_a_document_is_atomic_cas_backed_and_ledger_bound() {
+        let (mut conn, path, users, ws) = test_db();
+        let item = insert_item(&conn, ws, None, false, None);
+        let item_guid = ledger::guid(&conn, "items", item).unwrap();
+        let uploaded = dispatch(
+            &mut conn,
+            "content.ingest",
+            &json!({"workspaceId":ws,"dataUrl":"data:application/pdf;base64,QUJD"}),
+            Some(users[0]),
+        )
+        .unwrap();
+        let document_guid = Uuid::new_v4().to_string();
+        let added = dispatch(
+            &mut conn,
+            "items.addDocument",
+            &json!({"itemId":item,"itemGuid":item_guid,"documentGuid":document_guid,
+                "name":"manual.pdf","url":uploaded["url"],"mime":uploaded["mime"],
+                "accessLevel":"members"}),
+            Some(users[0]),
+        )
+        .unwrap();
+        assert_eq!(added["guid"], document_guid);
+        assert_eq!(added["ledgerCommitment"].as_str().unwrap().len(), 64);
+        let event: (String, String) = conn
+            .query_row(
+                "SELECT from_label,to_label FROM history_entries WHERE type='document_add' AND item_id=?1",
+                [item],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(event.0, document_guid);
+        assert_eq!(event.1, added["ledgerCommitment"]);
+
+        break_ledger(&conn);
+        let uploaded =
+            crate::content::ingest_data_url(&conn, "data:application/octet-stream;base64,REVG")
+                .unwrap()
+                .unwrap();
+        let failed = dispatch(
+            &mut conn,
+            "items.addDocument",
+            &json!({"itemId":item,"itemGuid":item_guid,"documentGuid":Uuid::new_v4().to_string(),
+                "name":"second.bin","url":uploaded,"mime":"application/octet-stream"}),
+            Some(users[0]),
+        );
+        assert!(failed.is_err());
+        let documents: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM item_documents WHERE item_id=?1",
+                [item],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(documents, 1, "документ без Ledger не должен сохраняться");
         cleanup(conn, path);
     }
 

@@ -121,6 +121,11 @@ test('browser signs a real custody transaction and ledger retains its proof', as
       'base64'
     ),
   });
+  await page.locator('input[type="file"]').nth(2).setInputFiles({
+    name: 'manual.pdf',
+    mimeType: 'application/pdf',
+    buffer: Buffer.from('E2E signed document'),
+  });
   await page.getByRole('button', { name: 'Создать инструмент' }).click();
   await expect(page).toHaveURL(/\/tool\/\d+/, { timeout: 10_000 });
   const itemId = Number(page.url().match(/\/tool\/(\d+)/)?.[1]);
@@ -137,6 +142,7 @@ test('browser signs a real custody transaction and ledger retains its proof', as
   });
 
   const itemAfterTake = await trpc<{
+    documents: Array<{ name: string; url: string; mime?: string }>;
     history: Array<{
       type: string;
       eventVersion?: number;
@@ -156,6 +162,17 @@ test('browser signs a real custody transaction and ledger retains its proof', as
   expect(photoEvent).toMatchObject({ eventVersion: 3 });
   expect(photoEvent?.requestDeviceId).toBeTruthy();
   expect(photoEvent?.requestHash).toMatch(/^[a-f0-9]{64}$/);
+  expect(itemAfterTake.documents).toEqual([
+    expect.objectContaining({
+      name: 'manual.pdf',
+      url: expect.stringMatching(/^data:application\/pdf;base64,/),
+      mime: 'application/pdf',
+    }),
+  ]);
+  const documentEvent = itemAfterTake.history.find(entry => entry.type === 'document_add');
+  expect(documentEvent).toMatchObject({ eventVersion: 3 });
+  expect(documentEvent?.requestDeviceId).toBeTruthy();
+  expect(documentEvent?.requestHash).toMatch(/^[a-f0-9]{64}$/);
 
   await page.goto('/create');
   await page
