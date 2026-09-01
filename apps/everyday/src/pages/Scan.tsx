@@ -9,7 +9,7 @@ import QrScanner from '@/components/QrScanner'
 import { mapItemToCatalogTool } from '@/lib/catalog-item'
 import type { CatalogTool } from '@/lib/catalog-item'
 
-type BasketItem = CatalogTool & { rawId: number }
+type BasketItem = CatalogTool & { rawId: number; qrLabel: string }
 
 export default function Scan() {
   const navigate = useNavigate()
@@ -74,16 +74,22 @@ export default function Scan() {
 
   useEffect(() => {
     if (!itemQ.data) return
+    if (itemQ.data.qrVerification.authenticity !== 'trusted-node') {
+      const frame = requestAnimationFrame(() => {
+        setToast('Для выдачи нужна подписанная QR-бирка V2 — обратитесь к кладовщику')
+      })
+      return () => cancelAnimationFrame(frame)
+    }
     const catalog = mapItemToCatalogTool(itemQ.data)
     const itemId = itemQ.data.id
     const frame = requestAnimationFrame(() => {
       setBasket((prev) => {
         if (prev.some((i) => i.rawId === itemId)) return prev
-        return [...prev, { ...catalog, rawId: itemId }]
+        return [...prev, { ...catalog, rawId: itemId, qrLabel: code ?? '' }]
       })
     })
     return () => cancelAnimationFrame(frame)
-  }, [itemQ.data])
+  }, [code, itemQ.data])
 
   useEffect(() => {
     if (!toast) return
@@ -94,7 +100,7 @@ export default function Scan() {
   const item = itemQ.data
   const last = item ? mapItemToCatalogTool(item) : null
   const isMine = item && currentUser && item.responsibleUserId === currentUser.id
-  const takeIds = basket.map((i) => i.rawId)
+  const scans = basket.map((i) => ({ itemId: i.rawId, qrLabel: i.qrLabel }))
 
   return (
     <div className="mx-auto max-w-lg space-y-4">
@@ -155,7 +161,7 @@ export default function Scan() {
                 setToast('Не понял дату. Формат: 2026-09-01 18:00')
                 return
               }
-              takeMany.mutate({ itemIds: takeIds, dueAt: parsed.iso })
+              takeMany.mutate({ scans, dueAt: parsed.iso })
             }}
             disabled={takeMany.isPending}
             className="inline-flex h-11 w-full items-center justify-center gap-2 rounded-xl bg-accent px-4 text-sm font-semibold text-white hover:bg-accent-hover disabled:opacity-60"

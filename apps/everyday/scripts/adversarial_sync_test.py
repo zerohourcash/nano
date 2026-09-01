@@ -68,7 +68,7 @@ def main() -> int:
         tool = source.call("items.create", {"workspaceId": ws, "title": "Контрольная дрель"})
         source.call(
             "transfers.take",
-            {"itemId": tool["id"], "dueAt": "2026-12-01T12:00:00.000Z"},
+            source.checkout_payload(tool["id"], dueAt="2026-12-01T12:00:00.000Z"),
         )
         message = source.call(
             "chat.send", {"workspaceId": ws, "text": "Контрольное подписанное сообщение"}
@@ -211,8 +211,8 @@ def main() -> int:
         target_tool = item_named(target, target_ws, "Конфликтная пила") or {}
         check("второй участник вошёл на изолированном узле", isinstance(target_login, dict) and "id" in target_login)
 
-        left_take = source.call("transfers.take", {"itemId": conflict_tool["id"]})
-        right_take = target.call("transfers.take", {"itemId": target_tool.get("id")})
+        left_take = source.call("transfers.take", source.checkout_payload(conflict_tool["id"]))
+        right_take = target.call("transfers.take", target.checkout_payload(target_tool.get("id")))
         check(
             "две изолированные ноды независимо подписали выдачу",
             left_take.get("status", {}).get("slug") == "in-work"

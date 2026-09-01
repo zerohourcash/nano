@@ -163,7 +163,7 @@ def main() -> int:
         )
         taken = leaf.call(
             "transfers.take",
-            {"itemId": item.get("id"), "dueAt": "2026-09-30T12:00:00.000Z"},
+            leaf.checkout_payload(item.get("id"), dueAt="2026-09-30T12:00:00.000Z"),
         )
         check(
             "leaf создал подписанные чат и выдачу",

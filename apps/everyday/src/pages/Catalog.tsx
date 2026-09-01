@@ -22,7 +22,6 @@ import {
 import { AnimatePresence, motion } from 'framer-motion'
 import { cn } from '@/lib/utils'
 import { trpc } from '@/providers/trpc'
-import { parseDueInput } from '@/lib/due-date'
 import { mapItemToCatalogTool, type CatalogTool } from '@/lib/catalog-item'
 import { useStore } from '@/lib/store'
 import ToolMiniCard from '@/components/ToolMiniCard'
@@ -196,7 +195,6 @@ export default function Catalog() {
     workspace,
   } = useStore()
 
-  const utils = trpc.useUtils()
   const listQ = trpc.items.list.useQuery(
     { page: 1, limit: FETCH_LIMIT, sort: 'createdAt_desc', workspaceId: workspace?.id },
     { enabled: Boolean(workspace?.id) },
@@ -230,20 +228,6 @@ export default function Catalog() {
   const [visible, setVisible] = useState(PAGE_SIZE)
   const [loading, setLoading] = useState(false)
   const [toast, setToast] = useState<string | null>(null)
-  const takeMany = trpc.transfers.takeMany.useMutation({
-    onSuccess: (res) => {
-      utils.items.list.invalidate()
-      utils.meta.transferCounts.invalidate()
-      const skipped = res.failed.length
-      setToast(
-        skipped
-          ? `Взято ${res.takenCount} шт., не удалось: ${skipped}`
-          : `Взято ${res.takenCount} шт.`,
-      )
-      clearSelection()
-    },
-    onError: (e) => setToast(e.message),
-  })
   const sentinelRef = useRef<HTMLDivElement>(null)
   const searchRef = useRef<HTMLInputElement>(null)
 
@@ -622,23 +606,11 @@ export default function Catalog() {
             </button>
             <div className="flex-1" />
             <button
-              onClick={() => {
-                const ids = [...selectedToolIds].map(Number).filter((n) => Number.isFinite(n) && n > 0)
-                if (!ids.length) return
-                const due = window.prompt('Срок возврата (ГГГГ-ММ-ДД ЧЧ:ММ). Пусто = без срока')
-                if (due === null) return
-                const parsed = parseDueInput(due)
-                if (!parsed.ok) {
-                  window.alert('Не понял дату. Формат: 2026-09-01 18:00')
-                  return
-                }
-                takeMany.mutate({ itemIds: ids, dueAt: parsed.iso })
-              }}
-              disabled={takeMany.isPending}
+              onClick={() => navigate('/scan')}
               className="inline-flex items-center gap-1.5 h-8 px-3.5 rounded-xl bg-accent text-white text-[13px] font-semibold hover:bg-accent-hover active:scale-[0.97] transition disabled:opacity-60"
             >
-              {takeMany.isPending ? <Loader2 size={14} className="animate-spin" /> : <PackageCheck size={14} />}
-              Взять выбранные
+              <PackageCheck size={14} />
+              Выдать по QR
             </button>
             <button
               onClick={() => navigate('/transfers')}

@@ -1,6 +1,6 @@
 """Сценарии ТЗ через HTTP-API узла. Запускать через scripts/smoke_runner.py."""
 
-import copy, http.cookiejar, json, os, subprocess, tempfile, uuid, urllib.error, urllib.parse, urllib.request
+import copy, hashlib, http.cookiejar, json, os, subprocess, tempfile, uuid, urllib.error, urllib.parse, urllib.request
 from device_test_signing import CRITICAL, DeviceSigner
 
 BASE = os.environ.get("MK_BASE", "http://127.0.0.1:8098")
@@ -48,6 +48,12 @@ class Client:
         if "error" in data:
             return {"__err": data["error"]["json"].get("message"), "__code": data["error"]["json"].get("data", {}).get("code")}
         return data["result"]["data"]["json"]
+
+    def checkout_payload(self, item_id, **fields):
+        issued = self.call("items.qrLabel", {"itemId": item_id}, mutation=False)
+        if not isinstance(issued, dict) or not issued.get("label"):
+            raise AssertionError(f"signed QR issuance failed for item {item_id}: {issued}")
+        return {"itemId": item_id, "qrLabel": issued["label"], **fields}
 
 
 def show(label, v):
@@ -244,7 +250,16 @@ check(
     and "DEVICE_SIGNATURE_REQUIRED" in unsigned_take.get("__body", ""),
     str(unsigned_take)[:160],
 )
-take = owner.call("transfers.take", {"itemId": item_id, "dueAt": "2026-09-30T12:00:00.000Z", "purpose": "монтаж"})
+signed_without_scan = owner.call(
+    "transfers.take", {"itemId": item_id, "dueAt": "2026-09-30T12:00:00.000Z"}
+)
+check(
+    "device-signed checkout without QR possession is rejected",
+    "отсканируйте" in signed_without_scan.get("__err", ""),
+    str(signed_without_scan)[:160],
+)
+checkout = owner.checkout_payload(item_id, dueAt="2026-09-30T12:00:00.000Z", purpose="монтаж")
+take = owner.call("transfers.take", checkout)
 show("take", take)
 check("take succeeds", "__err" not in take)
 after = owner.call("items.byId", {"id": item_id}, mutation=False)
@@ -254,12 +269,22 @@ take_event = next(
     {},
 )
 check(
-    "device proof embedded into V2 ledger event",
-    take_event.get("eventVersion") == 2
+    "device proof and QR request embedded into V3 ledger event",
+    take_event.get("eventVersion") == 3
     and take_event.get("requestDeviceId") == owner.signer.device_id
     and bool(take_event.get("requestNonce"))
     and bool(take_event.get("requestHash")),
     str(take_event)[:220],
+)
+check(
+    "exact signed QR digest is exposed without leaking the label body",
+    take_event.get("qrProofs") == [{
+        "itemId": item_id,
+        "version": 2,
+        "sha256": hashlib.sha256(checkout["qrLabel"].encode()).hexdigest(),
+    }]
+    and "requestBody" not in take_event,
+    str(take_event.get("qrProofs"))[:180],
 )
 ret = owner.call("transfers.returnItem", {"itemId": item_id})
 show("return", ret)
@@ -316,6 +341,12 @@ gcreate = guest.call("items.create", {"workspaceId": ws_id, "title": "Левый
 check("viewer cannot create items", gcreate.get("__code") == "FORBIDDEN", str(gcreate)[:160])
 gcreate2 = guest.call("items.create", {"title": "Левый предмет без ws"})
 check("viewer cannot create items without workspaceId", gcreate2.get("__code") == "FORBIDDEN", str(gcreate2)[:160])
+viewer_label = guest.call("items.qrLabel", {"itemId": item_id}, mutation=False)
+check(
+    "viewer cannot download a signed QR instead of possessing the physical label",
+    viewer_label.get("__code") == "FORBIDDEN",
+    str(viewer_label)[:160],
+)
 gtake = guest.call("transfers.take", {"itemId": item_id})
 check("viewer cannot take items", gtake.get("__code") == "FORBIDDEN", str(gtake)[:160])
 
@@ -343,7 +374,7 @@ show("fault", f)
 check("fault reported and ledger-bound", "__err" not in f and bool(f.get("recordHash")) and bool(f.get("ledgerHash")), str(f)[:180])
 st = owner.call("items.byId", {"id": item_id}, mutation=False)
 show("item after fault", {k: st.get(k) for k in ("statusName", "status", "blocked")} if isinstance(st, dict) else st)
-tk2 = owner.call("transfers.take", {"itemId": item_id})
+tk2 = owner.call("transfers.take", owner.checkout_payload(item_id))
 check("faulty item cannot be taken", "__err" in tk2, str(tk2)[:160])
 
 print("\n== 12. Заявка на правку ==")
@@ -428,7 +459,7 @@ held_candidate = owner.call(
     "items.create",
     {"workspaceId": ws_id, "title": "Выданная карточка не удаляется", "storageId": st_id},
 )
-owner.call("transfers.take", {"itemId": held_candidate.get("id")})
+owner.call("transfers.take", owner.checkout_payload(held_candidate.get("id")))
 held_archive = owner.call("items.remove", {"id": held_candidate.get("id")})
 check(
     "issued item cannot be archived",

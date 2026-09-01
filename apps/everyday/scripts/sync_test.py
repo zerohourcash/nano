@@ -149,6 +149,12 @@ class Node:
             return {"__err": data["error"]["json"].get("message")}
         return data["result"]["data"]["json"]
 
+    def checkout_payload(self, item_id: int, **fields):
+        issued = self.call("items.qrLabel", {"itemId": item_id}, mutation=False)
+        if not isinstance(issued, dict) or not issued.get("label"):
+            raise AssertionError(f"signed QR issuance failed for item {item_id}: {issued}")
+        return {"itemId": item_id, "qrLabel": issued["label"], **fields}
+
     def stop(self, cleanup: bool = True) -> None:
         if self.proc.poll() is None:
             self.proc.terminate()
@@ -671,7 +677,7 @@ def main() -> int:
         )
         held_material = node.call(
             "transfers.take",
-            {"itemId": material["id"], "quantity": 4, "dueAt": "2026-09-10T12:00:00Z"},
+            node.checkout_payload(material["id"], quantity=4, dueAt="2026-09-10T12:00:00Z"),
         )
         check(
             "количественная QR-выдача создала локальную custody-проводку",

@@ -1,5 +1,6 @@
 import { expect, test, type Page } from '@playwright/test';
 import { readFile } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
 
 async function trpc<T>(
   page: Page,
@@ -137,6 +138,10 @@ test('browser signs a real custody transaction and ledger retains its proof', as
     .first()
     .click();
   await expect(page.getByText('Взять: Перфоратор E2E')).toBeVisible();
+  const itemQr = await trpc<{ label: string }>(page, 'items.qrLabel', { itemId }, false);
+  await page.getByPlaceholder('Или вставьте ссылку / токен').fill(itemQr.label);
+  await page.getByRole('button', { name: 'Далее' }).click();
+  await expect(page.getByText('QR получен и будет проверен сервером')).toBeVisible();
   await page.getByRole('checkbox').last().check();
   await page.getByRole('button', { name: 'Взять', exact: true }).last().click();
   await expect(page.getByText('Инструмент теперь у вас')).toBeVisible({
@@ -151,15 +156,21 @@ test('browser signs a real custody transaction and ledger retains its proof', as
       requestDeviceId?: string;
       requestNonce?: string;
       requestHash?: string;
+      qrProofs?: Array<{ itemId: number; version: number; sha256: string }>;
     }>;
   }>(page, 'items.byId', { id: itemId }, false);
   const event = itemAfterTake.history.find(
     entry => entry.type === 'transfer_receive'
   );
-  expect(event).toMatchObject({ eventVersion: 2 });
+  expect(event).toMatchObject({ eventVersion: 3 });
   expect(event?.requestDeviceId).toBeTruthy();
   expect(event?.requestNonce).toBeTruthy();
   expect(event?.requestHash).toMatch(/^[a-f0-9]{64}$/);
+  expect(event?.qrProofs).toEqual([{
+    itemId,
+    version: 2,
+    sha256: createHash('sha256').update(itemQr.label).digest('hex'),
+  }]);
   const photoEvent = itemAfterTake.history.find(entry => entry.type === 'photo_add');
   expect(photoEvent).toMatchObject({ eventVersion: 3 });
   expect(photoEvent?.requestDeviceId).toBeTruthy();
@@ -212,8 +223,16 @@ test('browser signs a real custody transaction and ledger retains its proof', as
   await manualCode.fill(`everyday:item:${qrItem.guid}`);
   await page.getByRole('button', { name: 'Далее' }).click();
   await expect(
-    page.getByText('Шуруповёрт QR E2E', { exact: true }).first()
+    page.getByText(/Шуруповёрт QR E2E · ВН-\d+ · на складе/)
   ).toBeVisible();
+  await expect(page.getByText('Для выдачи нужна подписанная QR-бирка V2 — обратитесь к кладовщику')).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Взять все (1)' })).toHaveCount(0);
+  await page.locator('input[type="file"]').setInputFiles({
+    name: 'signed-tool-qr.png',
+    mimeType: 'image/png',
+    buffer: qrPng,
+  });
+  await expect(page.getByRole('button', { name: 'Взять все (1)' })).toBeVisible();
   page.once('dialog', dialog => dialog.accept(''));
   await page.getByRole('button', { name: 'Взять все (1)' }).click();
   await expect(page.getByText('Взято 1 шт.')).toBeVisible({ timeout: 10_000 });
@@ -224,15 +243,19 @@ test('browser signs a real custody transaction and ledger retains its proof', as
       eventVersion?: number;
       requestDeviceId?: string;
       requestHash?: string;
+      qrProofs?: Array<{ itemId: number; version: number; sha256: string }>;
     }>;
   }>(page, 'items.byId', { id: qrItem.id }, false);
   const qrEvent = qrItemAfterTake.history.find(
     entry => entry.type === 'transfer_receive'
   );
   expect(qrItemAfterTake.responsibleUserId).toBeTruthy();
-  expect(qrEvent).toMatchObject({ eventVersion: 2 });
+  expect(qrEvent).toMatchObject({ eventVersion: 3 });
   expect(qrEvent?.requestDeviceId).toBeTruthy();
   expect(qrEvent?.requestHash).toMatch(/^[a-f0-9]{64}$/);
+  expect(qrEvent?.qrProofs).toHaveLength(1);
+  expect(qrEvent?.qrProofs?.[0]).toMatchObject({ itemId: qrItem.id, version: 2 });
+  expect(qrEvent?.qrProofs?.[0].sha256).toMatch(/^[a-f0-9]{64}$/);
 
   const inventorySite = await trpc<{ id: number }>(page, 'admin.buildingSites.create', {
     workspaceId: workspaces[0].id,
@@ -361,7 +384,8 @@ test('browser signs a real custody transaction and ledger retains its proof', as
     quantity: 10,
     unit: 'шт.',
   });
-  await trpc(page, 'transfers.take', { itemId: offeredItem.id, quantity: 6 });
+  const offeredQr = await trpc(page, 'items.qrLabel', { itemId: offeredItem.id }, false) as { label: string };
+  await trpc(page, 'transfers.take', { itemId: offeredItem.id, qrLabel: offeredQr.label, quantity: 6 });
   await page.goto('/bit');
   await expect(page.getByRole('heading', { name: 'Кошелёк Bit' })).toBeVisible();
   await page.getByRole('button', { name: 'Эмиссия' }).click();

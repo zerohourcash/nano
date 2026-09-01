@@ -274,6 +274,7 @@ export const transfersRouter = createRouter({
     .input(
       z.object({
         itemId: z.number().int().positive(),
+        qrLabel: z.string().min(1).max(2048),
         comment: z.string().optional(),
         dueAt: z.string().optional(),
         photoUrl: z.string().optional(),
@@ -288,7 +289,10 @@ export const transfersRouter = createRouter({
   takeMany: publicQuery
     .input(
       z.object({
-        itemIds: z.array(z.number().int().positive()).min(1).max(50),
+        scans: z.array(z.object({
+          itemId: z.number().int().positive(),
+          qrLabel: z.string().min(1).max(2048),
+        })).min(1).max(50),
         comment: z.string().optional(),
         dueAt: z.string().optional(),
       }),
@@ -297,7 +301,7 @@ export const transfersRouter = createRouter({
       const me = await requireMe(ctx);
       const taken: number[] = [];
       const failed: Array<{ itemId: number; message: string }> = [];
-      for (const itemId of input.itemIds) {
+      for (const { itemId } of input.scans) {
         try {
           await takeItemForUser(me, itemId, input.comment);
           taken.push(itemId);

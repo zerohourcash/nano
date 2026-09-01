@@ -47,6 +47,7 @@ import { askStatusReason, itemCirculates, statusNeedsReason } from '@/lib/status
 import { parseDueInput, toDateTimeLocal } from '@/lib/due-date'
 import { preparePhoto } from '@/lib/photo'
 import { useStore } from '@/lib/store'
+import QrScanner from '@/components/QrScanner'
 
 // ─── Утилиты ─────────────────────────────────────────────────────────────────
 
@@ -835,6 +836,7 @@ function TakeModal({
   const [comment, setComment] = useState('')
   const [noDue, setNoDue] = useState(false)
   const [photoUrl, setPhotoUrl] = useState<string | undefined>()
+  const [qrLabel, setQrLabel] = useState('')
   const maxQty = item.quantitative
     ? Math.max(1, Number(item.quantity ?? 1))
     : Math.max(1, Number((item as { family?: { inStock?: number } }).family?.inStock ?? 1))
@@ -856,6 +858,7 @@ function TakeModal({
       onDone(pending ? 'Заявка отправлена администратору' : 'Инструмент теперь у вас')
       onClose()
       setComment('')
+      setQrLabel('')
     },
     onError: (e) => onDone(e.message),
   })
@@ -863,6 +866,13 @@ function TakeModal({
   return (
     <Modal open={open} onClose={onClose} title={`Взять: ${item.title}`}>
       <div className="space-y-4">
+        <div>
+          <p className="mb-2 text-[13px] font-semibold text-ink-500">
+            Обязательно отсканируйте подписанную QR-бирку на самом оборудовании
+          </p>
+          <QrScanner onCode={(value) => setQrLabel(value.trim())} />
+          {qrLabel && <p className="mt-2 text-xs font-semibold text-success">QR получен и будет проверен сервером</p>}
+        </div>
         <label className="flex items-center gap-2 text-sm font-semibold text-ink-900">
           <input type="checkbox" checked={noDue} onChange={(e) => setNoDue(e.target.checked)} />
           Без срока возврата
@@ -928,7 +938,7 @@ function TakeModal({
         <div className="flex justify-end gap-2">
           <SecondaryButton onClick={onClose}>Отмена</SecondaryButton>
           <PrimaryButton
-            disabled={take.isPending}
+            disabled={take.isPending || !qrLabel}
             onClick={() => {
               let dueAt: string | undefined
               if (!noDue) {
@@ -941,6 +951,7 @@ function TakeModal({
               }
               take.mutate({
                 itemId: item.id,
+                qrLabel,
                 comment: comment || undefined,
                 dueAt,
                 photoUrl,

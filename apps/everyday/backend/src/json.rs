@@ -1,5 +1,50 @@
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Map, Value};
+use sha2::{Digest, Sha256};
+
+fn checkout_qr_proofs(request_body: Option<&str>, history_item_id: i64) -> Vec<Value> {
+    let Some(input) = request_body
+        .and_then(|body| serde_json::from_str::<Value>(body).ok())
+        .and_then(|body| {
+            body.get("0")
+                .and_then(|value| value.get("json"))
+                .or_else(|| body.get("json"))
+                .cloned()
+        })
+    else {
+        return Vec::new();
+    };
+    let proof = |item_id: Option<i64>, label: Option<&str>| {
+        label
+            .filter(|value| value.starts_with("everyday:item:v2:"))
+            .map(|value| {
+                json!({
+                    "itemId":item_id,
+                    "version":2,
+                    "sha256":format!("{:x}", Sha256::digest(value.as_bytes()))
+                })
+            })
+    };
+    let single_item_id = input.get("itemId").and_then(Value::as_i64);
+    if single_item_id == Some(history_item_id) {
+        if let Some(value) = proof(single_item_id, input.get("qrLabel").and_then(Value::as_str)) {
+            return vec![value];
+        }
+    }
+    input
+        .get("scans")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|scan| scan.get("itemId").and_then(Value::as_i64) == Some(history_item_id))
+        .filter_map(|scan| {
+            proof(
+                scan.get("itemId").and_then(Value::as_i64),
+                scan.get("qrLabel").and_then(Value::as_str),
+            )
+        })
+        .collect()
+}
 
 pub fn rights_value(raw: Option<String>) -> Value {
     raw.and_then(|s| serde_json::from_str(&s).ok())
@@ -367,7 +412,7 @@ fn item_comments(conn: &Connection, item_id: i64) -> Vec<Value> {
 pub fn item_history(conn: &Connection, item_id: i64) -> Vec<Value> {
     let mut stmt = conn
         .prepare(
-            "SELECT id, workspace_id, item_id, type, actor_user_id, from_label, to_label, quantity_delta, comment, hash, created_at, photo_url,event_version,request_device_id,request_nonce,request_hash
+            "SELECT id, workspace_id, item_id, type, actor_user_id, from_label, to_label, quantity_delta, comment, hash, created_at, photo_url,event_version,request_device_id,request_nonce,request_hash,request_body
              FROM history_entries WHERE item_id=?1 ORDER BY id DESC LIMIT 500",
         )
         .unwrap();
@@ -391,6 +436,10 @@ pub fn item_history(conn: &Connection, item_id: i64) -> Vec<Value> {
             "requestDeviceId": r.get::<_, Option<String>>(13)?,
             "requestNonce": r.get::<_, Option<String>>(14)?,
             "requestHash": r.get::<_, Option<String>>(15)?,
+            "qrProofs": checkout_qr_proofs(
+                r.get::<_, Option<String>>(16)?.as_deref(),
+                item_id.unwrap_or_default(),
+            ),
             "actor": user_public(conn, actor).unwrap_or(Value::Null),
             "item": item_id.and_then(|i| item_json(conn, i, false)).unwrap_or(Value::Null)
         }))

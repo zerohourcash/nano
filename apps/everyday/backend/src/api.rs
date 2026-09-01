@@ -489,6 +489,7 @@ fn required_right(procedure: &str) -> Option<&'static str> {
     } else if matches!(
         procedure,
         "items.update"
+            | "items.qrLabel"
             | "items.addPhoto"
             | "history.move"
             | "items.resolveFault"
@@ -1790,6 +1791,34 @@ fn items_qr_label(conn: &Connection, input: &Value, user_id: Option<i64>) -> Api
     Ok(json!({"label":label,"version":2,"algorithm":"Ed25519","cloneResistant":false}))
 }
 
+fn verify_checkout_qr(
+    conn: &Connection,
+    item_id: i64,
+    label: Option<String>,
+) -> Result<(), ApiError> {
+    let label = label.ok_or_else(|| {
+        ApiError::bad("Перед выдачей отсканируйте подписанный QR V2 на оборудовании")
+    })?;
+    if !label.trim().starts_with("everyday:item:v2:") {
+        return Err(ApiError::bad(
+            "Для выдачи требуется подписанная QR-бирка V2; старую бирку перепечатайте",
+        ));
+    }
+    let verified = crate::qr_label::verify(conn, &label)
+        .map_err(|error| ApiError::bad(format!("QR выдачи отклонён: {error}")))?;
+    let item_guid: Option<String> = conn
+        .query_row(
+            "SELECT guid FROM items WHERE id=?1 AND archived=0",
+            [item_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if item_guid.as_deref() != Some(verified.item_guid.as_str()) {
+        return Err(ApiError::bad("QR относится к другому оборудованию"));
+    }
+    Ok(())
+}
+
 fn items_next_id(conn: &Connection, input: &Value) -> ApiResult {
     let ws = i64v(input, "workspaceId").unwrap_or_else(|| ws_fallback(conn));
     let prefix: String = conn
@@ -2882,55 +2911,15 @@ fn take_one_atomic(
 fn transfers_take(conn: &mut Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
     let uid = require_user(conn, user_id)?;
     let id = i64v(input, "itemId").ok_or_else(|| ApiError::bad("itemId"))?;
+    verify_checkout_qr(conn, id, s(input, "qrLabel"))?;
     let qty = f64v(input, "quantity");
     let item = jsn::item_json(conn, id, false)
         .ok_or_else(|| ApiError::not_found("Инструмент не найден"))?;
     let want = qty.unwrap_or(1.0).max(1.0);
     if !item["quantitative"].as_bool().unwrap_or(false) && want > 1.0 {
-        let mut taken = Vec::new();
-        let mut failed = Vec::new();
-        match take_one(
-            conn,
-            uid,
-            id,
-            s(input, "comment").as_deref(),
-            s(input, "dueAt").as_deref(),
-            s(input, "photoUrl").as_deref(),
-            None,
-        ) {
-            Ok(_) => taken.push(id),
-            Err(e) => failed.push(json!({"itemId": id, "message": e.message})),
-        }
-        if let Some(members) = item
-            .get("family")
-            .and_then(|f| f.get("members"))
-            .and_then(|v| v.as_array())
-        {
-            for m in members {
-                if taken.len() as f64 >= want {
-                    break;
-                }
-                let sid = m.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
-                if sid == id || m.get("inStock").and_then(|v| v.as_bool()) != Some(true) {
-                    continue;
-                }
-                match take_one(
-                    conn,
-                    uid,
-                    sid,
-                    s(input, "comment").as_deref(),
-                    s(input, "dueAt").as_deref(),
-                    s(input, "photoUrl").as_deref(),
-                    None,
-                ) {
-                    Ok(_) => taken.push(sid),
-                    Err(e) => failed.push(json!({"itemId": sid, "message": e.message})),
-                }
-            }
-        }
-        return Ok(
-            json!({"takenCount": taken.len(), "taken": taken, "failed": failed, "itemId": id}),
-        );
+        return Err(ApiError::bad(
+            "Каждую поштучную единицу нужно отсканировать отдельно",
+        ));
     }
     take_one(
         conn,
@@ -2945,11 +2934,20 @@ fn transfers_take(conn: &mut Connection, input: &Value, user_id: Option<i64>) ->
 
 fn transfers_take_many(conn: &mut Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
     let uid = require_user(conn, user_id)?;
-    let ids = g(input, "itemIds").as_array().cloned().unwrap_or_default();
+    let scans = g(input, "scans").as_array().cloned().unwrap_or_default();
+    if scans.is_empty() {
+        return Err(ApiError::bad(
+            "Перед выдачей отсканируйте подписанные QR V2",
+        ));
+    }
     let mut taken = Vec::new();
     let mut failed = Vec::new();
-    for v in ids {
-        let id = v.as_i64().unwrap_or(0);
+    for scan in scans {
+        let id = i64v(&scan, "itemId").unwrap_or(0);
+        if let Err(error) = verify_checkout_qr(conn, id, s(&scan, "qrLabel")) {
+            failed.push(json!({"itemId":id,"message":error.message}));
+            continue;
+        }
         match take_one(
             conn,
             uid,
@@ -7528,6 +7526,36 @@ mod tests {
         conn.last_insert_rowid()
     }
 
+    fn checkout_input(conn: &Connection, item_id: i64) -> Value {
+        json!({
+            "itemId": item_id,
+            "qrLabel": crate::qr_label::issue(conn, item_id).unwrap()
+        })
+    }
+
+    fn checkout_quantity_input(conn: &Connection, item_id: i64, quantity: f64) -> Value {
+        json!({
+            "itemId": item_id,
+            "quantity": quantity,
+            "qrLabel": crate::qr_label::issue(conn, item_id).unwrap()
+        })
+    }
+
+    fn dispatch_checkout(conn: &mut Connection, item_id: i64, user_id: i64) -> ApiResult {
+        let input = checkout_input(conn, item_id);
+        dispatch(conn, "transfers.take", &input, Some(user_id))
+    }
+
+    fn dispatch_checkout_quantity(
+        conn: &mut Connection,
+        item_id: i64,
+        quantity: f64,
+        user_id: i64,
+    ) -> ApiResult {
+        let input = checkout_quantity_input(conn, item_id, quantity);
+        dispatch(conn, "transfers.take", &input, Some(user_id))
+    }
+
     /// Делает запись в журнал невозможной, чтобы проверить откат мутации.
     fn break_ledger(conn: &Connection) {
         conn.execute_batch(
@@ -7751,21 +7779,9 @@ mod tests {
         assert_eq!(signed_fields["scopeRefGuid"], "site-a");
         assert_eq!(signed_fields["blockTransfers"], true);
 
-        let blocked = dispatch(
-            &mut conn,
-            "transfers.take",
-            &json!({"itemId":in_scope}),
-            Some(users[0]),
-        )
-        .unwrap_err();
+        let blocked = dispatch_checkout(&mut conn, in_scope, users[0]).unwrap_err();
         assert_eq!(blocked.http, 409);
-        dispatch(
-            &mut conn,
-            "transfers.take",
-            &json!({"itemId":outside}),
-            Some(users[0]),
-        )
-        .unwrap();
+        dispatch_checkout(&mut conn, outside, users[0]).unwrap();
         dispatch(
             &mut conn,
             "inventory.complete",
@@ -7845,13 +7861,7 @@ mod tests {
         assert_eq!(warning["cryptographicValid"], true);
         assert_eq!(warning["trustedKey"], false);
         assert_eq!(warning["verdict"], "untrusted_key");
-        dispatch(
-            &mut conn,
-            "transfers.take",
-            &json!({"itemId":in_scope}),
-            Some(users[0]),
-        )
-        .unwrap();
+        dispatch_checkout(&mut conn, in_scope, users[0]).unwrap();
         conn.execute(
             "UPDATE inventory_sessions SET status='in_progress',completed_at=NULL WHERE id=?1",
             [session["id"].as_i64().unwrap()],
@@ -8072,6 +8082,33 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(malformed.http, 400);
+        let without_scan = dispatch(
+            &mut conn,
+            "transfers.take",
+            &json!({"itemId":own}),
+            Some(users[0]),
+        )
+        .unwrap_err();
+        assert_eq!(without_scan.http, 400);
+        assert!(without_scan.message.contains("отсканируйте"));
+        let wrong_item_label = crate::qr_label::issue(&conn, foreign).unwrap();
+        let wrong_item = dispatch(
+            &mut conn,
+            "transfers.take",
+            &json!({"itemId":own,"qrLabel":wrong_item_label}),
+            Some(users[0]),
+        )
+        .unwrap_err();
+        assert_eq!(wrong_item.http, 400);
+        assert!(wrong_item.message.contains("другому оборудованию"));
+        let checked_out = dispatch(
+            &mut conn,
+            "transfers.take",
+            &json!({"itemId":own,"qrLabel":signed_label}),
+            Some(users[0]),
+        )
+        .unwrap();
+        assert_eq!(checked_out["responsibleUserId"], users[0]);
         cleanup(conn, path);
     }
 
@@ -8185,13 +8222,7 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(create.http, 403);
-        let take = dispatch(
-            &mut conn,
-            "transfers.take",
-            &json!({"itemId": item}),
-            Some(viewer),
-        )
-        .unwrap_err();
+        let take = dispatch_checkout(&mut conn, item, viewer).unwrap_err();
         assert_eq!(take.http, 403);
         cleanup(conn, path);
     }
@@ -8327,13 +8358,7 @@ mod tests {
             Some(users[0]),
         )
         .unwrap();
-        let taken = dispatch(
-            &mut conn,
-            "transfers.take",
-            &json!({"itemId": item["id"].as_i64().unwrap()}),
-            Some(users[0]),
-        )
-        .unwrap();
+        let taken = dispatch_checkout(&mut conn, item["id"].as_i64().unwrap(), users[0]).unwrap();
         assert_eq!(taken["status"]["slug"].as_str(), Some("in-work"));
         cleanup(conn, path);
     }
@@ -8364,13 +8389,7 @@ mod tests {
     fn quantity_return_adds_stock_back_and_journals_it() {
         let (mut conn, path, users, ws) = test_db();
         let item_id = insert_item(&conn, ws, None, true, Some(10.0));
-        dispatch(
-            &mut conn,
-            "transfers.take",
-            &json!({"itemId": item_id, "quantity": 4.0}),
-            Some(users[1]),
-        )
-        .unwrap();
+        dispatch_checkout_quantity(&mut conn, item_id, 4.0, users[1]).unwrap();
         let after_take: f64 = conn
             .query_row(
                 "SELECT quantity FROM items WHERE id=?1",
@@ -8424,13 +8443,7 @@ mod tests {
     fn quantitative_direct_transfer_moves_holding_without_charging_stock_twice() {
         let (mut conn, path, users, ws) = test_db();
         let item = insert_item(&conn, ws, None, true, Some(10.0));
-        dispatch(
-            &mut conn,
-            "transfers.take",
-            &json!({"itemId":item,"quantity":4.0}),
-            Some(users[0]),
-        )
-        .unwrap();
+        dispatch_checkout_quantity(&mut conn, item, 4.0, users[0]).unwrap();
         let transfer = dispatch(
             &mut conn,
             "transfers.prepare",
@@ -8631,13 +8644,7 @@ mod tests {
             .unwrap();
         assert_eq!(slug, "needs-check");
 
-        let blocked = dispatch(
-            &mut conn,
-            "transfers.take",
-            &json!({"itemId": item}),
-            Some(users[1]),
-        )
-        .unwrap_err();
+        let blocked = dispatch_checkout(&mut conn, item, users[1]).unwrap_err();
         assert_eq!(blocked.http, 400);
 
         let journaled: i64 = conn
@@ -8768,13 +8775,7 @@ mod tests {
         let (mut conn, path, users, ws) = test_db();
         seed_workspace_defaults(&conn, ws, users[0]).unwrap();
         let item = insert_item(&conn, ws, None, false, None);
-        dispatch(
-            &mut conn,
-            "transfers.take",
-            &json!({"itemId": item}),
-            Some(users[1]),
-        )
-        .unwrap();
+        dispatch_checkout(&mut conn, item, users[1]).unwrap();
 
         // Себя удалить нельзя.
         let self_remove = dispatch(

@@ -83,6 +83,10 @@ fn should_retain_request_body(path: &str, body: &[u8]) -> bool {
             path,
             "/api/trpc/items.addPhoto" | "/api/trpc/items.addDocument"
         )
+        || (matches!(
+            path,
+            "/api/trpc/transfers.take" | "/api/trpc/transfers.takeMany"
+        ) && body.len() <= 128 * 1024)
         || (path.starts_with("/api/trpc/interorg.") && body.len() <= 64 * 1024)
         || (path == "/api/trpc/bit.offer" && body.len() <= 16 * 1024)
         || (path == "/api/trpc/knowledge.save" && is_compact_knowledge_intent(body))
@@ -421,12 +425,13 @@ mod tests {
         )
         .unwrap();
         let path = "/api/trpc/transfers.take";
-        let body = br#"{"itemId":42}"#;
+        let body = br#"{"0":{"json":{"itemId":42,"qrLabel":"everyday:item:v2:signed"}}}"#;
         let headers = signed_headers(&key, "phone-device-0001", path, body, "unique-nonce-0001");
         let proof = verify_request(&db, 7, path, body, &headers).unwrap();
-        assert!(
-            proof.request_body.is_none(),
-            "обычные и потенциально секретные запросы не должны попадать в переносимый Ledger body"
+        assert_eq!(
+            proof.request_body.as_deref(),
+            std::str::from_utf8(body).ok(),
+            "QR possession proof должен оставаться в проверяемом V3 Ledger body"
         );
         assert!(verify_request(&db, 7, path, body, &headers).is_err());
 

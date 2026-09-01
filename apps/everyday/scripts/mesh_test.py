@@ -172,7 +172,7 @@ def main() -> int:
 
         taken = c.call(
             "transfers.take",
-            {"itemId": created_c["id"], "dueAt": "2026-09-30T12:00:00.000Z"},
+            c.checkout_payload(created_c["id"], dueAt="2026-09-30T12:00:00.000Z"),
         )
         check(
             "C подписал локальную выдачу со статусом «В работе»",
@@ -220,7 +220,7 @@ def main() -> int:
         check("B принимает операции при полной потере сети", isinstance(created_b, dict) and "id" in created_b)
         delayed_take = b.call(
             "transfers.take",
-            {"itemId": created_b["id"], "dueAt": "2026-10-31T12:00:00.000Z"},
+            b.checkout_payload(created_b["id"], dueAt="2026-10-31T12:00:00.000Z"),
         )
         check(
             "отложенная выдача подписана и сохранена локально",

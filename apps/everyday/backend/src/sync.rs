@@ -8060,10 +8060,10 @@ mod tests {
         let target = crate::db::open(&target_path).unwrap();
         let rejected = crate::db::open(&rejected_path).unwrap();
         let now = chrono::Utc::now().to_rfc3339();
-        source.execute("INSERT INTO workspaces(name,internal_id_prefix,created_at,guid) VALUES('Org','O-',?1,'custody-workspace')",[&now]).unwrap();
+        source.execute("INSERT INTO workspaces(name,internal_id_prefix,created_at,guid) VALUES('Org','O-',?1,'00000000-0000-4000-8000-000000000400')",[&now]).unwrap();
         let workspace = source.last_insert_rowid();
         crate::db::ensure_workspace_statuses(&source, workspace).unwrap();
-        source.execute("INSERT INTO users(full_name,phone,status,created_at,guid) VALUES('Worker','+70000000401','active',?1,'custody-worker')",[&now]).unwrap();
+        source.execute("INSERT INTO users(full_name,phone,status,created_at,guid) VALUES('Worker','+70000000401','active',?1,'00000000-0000-4000-8000-000000000401')",[&now]).unwrap();
         let worker = source.last_insert_rowid();
         source
             .execute(
@@ -8081,7 +8081,7 @@ mod tests {
             .unwrap();
         source.execute(
             "INSERT INTO items(internal_id,title,status_id,workspace_id,quantitative,quantity,created_at,guid)
-             VALUES('MAT-1','Кабель',?1,?2,1,10,?3,'custody-item')",
+             VALUES('MAT-1','Кабель',?1,?2,1,10,?3,'00000000-0000-4000-8000-000000000402')",
             params![status,workspace,now],
         ).unwrap();
         let item = source.last_insert_rowid();
@@ -8098,10 +8098,11 @@ mod tests {
         .unwrap();
         let proof = signed_device_proof(&key, device_id, "/api/trpc/transfers.take");
         crate::device::set_pending(&source, worker, &proof).unwrap();
+        let checkout_qr = crate::qr_label::issue(&source, item).unwrap();
         crate::api::dispatch(
             &mut source,
             "transfers.take",
-            &json!({"itemId":item,"quantity":4.0,"dueAt":"2026-09-10T12:00:00Z"}),
+            &json!({"itemId":item,"qrLabel":checkout_qr,"quantity":4.0,"dueAt":"2026-09-10T12:00:00Z"}),
             Some(worker),
         )
         .unwrap();
@@ -8112,7 +8113,7 @@ mod tests {
         assert_eq!(result["ok"], true, "{result}");
         let restored: f64 = target.query_row(
             "SELECT COALESCE(SUM(h.quantity),0) FROM item_holdings h JOIN items i ON i.id=h.item_id
-             WHERE i.guid='custody-item' AND h.returned_at IS NULL",
+             WHERE i.guid='00000000-0000-4000-8000-000000000402' AND h.returned_at IS NULL",
             [],
             |row| row.get(0),
         ).unwrap();
@@ -8197,7 +8198,7 @@ mod tests {
             let mut statement = target.prepare(
                 "SELECT u.guid,SUM(h.quantity) FROM item_holdings h
                  JOIN items i ON i.id=h.item_id JOIN users u ON u.id=h.user_id
-                 WHERE i.guid='custody-item' AND h.returned_at IS NULL GROUP BY u.guid ORDER BY u.guid",
+                 WHERE i.guid='00000000-0000-4000-8000-000000000402' AND h.returned_at IS NULL GROUP BY u.guid ORDER BY u.guid",
             ).unwrap();
             statement
                 .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
@@ -8208,8 +8209,8 @@ mod tests {
         assert_eq!(
             balances,
             vec![
-                ("custody-receiver".into(), 3.0),
-                ("custody-worker".into(), 1.0)
+                ("00000000-0000-4000-8000-000000000401".into(), 1.0),
+                ("custody-receiver".into(), 3.0)
             ]
         );
 
@@ -8220,7 +8221,7 @@ mod tests {
             .iter_mut()
             .find(|entry| entry["userGuid"] == "custody-receiver")
             .unwrap();
-        record["userGuid"] = Value::String("custody-worker".into());
+        record["userGuid"] = Value::String("00000000-0000-4000-8000-000000000401".into());
         record["entryHash"] = Value::String(custody_entry_hash(
             record["workspaceGuid"].as_str().unwrap(),
             record["itemGuid"].as_str().unwrap(),
@@ -9641,9 +9642,9 @@ mod tests {
         let mut target = crate::db::open(&target_path).unwrap();
         let rejected = crate::db::open(&rejected_path).unwrap();
         let created = chrono::Utc::now().to_rfc3339();
-        source.execute("INSERT INTO workspaces(name,internal_id_prefix,created_at,guid) VALUES('Item org','I-',?1,'item-state-workspace')",[&created]).unwrap();
+        source.execute("INSERT INTO workspaces(name,internal_id_prefix,created_at,guid) VALUES('Item org','I-',?1,'00000000-0000-4000-8000-000000000088')",[&created]).unwrap();
         let workspace = source.last_insert_rowid();
-        source.execute("INSERT INTO users(full_name,phone,status,role_rights,created_at,guid) VALUES('Owner','+70000000088','active',?1,?2,'item-state-owner')",params![crate::db::owner_rights().to_string(),created]).unwrap();
+        source.execute("INSERT INTO users(full_name,phone,status,role_rights,created_at,guid) VALUES('Owner','+70000000088','active',?1,?2,'00000000-0000-4000-8000-000000000089')",params![crate::db::owner_rights().to_string(),created]).unwrap();
         let owner = source.last_insert_rowid();
         source
             .execute(
@@ -9665,10 +9666,12 @@ mod tests {
             &signed_device_proof(&key, device, "/api/trpc/transfers.take"),
         )
         .unwrap();
+        let checkout_qr =
+            crate::qr_label::issue(&source, created_item["id"].as_i64().unwrap()).unwrap();
         crate::api::dispatch(
             &mut source,
             "transfers.take",
-            &json!({"itemId":created_item["id"],"quantity":4}),
+            &json!({"itemId":created_item["id"],"qrLabel":checkout_qr,"quantity":4}),
             Some(owner),
         )
         .unwrap();
@@ -9687,7 +9690,8 @@ mod tests {
         let repeated = apply_remote_journal(&target, &export_journal(&source), "");
         assert_eq!(repeated["ok"], true, "{repeated}");
         assert_eq!(target.query_row("SELECT COALESCE(sum(h.quantity),0) FROM item_holdings h JOIN items i ON i.id=h.item_id WHERE i.guid=?1 AND h.returned_at IS NULL",[&item_guid],|r|r.get::<_,f64>(0)).unwrap(),4.0);
-        let target_owner = id_by_guid(&target, "users", "item-state-owner").unwrap();
+        let target_owner =
+            id_by_guid(&target, "users", "00000000-0000-4000-8000-000000000089").unwrap();
         let target_item = id_by_guid(&target, "items", &item_guid).unwrap();
         crate::device::set_pending(
             &source,
