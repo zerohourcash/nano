@@ -127,20 +127,25 @@ export default function Knowledge() {
 
   const onSubmit = async (event: FormEvent) => {
     event.preventDefault()
-    if (!workspace || !title.trim() || !slug.trim()) return
+    if (!workspace?.guid || !title.trim() || !slug.trim()) return
     try {
       const compactAttachments = await Promise.all(attachments.map(async ({ name, url, mime }) => {
         if (!url.startsWith('data:')) return { name, url, ...(mime ? { mime } : {}) }
         const uploaded = await ingestContent.mutateAsync({ workspaceId: workspace.id, dataUrl: url })
         return { name, url: uploaded.url, mime: uploaded.mime }
       }))
+      const normalizedSlug = slugify(slug)
+      const editingCurrentPage = page?.slug === normalizedSlug
       save.mutate({
         workspaceId: workspace.id,
+        workspaceGuid: workspace.guid,
         title: title.trim(),
-        slug: slugify(slug),
+        slug: normalizedSlug,
         content,
         visibility,
-        parentRevisionGuid: page?.slug === slugify(slug) ? page.currentRevisionGuid ?? undefined : undefined,
+        pageGuid: editingCurrentPage ? page.guid : crypto.randomUUID(),
+        revisionGuid: crypto.randomUUID(),
+        parentRevisionGuid: editingCurrentPage ? page.currentRevisionGuid ?? undefined : undefined,
         attachments: compactAttachments,
       })
     } catch (error) {

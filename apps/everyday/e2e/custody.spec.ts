@@ -275,13 +275,20 @@ test('browser signs a real custody transaction and ledger retains its proof', as
   const forgedBundle = structuredClone(transportBundle);
   forgedBundle.ciphertext = `${forgedBundle.ciphertext.startsWith('A') ? 'B' : 'A'}${forgedBundle.ciphertext.slice(1)}`;
 
-  const integrity = await trpc<{ healthy: boolean; photoError?: string | null }>(
+  const integrity = await trpc<{
+    healthy: boolean;
+    photoError?: string | null;
+    documentIntentVerified?: boolean;
+    knowledgeIntentVerified?: boolean;
+  }>(
     page,
     'sync.audit',
     null,
     false
   );
   expect(integrity.healthy, JSON.stringify(integrity)).toBe(true);
+  expect(integrity.documentIntentVerified).toBe(true);
+  expect(integrity.knowledgeIntentVerified).toBe(true);
 
   await page.goto('/admin');
   await page.getByRole('button', { name: 'Пространства', exact: true }).click();

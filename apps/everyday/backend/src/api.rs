@@ -4246,6 +4246,13 @@ fn knowledge_save(conn: &mut Connection, input: &Value, user_id: Option<i64>) ->
         let ws = i64v(input, "workspaceId").unwrap_or_else(|| ws_fallback(conn));
         require_can_in_workspace(conn, uid, ws, "editKnowledge")?;
         db::fill_guids(conn).map_err(|e| ApiError::internal(e.to_string()))?;
+        if let Some(requested) = s(input, "workspaceGuid") {
+            let expected = ledger::guid(conn, "workspaces", ws)
+                .map_err(|error| ApiError::internal(error.to_string()))?;
+            if requested != expected {
+                return Err(ApiError::bad("workspaceGuid не соответствует организации"));
+            }
+        }
         let slug = s(input, "slug").ok_or_else(|| ApiError::bad("slug"))?;
         let title = s(input, "title").ok_or_else(|| ApiError::bad("title"))?;
         let content = s(input, "content").unwrap_or_default();
@@ -4260,6 +4267,8 @@ fn knowledge_save(conn: &mut Connection, input: &Value, user_id: Option<i64>) ->
             &visibility,
             s(input, "parentRevisionGuid").as_deref(),
             input.get("attachments").unwrap_or(&Value::Null),
+            s(input, "pageGuid").as_deref(),
+            s(input, "revisionGuid").as_deref(),
         )
         .map_err(|e| ApiError::bad(e.to_string()))?;
         let page_guid = page["guid"]

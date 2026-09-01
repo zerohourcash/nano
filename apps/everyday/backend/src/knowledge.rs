@@ -62,6 +62,8 @@ pub fn save(
     visibility: &str,
     parent: Option<&str>,
     attachments: &Value,
+    requested_page_guid: Option<&str>,
+    requested_revision_guid: Option<&str>,
 ) -> anyhow::Result<Value> {
     if slug.is_empty()
         || slug.len() > 120
@@ -80,13 +82,30 @@ pub fn save(
     if !matches!(visibility, "members" | "accounting" | "managers") {
         bail!("некорректная видимость")
     }
-    let page_guid = conn
+    for (label, guid) in [
+        ("pageGuid", requested_page_guid),
+        ("revisionGuid", requested_revision_guid),
+    ] {
+        if let Some(guid) = guid {
+            uuid::Uuid::parse_str(guid).map_err(|_| anyhow!("некорректный {label}"))?;
+        }
+    }
+    let existing_page_guid = conn
         .query_row(
             "SELECT guid FROM knowledge_pages WHERE workspace_id=?1 AND slug=?2",
             params![workspace, slug],
             |r| r.get::<_, String>(0),
         )
-        .unwrap_or_else(|_| uuid::Uuid::new_v4().to_string());
+        .ok();
+    if let (Some(existing), Some(requested)) = (existing_page_guid.as_deref(), requested_page_guid)
+    {
+        if existing != requested {
+            bail!("pageGuid не соответствует существующей странице")
+        }
+    }
+    let page_guid = existing_page_guid
+        .or_else(|| requested_page_guid.map(str::to_string))
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     conn.execute("INSERT INTO knowledge_pages(guid,workspace_id,slug,title,visibility,created_at) VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(workspace_id,slug) DO UPDATE SET title=excluded.title,visibility=excluded.visibility",params![page_guid,workspace,slug,title,visibility,chrono::Utc::now().to_rfc3339()])?;
     let current: Option<String> = conn
         .query_row(
@@ -111,7 +130,9 @@ pub fn save(
     }
     let attachments = normalize_attachments(conn, attachments)?;
     let created = chrono::Utc::now().to_rfc3339();
-    let guid = uuid::Uuid::new_v4().to_string();
+    let guid = requested_revision_guid
+        .map(str::to_string)
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let author_guid = user_guid(conn, author)?;
     let ws_guid = workspace_guid(conn, workspace)?;
     let revision_hash = digest(&[
@@ -174,8 +195,44 @@ pub fn export(conn: &Connection) -> Value {
     let mut pages = Vec::new();
     if let Ok(mut s)=conn.prepare("SELECT p.guid,w.guid,p.slug,p.title,p.visibility,p.created_at FROM knowledge_pages p JOIN workspaces w ON w.id=p.workspace_id ORDER BY p.guid"){if let Ok(rows)=s.query_map([],|r|Ok(json!({"guid":r.get::<_,String>(0)?,"workspaceGuid":r.get::<_,String>(1)?,"slug":r.get::<_,String>(2)?,"title":r.get::<_,String>(3)?,"visibility":r.get::<_,String>(4)?,"createdAt":r.get::<_,String>(5)?}))){pages.extend(rows.flatten())}}
     let mut revisions = Vec::new();
-    if let Ok(mut s)=conn.prepare("SELECT r.guid,r.page_guid,r.parent_guid,u.guid,r.title,r.visibility,r.content,r.attachments_json,r.revision_hash,r.created_at FROM knowledge_revisions r JOIN users u ON u.id=r.author_user_id ORDER BY r.revision_hash"){if let Ok(rows)=s.query_map([],|r|Ok(json!({"guid":r.get::<_,String>(0)?,"pageGuid":r.get::<_,String>(1)?,"parentGuid":r.get::<_,Option<String>>(2)? ,"authorGuid":r.get::<_,String>(3)?,"title":r.get::<_,String>(4)?,"visibility":r.get::<_,String>(5)?,"content":r.get::<_,String>(6)?,"attachments":serde_json::from_str::<Value>(&r.get::<_,String>(7)?).unwrap_or_else(|_|json!([])),"revisionHash":r.get::<_,String>(8)?,"createdAt":r.get::<_,String>(9)?}))){revisions.extend(rows.flatten())}}
-    json!({"pages":pages,"revisions":revisions})
+    if let Ok(mut statement) = conn.prepare(
+        "SELECT r.guid,w.guid,r.page_guid,p.slug,r.parent_guid,u.guid,r.title,r.visibility,
+                r.content,r.attachments_json,r.revision_hash,r.created_at,
+                (SELECT h.hash FROM history_entries h
+                 WHERE h.type='knowledge_revision' AND h.from_label=r.page_guid
+                   AND h.to_label=r.revision_hash AND h.event_version=3
+                   AND h.request_body IS NOT NULL ORDER BY h.id DESC LIMIT 1)
+                ,(SELECT h.request_body FROM history_entries h
+                 WHERE h.type='knowledge_revision' AND h.from_label=r.page_guid
+                   AND h.to_label=r.revision_hash AND h.event_version=3
+                   AND h.request_body IS NOT NULL ORDER BY h.id DESC LIMIT 1)
+         FROM knowledge_revisions r JOIN users u ON u.id=r.author_user_id
+         JOIN knowledge_pages p ON p.guid=r.page_guid
+         JOIN workspaces w ON w.id=p.workspace_id ORDER BY r.revision_hash",
+    ) {
+        if let Ok(rows) = statement.query_map([], |row| {
+            let hash = row.get::<_, Option<String>>(12)?;
+            let body = row.get::<_, Option<String>>(13)?.unwrap_or_default();
+            let ledger_hash = (body.contains("workspaceGuid")
+                && body.contains("pageGuid")
+                && body.contains("revisionGuid"))
+            .then_some(hash)
+            .flatten();
+            Ok(json!({
+                "guid":row.get::<_,String>(0)?,"workspaceGuid":row.get::<_,String>(1)?,
+                "pageGuid":row.get::<_,String>(2)?,"slug":row.get::<_,String>(3)?,
+                "parentGuid":row.get::<_,Option<String>>(4)?,"authorGuid":row.get::<_,String>(5)?,
+                "title":row.get::<_,String>(6)?,"visibility":row.get::<_,String>(7)?,
+                "content":row.get::<_,String>(8)?,
+                "attachments":serde_json::from_str::<Value>(&row.get::<_,String>(9)?).unwrap_or_else(|_|json!([])),
+                "revisionHash":row.get::<_,String>(10)?,"createdAt":row.get::<_,String>(11)?,
+                "ledgerHash":ledger_hash,
+            }))
+        }) {
+            revisions.extend(rows.flatten())
+        }
+    }
+    json!({"intentMode":"device-signed-with-explicit-legacy/v1","pages":pages,"revisions":revisions})
 }
 
 pub fn import(conn: &Connection, value: &Value) -> anyhow::Result<()> {

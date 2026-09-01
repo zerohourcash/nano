@@ -231,6 +231,11 @@ capability, затем применяют только её scope. Неверн�
   либо незавершённом blob. Браузерные формы ТМЦ и wiki используют двухфазный
   `content.ingest`: подписанная предметная транзакция содержит `cas:sha256`, а
   не base64 файла.
+- Новые wiki-ревизии используют клиентские `workspaceGuid`, `pageGuid` и
+  `revisionGuid`. Ledger V3 сохраняет компактное signed request body, а import
+  до доверия к ноде сравнивает с ним slug, заголовок, текст, ACL, parent и все
+  CAS-вложения. Старые ревизии остаются явно legacy и не получают ложной
+  атрибуции пользовательского intent.
 - Файловый transport bundle v2 не раскрывает journal посреднику: используется
   XChaCha20-Poly1305 с новым 192-битным nonce, фиксированным AAD и ключом
   HKDF-SHA256, доменно отделённым от bearer/CAS. Wrong-key и tampering
