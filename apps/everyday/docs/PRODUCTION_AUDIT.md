@@ -5,6 +5,16 @@
 по себе не считается доказательством сетевого требования: для P2P используются
 отдельные процессы и отдельные SQLite-базы.
 
+Последний единый запуск `npm run release:candidate:audit` завершён без ошибок:
+production HTTP/Chromium, offline sync, mesh/discovery, adversarial,
+multi-tenant capability, interorg AEAD, spam, constrained-MTU transport,
+mobile restart, SQLCipher, backup/restore, 100 отдельных процессов и Android
+APK. Debug APK содержит Rust JNI-ноду для `arm64-v8a` и `x86_64`, размер
+75 589 676 байт, SHA-256
+`02c21b9dea7a20b2d261d5bfec43eb3bd3acdc844f22bf3707c0a4bad61fa04e`.
+Это воспроизводимое программное доказательство; BLE RF на двух физических
+телефонах и независимый криптографический аудит остаются внешними release-gate.
+
 | Требование | Реализация | Исполняемое доказательство | Статус |
 | --- | --- | --- | --- |
 | Обязательная подписанная выдача по QR | tenant-bound QR V2 обязателен в single/bulk API; сервер проверяет Ed25519 node-proof, организацию, item binding и tenant-scoped доверие signer key, полученное только после принятого подписанного журнала этой организации. Глобального одобрения ноды недостаточно для бирки другого tenant; revoke атомарно удаляет её QR scopes. Legacy запрещён, каждая штучная единица сканируется отдельно. Точное тело коммитится device-proof в Ledger V3, публичная история раскрывает только SHA-256 QR proof; выпуск бирки требует `editItems`. Append-only custody детерминированно восстанавливает holdings, ответственного, статус и срок; две положительные offline-ветви дают `needs-check`, а не произвольного владельца из snapshot. Физический клон подлинной бирки криптографически не обнаружим | `npm run smoke` проверяет no-QR/wrong/tamper/ACL/digest; Playwright декодирует реальный PNG и выдаёт через UI; `npm run sync:test` выполняет offline join, QR-выдачу при остановленном owner и обратную сходимость; `npm run capability:test` доказывает разные QR key scopes на двух scoped peers; Rust отвергает ключ, разрешённый только соседней организации, и подмену custody state | Проверено |
