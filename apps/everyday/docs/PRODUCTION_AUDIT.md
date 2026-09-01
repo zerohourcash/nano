@@ -8,6 +8,7 @@
 | Требование | Реализация | Исполняемое доказательство | Статус |
 | --- | --- | --- | --- |
 | Подписанная выдача по QR | canonical `everyday:item:<UUID>`, Ed25519 device-proof, Ledger V2, append-only custody commitment и восстановление holdings | `npm run test:e2e`, `npm run sync:test`, Rust QR/custody tamper tests | Проверено |
+| Прямая передача | двухфазные sender prepare / recipient accept; custody debit+credit только после подтверждения, без повторного списания склада | Rust direct-transfer/forged-recipient tests, `npm run adversarial:test` | Проверено |
 | Работа без интернета | локальные Rust/SQLite/PWA, операции не требуют peer | `npm run mesh:test`, `npm run mobile:node:test` | Проверено |
 | Догон после разрыва | account-chain frontier, идемпотентный store-and-forward | `npm run mesh:test`, `npm run sync:test` | Проверено |
 | Конфликты/двойная выдача | обе ветви сохраняются, предмет → `needs-check` | `npm run adversarial:test` | Проверено |

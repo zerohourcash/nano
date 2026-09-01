@@ -116,11 +116,19 @@ fn migrate(conn: &Connection) -> Result<()> {
         [],
     );
     let _ = conn.execute("ALTER TABLE transfers ADD COLUMN photo_url TEXT", []);
-    let _ = conn.execute("ALTER TABLE history_entries ADD COLUMN photo_url TEXT", []);
     let _ = conn.execute(
-        "ALTER TABLE item_holdings ADD COLUMN sync_rebuilt INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE transfers ADD COLUMN prepare_ledger_hash TEXT",
         [],
     );
+    let _ = conn.execute(
+        "ALTER TABLE transfers ADD COLUMN accept_ledger_hash TEXT",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE transfers ADD COLUMN source_custody INTEGER NOT NULL DEFAULT 0",
+        [],
+    );
+    let _ = conn.execute("ALTER TABLE history_entries ADD COLUMN photo_url TEXT", []);
     // ТЗ §5: у вложения есть уменьшенная копия и контрольная сумма.
     let _ = conn.execute("ALTER TABLE item_photos ADD COLUMN thumb_url TEXT", []);
     let _ = conn.execute("ALTER TABLE item_photos ADD COLUMN sha256 TEXT", []);
@@ -421,6 +429,10 @@ fn migrate(conn: &Connection) -> Result<()> {
           WHERE source_system IS NOT NULL AND external_id IS NOT NULL;
         "#,
     )?;
+    let _ = conn.execute(
+        "ALTER TABLE item_holdings ADD COLUMN sync_rebuilt INTEGER NOT NULL DEFAULT 0",
+        [],
+    );
     let _ = conn.execute("ALTER TABLE chat_messages ADD COLUMN guid TEXT", []);
     let _ = conn.execute("ALTER TABLE chat_messages ADD COLUMN ledger_hash TEXT", []);
     conn.execute_batch(

@@ -2582,6 +2582,7 @@ struct CustodyLedgerEvidence {
     workspace_guid: String,
     item_guid: String,
     actor_guid: String,
+    to_label: Option<String>,
     operation: String,
     quantity: Option<f64>,
     created_at: String,
@@ -2616,6 +2617,10 @@ fn custody_ledger_evidence(
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_owned(),
+            to_label: event
+                .get("toLabel")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
             operation: event
                 .get("type")
                 .and_then(Value::as_str)
@@ -2641,7 +2646,7 @@ fn custody_ledger_evidence(
         });
     }
     conn.query_row(
-        "SELECT w.guid,i.guid,u.guid,h.type,h.quantity_delta,h.created_at,
+        "SELECT w.guid,i.guid,u.guid,h.to_label,h.type,h.quantity_delta,h.created_at,
                 h.request_device_id IS NOT NULL AND h.request_device_id!='' AND
                 h.request_public_key IS NOT NULL AND h.request_public_key!='' AND
                 h.request_nonce IS NOT NULL AND h.request_nonce!='' AND
@@ -2657,10 +2662,11 @@ fn custody_ledger_evidence(
                 workspace_guid: row.get(0)?,
                 item_guid: row.get(1)?,
                 actor_guid: row.get(2)?,
-                operation: row.get(3)?,
-                quantity: row.get(4)?,
-                created_at: row.get(5)?,
-                has_device_proof: row.get::<_, i64>(6)? != 0,
+                to_label: row.get(3)?,
+                operation: row.get(4)?,
+                quantity: row.get(5)?,
+                created_at: row.get(6)?,
+                has_device_proof: row.get::<_, i64>(7)? != 0,
             })
         },
     )
@@ -2743,9 +2749,11 @@ fn verify_custody_records(conn: &Connection, journal: &Value) -> anyhow::Result<
             .quantity
             .map(|quantity| (quantity.abs() - delta.abs()).abs() < 1e-9)
             .unwrap_or_else(|| (delta.abs() - 1.0).abs() < 1e-9);
+        let actor_matches = evidence.actor_guid == user
+            || (delta > 0.0 && evidence.to_label.as_deref() == Some(user));
         if evidence.workspace_guid != workspace
             || evidence.item_guid != item
-            || evidence.actor_guid != user
+            || !actor_matches
             || evidence.operation != expected_type
             || evidence.created_at != created_at
             || !quantity_matches
@@ -2804,9 +2812,11 @@ fn verify_stored_custody(conn: &Connection) -> anyhow::Result<usize> {
             .quantity
             .map(|quantity| (quantity.abs() - delta.abs()).abs() < 1e-9)
             .unwrap_or_else(|| (delta.abs() - 1.0).abs() < 1e-9);
+        let actor_matches = evidence.actor_guid == user
+            || (delta > 0.0 && evidence.to_label.as_deref() == Some(user.as_str()));
         if evidence.workspace_guid != workspace
             || evidence.item_guid != item
-            || evidence.actor_guid != user
+            || !actor_matches
             || evidence.operation != expected
             || evidence.created_at != created
             || !quantity_matches
@@ -3738,6 +3748,95 @@ mod tests {
                 .unwrap(),
             0
         );
+
+        source.execute("INSERT INTO users(full_name,phone,status,created_at,guid) VALUES('Receiver','+70000000402','active',?1,'custody-receiver')",[&now]).unwrap();
+        let receiver = source.last_insert_rowid();
+        source
+            .execute(
+                "INSERT INTO user_workspaces(user_id,workspace_id,rights_json) VALUES(?1,?2,?3)",
+                params![receiver, workspace, crate::db::default_rights().to_string()],
+            )
+            .unwrap();
+        record_membership_version(&source, workspace, receiver, true, None, true).unwrap();
+        let receiver_key = SigningKey::generate(&mut OsRng);
+        let receiver_device = "custody-receiver-device-0002";
+        crate::device::register(
+            &source,
+            receiver,
+            &json!({
+                "deviceId":receiver_device,"name":"Телефон получателя",
+                "publicKey":URL_SAFE_NO_PAD.encode(receiver_key.verifying_key().to_bytes())
+            }),
+        )
+        .unwrap();
+        let prepare_proof = signed_device_proof(&key, device_id, "/api/trpc/transfers.prepare");
+        crate::device::set_pending(&source, worker, &prepare_proof).unwrap();
+        let transfer = crate::api::dispatch(
+            &mut source,
+            "transfers.prepare",
+            &json!({"itemId":item,"toUserId":receiver,"quantity":3.0}),
+            Some(worker),
+        )
+        .unwrap();
+        let accept_proof =
+            signed_device_proof(&receiver_key, receiver_device, "/api/trpc/transfers.accept");
+        crate::device::set_pending(&source, receiver, &accept_proof).unwrap();
+        crate::api::dispatch(
+            &mut source,
+            "transfers.accept",
+            &json!({"id":transfer["id"]}),
+            Some(receiver),
+        )
+        .unwrap();
+        let direct = export_journal(&source);
+        let result = apply_remote_journal(&target, &direct, "");
+        assert_eq!(result["ok"], true, "{result}");
+        let balances: Vec<(String, f64)> = {
+            let mut statement = target.prepare(
+                "SELECT u.guid,SUM(h.quantity) FROM item_holdings h
+                 JOIN items i ON i.id=h.item_id JOIN users u ON u.id=h.user_id
+                 WHERE i.guid='custody-item' AND h.returned_at IS NULL GROUP BY u.guid ORDER BY u.guid",
+            ).unwrap();
+            statement
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .flatten()
+                .collect()
+        };
+        assert_eq!(
+            balances,
+            vec![
+                ("custody-receiver".into(), 3.0),
+                ("custody-worker".into(), 1.0)
+            ]
+        );
+
+        let mut wrong_recipient = direct.clone();
+        let record = wrong_recipient["custody"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|entry| entry["userGuid"] == "custody-receiver")
+            .unwrap();
+        record["userGuid"] = Value::String("custody-worker".into());
+        record["entryHash"] = Value::String(custody_entry_hash(
+            record["workspaceGuid"].as_str().unwrap(),
+            record["itemGuid"].as_str().unwrap(),
+            record["userGuid"].as_str().unwrap(),
+            record["quantityDelta"].as_f64().unwrap(),
+            record["dueAt"].as_str(),
+            record["comment"].as_str(),
+            record["photoUrl"].as_str(),
+            record["ledgerHash"].as_str().unwrap(),
+            record["createdAt"].as_str().unwrap(),
+        ));
+        ledger::sign_journal(&source, &mut wrong_recipient).unwrap();
+        let result = apply_remote_journal(&rejected, &wrong_recipient, "");
+        assert_eq!(result["ok"], false);
+        assert!(result["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("semantically bound"));
 
         drop((source, target, rejected));
         for path in [source_path, target_path, rejected_path] {

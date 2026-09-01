@@ -2630,6 +2630,31 @@ fn transfers_prepare_atomic(conn: &Connection, input: &Value, user_id: Option<i6
             "Передать инструмент может только ответственный сотрудник",
         ));
     }
+    let quantity = f64v(input, "quantity");
+    let source_custody = if item["quantitative"].as_bool().unwrap_or(false) {
+        let quantity = quantity
+            .filter(|value| value.is_finite() && *value > 0.0)
+            .ok_or_else(|| ApiError::bad("Для материала укажите количество"))?;
+        let held: f64 = conn
+            .query_row(
+                "SELECT COALESCE(SUM(quantity),0) FROM item_holdings
+             WHERE item_id=?1 AND user_id=?2 AND returned_at IS NULL",
+                params![item_id, uid],
+                |row| row.get(0),
+            )
+            .unwrap_or(0.0);
+        if held > 1e-9 && held + 1e-9 < quantity {
+            return Err(ApiError::bad(
+                "У отправителя недостаточно выданного материала",
+            ));
+        }
+        if held <= 1e-9 && item["quantity"].as_f64().unwrap_or(0.0) + 1e-9 < quantity {
+            return Err(ApiError::bad("На складе недостаточно материала"));
+        }
+        held >= quantity - 1e-9
+    } else {
+        item["responsibleUserId"].as_i64() == Some(uid)
+    };
     let status = if b(input, "asDraft").unwrap_or(false) {
         "draft"
     } else {
@@ -2637,23 +2662,31 @@ fn transfers_prepare_atomic(conn: &Connection, input: &Value, user_id: Option<i6
     };
     let code = next_transfer_code(conn, ws);
     conn.execute(
-        "INSERT INTO transfers (code, item_id, from_user_id, to_user_id, to_storage_id, building_site_id, workspace_id, quantity, status, comment, no_confirmation, created_at)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
-        params![code, item_id, uid, to, i64v(input,"toStorageId"), i64v(input,"buildingSiteId"), ws, f64v(input,"quantity"), status, s(input,"comment"), b(input,"noConfirmation").unwrap_or(false) as i64, now()],
+        "INSERT INTO transfers (code, item_id, from_user_id, to_user_id, to_storage_id, building_site_id, workspace_id, quantity, status, comment, no_confirmation,source_custody,created_at)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+        params![code, item_id, uid, to, i64v(input,"toStorageId"), i64v(input,"buildingSiteId"), ws, quantity, status, s(input,"comment"), b(input,"noConfirmation").unwrap_or(false) as i64,source_custody as i64,now()],
     )?;
     let tid = conn.last_insert_rowid();
-    ledger::append(
+    let from_guid = ledger::guid(conn, "users", uid)
+        .map_err(|error| ApiError::internal(format!("Ошибка GUID отправителя: {error}")))?;
+    let to_guid = ledger::guid(conn, "users", to)
+        .map_err(|error| ApiError::internal(format!("Ошибка GUID получателя: {error}")))?;
+    let event = ledger::append(
         conn,
         ws,
         uid,
         Some(item_id),
         "transfer_send",
-        None,
-        None,
-        None,
+        Some(&from_guid),
+        Some(&to_guid),
+        quantity,
         Some(&format!("Передача {code} оформлена")),
     )
     .map_err(|e| ApiError::internal(format!("Ошибка журнала: {e}")))?;
+    conn.execute(
+        "UPDATE transfers SET prepare_ledger_hash=?1 WHERE id=?2",
+        params![event["opId"].as_str(), tid],
+    )?;
     if to != uid {
         let title = item["title"].as_str().unwrap_or("");
         let from_name = jsn::user_public(conn, uid)
@@ -2692,10 +2725,10 @@ fn transfers_accept_atomic(
         .as_i64()
         .ok_or_else(|| ApiError::bad("Некорректная передача"))?;
     require_member(conn, uid, ws)?;
-    let needs_admin: bool = conn.query_row(
-        "SELECT needs_admin != 0 FROM transfers WHERE id=?1",
+    let (needs_admin, source_custody, prepare_ledger_hash): (bool, bool, Option<String>) = conn.query_row(
+        "SELECT needs_admin != 0,source_custody != 0,prepare_ledger_hash FROM transfers WHERE id=?1",
         params![id],
-        |row| row.get(0),
+        |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
     )?;
     if needs_admin {
         require_can(conn, uid, "manageUsers")?;
@@ -2726,12 +2759,38 @@ fn transfers_accept_atomic(
                 .as_f64()
                 .filter(|q| *q > 0.0)
                 .ok_or_else(|| ApiError::bad("В передаче не указано количество"))?;
-            let changed = conn.execute(
-                "UPDATE items SET quantity=quantity-?1 WHERE id=?2 AND quantity>=?1",
-                params![quantity, item_id],
-            )?;
-            if changed != 1 {
-                return Err(ApiError::conflict("Недостаточное количество на складе"));
+            if source_custody {
+                let held: f64 = conn
+                    .query_row(
+                        "SELECT COALESCE(SUM(quantity),0) FROM item_holdings
+                     WHERE item_id=?1 AND user_id=?2 AND returned_at IS NULL",
+                        params![item_id, t["fromUserId"].as_i64()],
+                        |row| row.get(0),
+                    )
+                    .unwrap_or(0.0);
+                if held + 1e-9 < quantity {
+                    return Err(ApiError::conflict(
+                        "Выданная партия отправителя уже изменилась",
+                    ));
+                }
+                conn.execute(
+                    "UPDATE item_holdings SET returned_at=?1 WHERE item_id=?2 AND user_id=?3 AND returned_at IS NULL",
+                    params![now(),item_id,t["fromUserId"].as_i64()],
+                )?;
+                if quantity + 1e-9 < held {
+                    conn.execute(
+                        "INSERT INTO item_holdings(item_id,user_id,quantity,created_at) VALUES(?1,?2,?3,?4)",
+                        params![item_id,t["fromUserId"].as_i64(),held-quantity,now()],
+                    )?;
+                }
+            } else {
+                let changed = conn.execute(
+                    "UPDATE items SET quantity=quantity-?1 WHERE id=?2 AND quantity>=?1",
+                    params![quantity, item_id],
+                )?;
+                if changed != 1 {
+                    return Err(ApiError::conflict("Недостаточное количество на складе"));
+                }
             }
             conn.execute(
                 "INSERT INTO item_holdings (item_id, user_id, quantity, created_at) VALUES (?1,?2,?3,?4)",
@@ -2742,14 +2801,28 @@ fn transfers_accept_atomic(
                 params![t["toUserId"].as_i64(), t["toStorageId"].as_i64(), t["buildingSiteId"].as_i64(), item_id])?;
         }
     }
-    ledger::append(
+    let from_user = t["fromUserId"].as_i64();
+    let to_user = t["toUserId"].as_i64();
+    let from_guid = from_user
+        .map(|user| ledger::guid(conn, "users", user))
+        .transpose()
+        .map_err(|error| ApiError::internal(format!("Ошибка GUID отправителя: {error}")))?;
+    let to_guid = to_user
+        .map(|user| ledger::guid(conn, "users", user))
+        .transpose()
+        .map_err(|error| ApiError::internal(format!("Ошибка GUID получателя: {error}")))?;
+    let event = ledger::append(
         conn,
         ws,
         uid,
         t["itemId"].as_i64(),
-        "transfer_receive",
-        None,
-        None,
+        if accept {
+            "transfer_receive"
+        } else {
+            "transfer_reject"
+        },
+        from_guid.as_deref(),
+        to_guid.as_deref(),
         t["quantity"].as_f64(),
         Some(if accept {
             "Принята"
@@ -2758,6 +2831,54 @@ fn transfers_accept_atomic(
         }),
     )
     .map_err(|e| ApiError::internal(format!("Ошибка журнала: {e}")))?;
+    conn.execute(
+        "UPDATE transfers SET accept_ledger_hash=?1 WHERE id=?2",
+        params![event["opId"].as_str(), id],
+    )?;
+    if accept {
+        let item_id = t["itemId"]
+            .as_i64()
+            .ok_or_else(|| ApiError::bad("В передаче нет инструмента"))?;
+        let quantity = t["quantity"].as_f64().unwrap_or(1.0);
+        let recipient = to_user.ok_or_else(|| ApiError::bad("В передаче нет получателя"))?;
+        if source_custody {
+            let sender = from_user.ok_or_else(|| ApiError::bad("В передаче нет отправителя"))?;
+            let prepare_hash = prepare_ledger_hash
+                .as_deref()
+                .ok_or_else(|| ApiError::bad("Передача не связана с намерением отправителя"))?;
+            let prepare_created: String = conn
+                .query_row(
+                    "SELECT created_at FROM history_entries WHERE hash=?1",
+                    [prepare_hash],
+                    |row| row.get(0),
+                )
+                .map_err(|_| ApiError::bad("Не найдено намерение отправителя"))?;
+            crate::sync::record_custody_entry(
+                conn,
+                ws,
+                item_id,
+                sender,
+                -quantity,
+                None,
+                t["comment"].as_str(),
+                None,
+                &json!({"opId":prepare_hash,"createdAt":prepare_created}),
+            )
+            .map_err(|error| ApiError::internal(format!("Ошибка custody отправителя: {error}")))?;
+        }
+        crate::sync::record_custody_entry(
+            conn,
+            ws,
+            item_id,
+            recipient,
+            quantity,
+            None,
+            t["comment"].as_str(),
+            None,
+            &event,
+        )
+        .map_err(|error| ApiError::internal(format!("Ошибка custody получателя: {error}")))?;
+    }
     jsn::transfer_json(conn, id).ok_or_else(|| ApiError::bad("ошибка"))
 }
 
@@ -5621,6 +5742,63 @@ mod tests {
         assert_eq!(custody_entries, 2);
         assert_eq!(linked, 2);
         assert!(custody_balance.abs() < 1e-9);
+        cleanup(conn, path);
+    }
+
+    #[test]
+    fn quantitative_direct_transfer_moves_holding_without_charging_stock_twice() {
+        let (mut conn, path, users, ws) = test_db();
+        let item = insert_item(&conn, ws, None, true, Some(10.0));
+        dispatch(
+            &mut conn,
+            "transfers.take",
+            &json!({"itemId":item,"quantity":4.0}),
+            Some(users[0]),
+        )
+        .unwrap();
+        let transfer = dispatch(
+            &mut conn,
+            "transfers.prepare",
+            &json!({"itemId":item,"toUserId":users[1],"quantity":3.0}),
+            Some(users[0]),
+        )
+        .unwrap();
+        dispatch(
+            &mut conn,
+            "transfers.accept",
+            &json!({"id":transfer["id"]}),
+            Some(users[1]),
+        )
+        .unwrap();
+        let stock: f64 = conn
+            .query_row("SELECT quantity FROM items WHERE id=?1", [item], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let held = |user: i64| -> f64 {
+            conn.query_row(
+                "SELECT COALESCE(SUM(quantity),0) FROM item_holdings
+                 WHERE item_id=?1 AND user_id=?2 AND returned_at IS NULL",
+                params![item, user],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert!((stock - 6.0).abs() < 1e-9, "stock charged twice: {stock}");
+        assert!((held(users[0]) - 1.0).abs() < 1e-9);
+        assert!((held(users[1]) - 3.0).abs() < 1e-9);
+        let (sender_delta, recipient_delta): (f64, f64) = conn
+            .query_row(
+                "SELECT
+                   COALESCE(SUM(CASE WHEN user_guid=(SELECT guid FROM users WHERE id=?1) THEN quantity_delta ELSE 0 END),0),
+                   COALESCE(SUM(CASE WHEN user_guid=(SELECT guid FROM users WHERE id=?2) THEN quantity_delta ELSE 0 END),0)
+                 FROM custody_entries WHERE item_guid=(SELECT guid FROM items WHERE id=?3)",
+                params![users[0],users[1],item],
+                |row| Ok((row.get(0)?,row.get(1)?)),
+            )
+            .unwrap();
+        assert!((sender_delta - 1.0).abs() < 1e-9);
+        assert!((recipient_delta - 3.0).abs() < 1e-9);
         cleanup(conn, path);
     }
 
