@@ -5115,6 +5115,80 @@ fn verify_stock_operation_records(journal: &Value) -> anyhow::Result<(usize, usi
         }
         verified += 1;
     }
+
+    // The ledger must also determine the portable current location. Otherwise a
+    // trusted node could keep the exact signed move event but rewrite only the
+    // denormalized item snapshot. A later signed master-state version is allowed
+    // to supersede the move and is already checked by verify_item_state_versions.
+    for item in journal
+        .get("items")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let Some(item_guid) = item.get("guid").and_then(Value::as_str) else {
+            continue;
+        };
+        let latest_master = journal
+            .get("itemStateVersions")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|record| record.get("itemGuid").and_then(Value::as_str) == Some(item_guid))
+            .max_by_key(|record| {
+                (
+                    record.get("depth").and_then(Value::as_i64).unwrap_or(-1),
+                    record
+                        .get("versionHash")
+                        .and_then(Value::as_str)
+                        .unwrap_or(""),
+                )
+            })
+            .and_then(|record| record.get("updatedAt").and_then(Value::as_str));
+        let latest_move = journal
+            .get("history")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|event| {
+                event.get("type").and_then(Value::as_str) == Some("move")
+                    && event.get("eventVersion").and_then(Value::as_i64) == Some(3)
+                    && event.get("itemGuid").and_then(Value::as_str) == Some(item_guid)
+            })
+            .max_by_key(|event| {
+                (
+                    event.get("createdAt").and_then(Value::as_str).unwrap_or(""),
+                    event.get("opId").and_then(Value::as_str).unwrap_or(""),
+                )
+            });
+        let Some(movement) = latest_move else {
+            continue;
+        };
+        let moved_at = movement
+            .get("createdAt")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if latest_master.is_some_and(|updated| updated > moved_at) {
+            continue;
+        }
+        let body = movement
+            .get("requestBody")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("latest move has no signed request body"))?;
+        let envelope: Value = serde_json::from_str(body)?;
+        let input = trpc_request_input(&envelope)?;
+        if input.get("toStorageId").is_some()
+            && item.get("storageGuid").unwrap_or(&Value::Null)
+                != input.get("toStorageGuid").unwrap_or(&Value::Null)
+        {
+            anyhow::bail!("item storage snapshot differs from latest signed move")
+        }
+        if item.get("buildingSiteGuid").unwrap_or(&Value::Null)
+            != input.get("toBuildingSiteGuid").unwrap_or(&Value::Null)
+        {
+            anyhow::bail!("item site snapshot differs from latest signed move")
+        }
+    }
     Ok((verified, legacy))
 }
 
@@ -9339,7 +9413,7 @@ mod tests {
 
         let move_body = json!({"0":{"json":{
             "operationGuid":"op-2","workspaceGuid":"ws-1","itemGuid":"item-1",
-            "toStorageGuid":"storage-a","toBuildingSiteGuid":null
+            "toStorageId":7,"toStorageGuid":"storage-a","toBuildingSiteGuid":null
         }}})
         .to_string();
         let mut movement = json!({
@@ -9347,14 +9421,26 @@ mod tests {
             "requestBody":move_body,
             "requestHash":hex::encode(Sha256::digest(move_body.as_bytes())),
             "fromLabel":"op-2","workspaceGuid":"ws-1","itemGuid":"item-1",
-            "actorGuid":"actor-1","quantityDelta":null,"comment":null
+            "actorGuid":"actor-1","quantityDelta":null,"comment":null,
+            "createdAt":"2026-09-01T12:00:00Z","opId":"move-hash"
         });
         movement["toLabel"] =
             json!(stock_operation_commitment(&movement, "move", Some("storage-a"), None).unwrap());
         assert_eq!(
-            verify_stock_operation_records(&json!({"history":[movement.clone()]})).unwrap(),
+            verify_stock_operation_records(&json!({
+                "history":[movement.clone()],
+                "items":[{"guid":"item-1","storageGuid":"storage-a","buildingSiteGuid":null}],
+                "itemStateVersions":[]
+            }))
+            .unwrap(),
             (1, 0)
         );
+        let rewritten_snapshot = json!({
+            "history":[movement.clone()],
+            "items":[{"guid":"item-1","storageGuid":"storage-b","buildingSiteGuid":null}],
+            "itemStateVersions":[]
+        });
+        assert!(verify_stock_operation_records(&rewritten_snapshot).is_err());
         movement["toLabel"] =
             json!(stock_operation_commitment(&movement, "move", Some("storage-b"), None).unwrap());
         assert!(verify_stock_operation_records(&json!({"history":[movement]})).is_err());
