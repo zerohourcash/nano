@@ -155,6 +155,8 @@ CRC/MTU-фрагментация допустимы как защита кана
 - Android: foreground service через JNI запускает тот же Rust/SQLite узел;
   WebView работает с loopback UI, отдельный LAN listener публикует только sync,
   а HMAC UDP broadcast автоматически находит соседние телефоны в offline LAN.
+  NetworkCallback обновляет advertised endpoint при смене Wi‑Fi/хотспота, а
+  discovery вычисляет адрес заново перед каждым подписанным анонсом.
 - Обмен телефонов без IP: уже возможен вручную через системный файловый Share.
 - iOS-оболочка и потоковый BLE Mesh adapter ещё не реализованы; документация не
   должна заявлять обратное. Android ABI/APK проверяются отдельным CI job.

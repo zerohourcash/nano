@@ -153,23 +153,24 @@ pub async fn run(state: Arc<AppState>, token: String, bind: String, target: Stri
         eprintln!("LAN discovery broadcast недоступен: {error}");
         return;
     }
-    let (node_id, url) = {
+    let node_id = {
         let db = state.db.lock();
-        (sync::ensure_node(&db).0, sync::guess_lan_base())
+        sync::ensure_node(&db).0
     };
-    if !local_transport_url(&url) {
-        eprintln!(
-            "LAN discovery выключен: MESHKEEPER_ADVERTISE_URL не является локальным IP endpoint"
-        );
-        return;
-    }
-    eprintln!("LAN discovery {bind} → {target}, объявляю {url}");
+    eprintln!("LAN discovery {bind} → {target}");
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
     let mut buffer = [0_u8; MAX_PACKET_BYTES + 1];
     let mut replay_cache = ReplayCache::default();
+    let mut last_url = String::new();
     loop {
         tokio::select! {
             _ = interval.tick() => {
+                let url = sync::guess_lan_base();
+                if !local_transport_url(&url) { continue; }
+                if url != last_url {
+                    eprintln!("LAN discovery объявляю {url}");
+                    last_url = url.clone();
+                }
                 let packet = make_announcement(&token, &node_id, &url, now());
                 if let Ok(bytes) = serde_json::to_vec(&packet) {
                     let _ = socket.send_to(&bytes, &target).await;

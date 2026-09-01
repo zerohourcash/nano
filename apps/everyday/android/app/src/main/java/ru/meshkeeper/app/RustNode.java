@@ -35,5 +35,8 @@ public final class RustNode {
     /** Returns the existing/new node seed so Java can seal it before Rust removes SQLite plaintext. */
     public static native String provisionNodeKey(String dbPath);
 
+    /** Updates the LAN endpoint announced by the already running Rust node. */
+    public static native void updateAdvertiseUrl(String advertiseUrl);
+
     public static String localOrigin() { return "http://localhost:" + UI_PORT; }
 }

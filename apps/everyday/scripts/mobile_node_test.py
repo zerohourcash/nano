@@ -3,19 +3,25 @@
 from __future__ import annotations
 
 import json
+import base64
 import os
 import socket
 import subprocess
 import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
+from http.cookiejar import CookieJar
 from pathlib import Path
+
+from device_test_signing import CRITICAL, DeviceSigner
 
 ROOT = Path(__file__).resolve().parent.parent
 BINARY = ROOT / "backend" / "target" / "release" / "meshkeeper-node"
 TOKEN = "android-host-test-token-at-least-32-characters"
+NODE_KEY = base64.b64encode(bytes([17]) * 32).decode().rstrip("=")
 
 
 def free_port() -> int:
@@ -35,6 +41,68 @@ def request(url: str, token: str | None = None) -> tuple[int, bytes]:
         return error.code, error.read()
 
 
+class MobileApi:
+    def __init__(self, base: str):
+        self.base = base
+        self.cookies = CookieJar()
+        self.opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(self.cookies))
+        self.signer = DeviceSigner("android-lifecycle")
+        self.registered = False
+
+    def call(self, procedure: str, payload=None, mutation: bool = True):
+        body = json.dumps({"0": {"json": payload}}, separators=(",", ":")).encode()
+        if mutation:
+            req = urllib.request.Request(
+                f"{self.base}/api/trpc/{procedure}?batch=1", data=body, method="POST"
+            )
+            req.add_header("content-type", "application/json")
+            if procedure in CRITICAL:
+                if not self.registered:
+                    enrolled = self.call("auth.registerDevice", {
+                        "deviceId": self.signer.device_id,
+                        "name": "Android lifecycle test",
+                        "publicKey": self.signer.public_key,
+                    })
+                    if not isinstance(enrolled, dict) or enrolled.get("deviceId") != self.signer.device_id:
+                        raise RuntimeError(f"device enrollment failed: {enrolled}")
+                    self.registered = True
+                for key, value in self.signer.headers(f"/api/trpc/{procedure}", body).items():
+                    req.add_header(key, value)
+        else:
+            encoded = urllib.parse.quote(body.decode())
+            req = urllib.request.Request(
+                f"{self.base}/api/trpc/{procedure}?batch=1&input={encoded}", method="GET"
+            )
+        req.add_header("origin", self.base)
+        with self.opener.open(req, timeout=10) as response:
+            value = json.loads(response.read().decode())
+        if isinstance(value, list):
+            value = value[0]
+        if "error" in value:
+            raise RuntimeError(value["error"]["json"].get("message", "API error"))
+        return value["result"]["data"]["json"]
+
+
+def spawn(env: dict[str, str]) -> subprocess.Popen:
+    return subprocess.Popen(
+        [str(BINARY)], cwd=ROOT, env=env,
+        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+    )
+
+
+def wait_ready(proc: subprocess.Popen, ui_port: int) -> bool:
+    for _ in range(100):
+        try:
+            if request(f"http://127.0.0.1:{ui_port}/health")[0] == 200:
+                return True
+        except OSError:
+            pass
+        if proc.poll() is not None:
+            return False
+        time.sleep(0.1)
+    return False
+
+
 def main() -> int:
     if not BINARY.is_file():
         print("release binary отсутствует; выполните cargo build --release")
@@ -50,22 +118,13 @@ def main() -> int:
         "MESHKEEPER_SYNC_TOKEN": TOKEN,
         "MESHKEEPER_ADVERTISE_URL": f"http://127.0.0.1:{sync_port}",
         "MESHKEEPER_ALLOW_INSECURE_SYNC": "1",
+        "MESHKEEPER_NODE_SIGNING_KEY": NODE_KEY,
         "MESHKEEPER_DEMO_DATA": "0",
         "MESHKEEPER_DEMO_LOGIN": "0",
     }
-    proc = subprocess.Popen([str(BINARY)], cwd=ROOT, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    proc = spawn(env)
     try:
-        for _ in range(100):
-            try:
-                if request(f"http://127.0.0.1:{ui_port}/health")[0] == 200:
-                    break
-            except OSError:
-                pass
-            if proc.poll() is not None:
-                print(proc.stderr.read().decode(errors="replace"))
-                return 1
-            time.sleep(0.1)
-        else:
+        if not wait_ready(proc, ui_port):
             print("локальный UI listener не запустился")
             return 1
 
@@ -80,6 +139,38 @@ def main() -> int:
         checks.append(("sync-only listener не публикует пользовательский API", api_status == 404))
         blob_status, _ = request(f"http://127.0.0.1:{sync_port}/sync/blob/{'0' * 64}", TOKEN)
         checks.append(("CAS route существует, но неизвестный hash не выдаётся", blob_status in (401, 404)))
+
+        api = MobileApi(f"http://127.0.0.1:{ui_port}")
+        owner = api.call("auth.register", {
+            "fullName": "Владелец телефона",
+            "phone": "+7 900 444-55-66",
+            "password": "MobileLifecycle123",
+            "workspaceName": "Мобильная автономная организация",
+        })
+        workspace = api.call("meta.workspaces", None, mutation=False)[0]
+        message = api.call("chat.send", {
+            "workspaceId": workspace["id"],
+            "text": "Подписано до остановки мобильного процесса",
+        })
+        status_before = api.call("sync.status", None, mutation=False)
+        checks.append(("мобильная транзакция подписана device-proof и ledger",
+                       owner.get("id") is not None and message.get("ledgerVerified") is True))
+
+        # Android may kill and later recreate the foreground service. The test
+        # uses the same no-backup SQLite and external Keystore-equivalent seed.
+        proc.terminate()
+        proc.wait(timeout=10)
+        proc = spawn(env)
+        restarted = wait_ready(proc, ui_port)
+        checks.append(("Rust-узел перезапустился на прежней мобильной базе", restarted))
+        if restarted:
+            status_after = api.call("sync.status", None, mutation=False)
+            messages = api.call("chat.list", {"workspaceId": workspace["id"]}, mutation=False)
+            persisted = [row for row in messages if row.get("guid") == message.get("guid")]
+            checks.append(("после убийства процесса сохранены node ID и внешний signing key",
+                           status_after.get("nodeId") == status_before.get("nodeId")))
+            checks.append(("подписанная offline-транзакция пережила restart ровно один раз",
+                           len(persisted) == 1 and persisted[0].get("ledgerVerified") is True))
         failed = False
         for label, ok in checks:
             print(f"[{'OK  ' if ok else 'FAIL'}] {label}")

@@ -12,6 +12,7 @@ ABIS = ("arm64-v8a", "x86_64")
 JNI_SYMBOLS = (
     "Java_ru_meshkeeper_app_RustNode_startNode",
     "Java_ru_meshkeeper_app_RustNode_provisionNodeKey",
+    "Java_ru_meshkeeper_app_RustNode_updateAdvertiseUrl",
 )
 
 

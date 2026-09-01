@@ -15,6 +15,7 @@ layout = (android / "src/main/res/layout/activity_main.xml").read_text(encoding=
 required = {
     "Rust JNI symbol": "Java_ru_meshkeeper_app_RustNode_startNode" in lib,
     "node key migration JNI": "Java_ru_meshkeeper_app_RustNode_provisionNodeKey" in lib,
+    "dynamic LAN address JNI": "Java_ru_meshkeeper_app_RustNode_updateAdvertiseUrl" in lib,
     "private UI bind": 'MESHKEEPER_BIND", "127.0.0.1:8765' in lib,
     "sync-only LAN bind": 'MESHKEEPER_SYNC_BIND", "0.0.0.0:8766' in lib,
     "foreground Rust launch": "RustNode.startNode" in service,
@@ -34,6 +35,7 @@ required = {
     "Rust receives organization scope": "MESHKEEPER_SYNC_WORKSPACES" in lib and "workspaceScope" in service,
     "native organization scope control": '@+id/workspaceScope' in layout and "normalizeWorkspaceScope" in activity,
     "authenticated LAN discovery": "MESHKEEPER_DISCOVERY_BIND" in lib and "discovery::run" in lib,
+    "network handover callback": "registerDefaultNetworkCallback" in service and "updateAdvertiseUrl" in service,
     "token absent from service Intent": "EXTRA_TOKEN" not in service and "EXTRA_TOKEN" not in activity,
     "scope absent from service Intent": "EXTRA_WORKSPACE_SCOPE" not in service and "EXTRA_WORKSPACE_SCOPE" not in activity,
     "token not restored into UI": "syncToken.setText(SecretStore.loadSyncToken" not in activity,

@@ -7,6 +7,8 @@ import android.app.PendingIntent;
 import android.app.Service;
 import android.content.Intent;
 import android.content.pm.ServiceInfo;
+import android.net.ConnectivityManager;
+import android.net.Network;
 import android.os.Build;
 import android.os.IBinder;
 import android.util.Log;
@@ -22,6 +24,8 @@ public class NodeService extends Service {
     public static final String EXTRA_RELAY = "relay";
     private static final String TAG = "MeshKeeperRustNode";
     private Thread nodeThread;
+    private ConnectivityManager connectivityManager;
+    private ConnectivityManager.NetworkCallback networkCallback;
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
@@ -31,6 +35,7 @@ public class NodeService extends Service {
         } else {
             startForeground(7, n);
         }
+        watchNetworkChanges();
         String relay = intent == null ? null : intent.getStringExtra(EXTRA_RELAY);
         if (relay == null) relay = getSharedPreferences("meshkeeper", MODE_PRIVATE).getString("relay", "");
         String workspaceScope = getSharedPreferences("meshkeeper", MODE_PRIVATE).getString("workspace_scope", "");
@@ -118,6 +123,39 @@ public class NodeService extends Service {
             }
         } catch (Exception ignored) {}
         return "";
+    }
+
+    private void watchNetworkChanges() {
+        if (networkCallback != null) return;
+        connectivityManager = (ConnectivityManager) getSystemService(CONNECTIVITY_SERVICE);
+        if (connectivityManager == null) return;
+        networkCallback = new ConnectivityManager.NetworkCallback() {
+            @Override public void onAvailable(Network network) { publishCurrentLanAddress(); }
+            @Override public void onLost(Network network) { publishCurrentLanAddress(); }
+        };
+        try {
+            connectivityManager.registerDefaultNetworkCallback(networkCallback);
+        } catch (RuntimeException error) {
+            Log.w(TAG, "Не удалось следить за сменой сети", error);
+            networkCallback = null;
+        }
+    }
+
+    private void publishCurrentLanAddress() {
+        String lan = lanIpv4();
+        if (lan.isEmpty() || !RustNode.isAvailable()) return;
+        RustNode.updateAdvertiseUrl("http://" + lan + ":" + RustNode.SYNC_PORT);
+    }
+
+    @Override
+    public void onDestroy() {
+        if (connectivityManager != null && networkCallback != null) {
+            try {
+                connectivityManager.unregisterNetworkCallback(networkCallback);
+            } catch (RuntimeException ignored) {}
+        }
+        networkCallback = null;
+        super.onDestroy();
     }
 
     private Notification notification() {

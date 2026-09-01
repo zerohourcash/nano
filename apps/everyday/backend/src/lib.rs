@@ -1379,4 +1379,22 @@ mod android_jni {
             }
         }
     }
+
+    #[no_mangle]
+    pub extern "system" fn Java_ru_meshkeeper_app_RustNode_updateAdvertiseUrl(
+        mut env: JNIEnv<'_>,
+        _class: JClass<'_>,
+        advertise_url: JString<'_>,
+    ) {
+        let Ok(advertise_url) = string(&mut env, advertise_url) else {
+            return;
+        };
+        if crate::validate_peer_url(advertise_url.trim()).is_ok() {
+            std::env::set_var(
+                "MESHKEEPER_ADVERTISE_URL",
+                advertise_url.trim().trim_end_matches('/'),
+            );
+            crate::sync::request_sync_now();
+        }
+    }
 }
