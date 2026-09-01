@@ -1148,6 +1148,73 @@ fn dispatch_inner(
                         Ok(json!({"url":url,"hash":hash,"mime":mime,"size":size}))
                     });
                 }
+                Some("writeoff-photo") => {
+                    let item_id = i64v(input, "itemId")
+                        .ok_or_else(|| ApiError::bad("Для фото списания требуется itemId"))?;
+                    let item_workspace = require_item_access(conn, uid, item_id)?;
+                    if item_workspace != workspace {
+                        return Err(ApiError::bad(
+                            "Фото списания относится к другой организации",
+                        ));
+                    }
+                    require_can_in_workspace(conn, uid, workspace, "writeOff")?;
+                    let operation_guid = s(input, "operationGuid").ok_or_else(|| {
+                        ApiError::bad("Для фото списания требуется operationGuid")
+                    })?;
+                    Uuid::parse_str(&operation_guid)
+                        .map_err(|_| ApiError::bad("Некорректный operationGuid"))?;
+                    let minute_ago =
+                        (chrono::Utc::now() - chrono::Duration::minutes(1)).to_rfc3339();
+                    let recent: i64 = conn.query_row(
+                        "SELECT COUNT(*) FROM content_upload_grants
+                         WHERE workspace_id=?1 AND user_id=?2 AND purpose='writeoff-photo'
+                           AND created_at>=?3",
+                        params![workspace, uid, minute_ago],
+                        |row| row.get(0),
+                    )?;
+                    if recent >= 10 {
+                        return Err(ApiError::new(
+                            "TOO_MANY_REQUESTS",
+                            429,
+                            "Слишком много фото списания: подождите минуту",
+                        ));
+                    }
+                    let source = s(input, "dataUrl").ok_or_else(|| ApiError::bad("dataUrl"))?;
+                    return atomic(conn, |conn| {
+                        let url = crate::content::ingest_data_url(conn, &source)
+                            .map_err(|error| ApiError::bad(format!("Некорректное фото: {error}")))?
+                            .ok_or_else(|| ApiError::bad("Ожидается base64 data URL"))?;
+                        let hash = url.trim_start_matches("cas:");
+                        let (mime, size): (String, i64) = conn.query_row(
+                            "SELECT mime,size FROM content_catalog WHERE hash=?1",
+                            [hash],
+                            |row| Ok((row.get(0)?, row.get(1)?)),
+                        )?;
+                        if !mime.starts_with("image/") {
+                            return Err(ApiError::bad("Для списания требуется изображение"));
+                        }
+                        let recent_bytes: i64 = conn.query_row(
+                            "SELECT COALESCE(SUM(size),0) FROM content_upload_grants
+                             WHERE workspace_id=?1 AND user_id=?2 AND purpose='writeoff-photo'
+                               AND created_at>=?3",
+                            params![workspace, uid, minute_ago],
+                            |row| row.get(0),
+                        )?;
+                        if recent_bytes.saturating_add(size) > 64_i64 * 1024 * 1024 {
+                            return Err(ApiError::new(
+                                "TOO_MANY_REQUESTS",
+                                429,
+                                "Лимит фото списания 64 МБ в минуту",
+                            ));
+                        }
+                        conn.execute(
+                            "INSERT OR IGNORE INTO content_upload_grants(workspace_id,user_id,purpose,binding_guid,hash,size,created_at)
+                             VALUES(?1,?2,'writeoff-photo',?3,?4,?5,?6)",
+                            params![workspace, uid, operation_guid, hash, size, chrono::Utc::now().to_rfc3339()],
+                        )?;
+                        Ok(json!({"url":url,"hash":hash,"mime":mime,"size":size}))
+                    });
+                }
                 None => require_can_in_workspace(conn, uid, workspace, "createItems")?,
                 Some(_) => return Err(ApiError::bad("Неизвестное назначение вложения")),
             }
@@ -3731,6 +3798,25 @@ fn attach_photo(conn: &Connection, entry: &Value, photo: Option<&str>) -> Result
     Ok(())
 }
 
+fn writeoff_commitment(
+    operation_guid: &str,
+    workspace_guid: &str,
+    item_guid: &str,
+    actor_guid: &str,
+    quantity_delta: Option<f64>,
+    comment: &str,
+    photo_url: Option<&str>,
+) -> String {
+    let payload = json!({
+        "domain":"everyday/writeoff/v1","operationGuid":operation_guid,
+        "workspaceGuid":workspace_guid,"itemGuid":item_guid,"actorGuid":actor_guid,
+        "quantityDelta":quantity_delta,"comment":comment,"photoUrl":photo_url,
+    });
+    hex::encode(Sha256::digest(
+        serde_json::to_vec(&payload).expect("JSON serialization"),
+    ))
+}
+
 fn history_write_off(conn: &mut Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
     atomic(conn, |conn| history_write_off_atomic(conn, input, user_id))
 }
@@ -3741,8 +3827,21 @@ fn history_write_off_atomic(conn: &Connection, input: &Value, user_id: Option<i6
     if s(input, "comment").is_none() {
         return Err(ApiError::bad("Укажите причину списания"));
     }
+    let comment = s(input, "comment").unwrap_or_default();
+    let operation_guid = s(input, "operationGuid")
+        .ok_or_else(|| ApiError::bad("Для списания требуется operationGuid"))?;
+    Uuid::parse_str(&operation_guid).map_err(|_| ApiError::bad("Некорректный operationGuid"))?;
     let id = i64v(input, "itemId").ok_or_else(|| ApiError::bad("itemId"))?;
     let item_ws = require_item_access(conn, uid, id)?;
+    let duplicate: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM history_entries
+         WHERE workspace_id=?1 AND type='write_off' AND from_label=?2",
+        params![item_ws, operation_guid],
+        |row| row.get(0),
+    )?;
+    if duplicate != 0 {
+        return Err(ApiError::conflict("Операция списания уже существует"));
+    }
     // ТЗ §8: если группа так настроена, списание без фото не принимается.
     let photo = s(input, "photoUrl");
     if requires_writeoff_photo(conn, item_ws) && photo.is_none() {
@@ -3752,6 +3851,47 @@ fn history_write_off_atomic(conn: &Connection, input: &Value, user_id: Option<i6
     }
     let item = jsn::item_json(conn, id, false).ok_or_else(|| ApiError::not_found("нет"))?;
     let ws = item["workspaceId"].as_i64().unwrap_or(1);
+    let workspace_guid = ledger::guid(conn, "workspaces", ws)
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    let item_guid =
+        ledger::guid(conn, "items", id).map_err(|error| ApiError::internal(error.to_string()))?;
+    if s(input, "workspaceGuid").as_deref() != Some(workspace_guid.as_str())
+        || s(input, "itemGuid").as_deref() != Some(item_guid.as_str())
+    {
+        return Err(ApiError::bad(
+            "workspaceGuid/itemGuid не соответствуют списываемой карточке",
+        ));
+    }
+    let actor_guid =
+        ledger::guid(conn, "users", uid).map_err(|error| ApiError::internal(error.to_string()))?;
+    let photo_hash = photo
+        .as_deref()
+        .map(|url| validate_known_cas(conn, url))
+        .transpose()?;
+    if let Some(hash) = photo_hash.as_deref() {
+        let granted: bool = conn
+            .query_row(
+                "SELECT 1 FROM content_upload_grants
+                 WHERE workspace_id=?1 AND user_id=?2 AND purpose='writeoff-photo'
+                   AND binding_guid=?3 AND hash=?4 AND consumed_at IS NULL
+                   AND created_at>=?5",
+                params![
+                    ws,
+                    uid,
+                    operation_guid,
+                    hash,
+                    (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339()
+                ],
+                |_| Ok(true),
+            )
+            .optional()?
+            .unwrap_or(false);
+        if !granted {
+            return Err(ApiError::bad(
+                "Фото списания не загружено для этой операции или grant истёк",
+            ));
+        }
+    }
     if item["quantitative"].as_bool().unwrap_or(false) {
         let qty = f64v(input, "quantity").unwrap_or(1.0);
         if qty <= 0.0 {
@@ -3770,16 +3910,25 @@ fn history_write_off_atomic(conn: &Connection, input: &Value, user_id: Option<i6
         if changed != 1 {
             return Err(ApiError::conflict("Остаток изменился; повторите операцию"));
         }
+        let commitment = writeoff_commitment(
+            &operation_guid,
+            &workspace_guid,
+            &item_guid,
+            &actor_guid,
+            Some(-qty),
+            &comment,
+            photo.as_deref(),
+        );
         let entry = ledger::append(
             conn,
             ws,
             uid,
             Some(id),
             "write_off",
-            None,
-            None,
+            Some(&operation_guid),
+            Some(&commitment),
             Some(-qty),
-            s(input, "comment").as_deref(),
+            Some(&comment),
         )
         .map_err(|e| ApiError::internal(format!("Ошибка журнала: {e}")))?;
         attach_photo(conn, &entry, photo.as_deref())?;
@@ -3793,19 +3942,45 @@ fn history_write_off_atomic(conn: &Connection, input: &Value, user_id: Option<i6
             .optional()?
             .ok_or_else(|| ApiError::bad("В рабочем пространстве нет статуса списания"))?;
         conn.execute("UPDATE items SET status_id=?1 WHERE id=?2", params![st, id])?;
+        let commitment = writeoff_commitment(
+            &operation_guid,
+            &workspace_guid,
+            &item_guid,
+            &actor_guid,
+            None,
+            &comment,
+            photo.as_deref(),
+        );
         let entry = ledger::append(
             conn,
             ws,
             uid,
             Some(id),
             "write_off",
+            Some(&operation_guid),
+            Some(&commitment),
             None,
-            None,
-            None,
-            s(input, "comment").as_deref(),
+            Some(&comment),
         )
         .map_err(|e| ApiError::internal(format!("Ошибка журнала: {e}")))?;
         attach_photo(conn, &entry, photo.as_deref())?;
+    }
+    if let Some(hash) = photo_hash.as_deref() {
+        let changed = conn.execute(
+            "UPDATE content_upload_grants SET consumed_at=?1
+             WHERE workspace_id=?2 AND user_id=?3 AND purpose='writeoff-photo'
+               AND binding_guid=?4 AND hash=?5 AND consumed_at IS NULL",
+            params![
+                chrono::Utc::now().to_rfc3339(),
+                ws,
+                uid,
+                operation_guid,
+                hash
+            ],
+        )?;
+        if changed != 1 {
+            return Err(ApiError::conflict("Фото списания уже использовано"));
+        }
     }
     jsn::item_json(conn, id, false).ok_or_else(|| ApiError::bad("ошибка"))
 }
@@ -10026,12 +10201,17 @@ mod tests {
         seed_workspace_defaults(&conn, ws, users[0]).unwrap();
         let first = insert_item(&conn, ws, None, false, None);
         let second = insert_item(&conn, ws, None, false, None);
+        let workspace_guid = ledger::guid(&conn, "workspaces", ws).unwrap();
+        let first_guid = ledger::guid(&conn, "items", first).unwrap();
+        let second_guid = ledger::guid(&conn, "items", second).unwrap();
 
         // По умолчанию фото не требуется — достаточно причины.
         dispatch(
             &mut conn,
             "history.writeOff",
-            &json!({"itemId": first, "comment": "Сломан безвозвратно"}),
+            &json!({"itemId": first,"workspaceGuid":workspace_guid,"itemGuid":first_guid,
+                "operationGuid":Uuid::new_v4().to_string(),
+                "comment": "Сломан безвозвратно"}),
             Some(users[0]),
         )
         .unwrap();
@@ -10047,19 +10227,43 @@ mod tests {
         let refused = dispatch(
             &mut conn,
             "history.writeOff",
-            &json!({"itemId": second, "comment": "Утилизирован"}),
+            &json!({"itemId": second,"workspaceGuid":workspace_guid,"itemGuid":second_guid,
+                "operationGuid":Uuid::new_v4().to_string(),
+                "comment": "Утилизирован"}),
             Some(users[0]),
         )
         .unwrap_err();
         assert_eq!(refused.http, 400, "{}", refused.message);
 
+        let operation_guid = Uuid::new_v4().to_string();
+        let uploaded = dispatch(
+            &mut conn,
+            "content.ingest",
+            &json!({"workspaceId":ws,"itemId":second,"purpose":"writeoff-photo",
+                "operationGuid":operation_guid,"dataUrl":"data:image/png;base64,AAAA"}),
+            Some(users[0]),
+        )
+        .unwrap();
+        let wrong_operation = dispatch(
+            &mut conn,
+            "history.writeOff",
+            &json!({"itemId":second,"workspaceGuid":workspace_guid,"itemGuid":second_guid,
+                "operationGuid":Uuid::new_v4().to_string(),
+                "comment":"Подмена grant","photoUrl":uploaded["url"]}),
+            Some(users[0]),
+        )
+        .unwrap_err();
+        assert!(wrong_operation.message.contains("grant"));
         dispatch(
             &mut conn,
             "history.writeOff",
             &json!({
                 "itemId": second,
+                "workspaceGuid": workspace_guid,
+                "itemGuid": second_guid,
+                "operationGuid": operation_guid,
                 "comment": "Утилизирован по акту",
-                "photoUrl": "data:image/png;base64,AAAA"
+                "photoUrl": uploaded["url"]
             }),
             Some(users[0]),
         )
@@ -10073,7 +10277,17 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(stored.as_deref(), Some("data:image/png;base64,AAAA"));
+        assert_eq!(stored.as_deref(), uploaded["url"].as_str());
+        assert!(stored.as_deref().is_some_and(|url| url.starts_with("cas:")));
+        let event: (String, String) = conn.query_row(
+            "SELECT from_label,to_label FROM history_entries WHERE item_id=?1 AND type='write_off'",
+            [second], |row| Ok((row.get(0)?,row.get(1)?))).unwrap();
+        assert_eq!(event.0, operation_guid);
+        assert_eq!(event.1.len(), 64);
+        let consumed: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM content_upload_grants WHERE purpose='writeoff-photo' AND consumed_at IS NOT NULL",
+            [], |row| row.get(0)).unwrap();
+        assert_eq!(consumed, 1);
         cleanup(conn, path);
     }
 

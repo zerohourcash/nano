@@ -77,6 +77,22 @@ fn is_compact_chat_intent(body: &[u8]) -> bool {
         })
 }
 
+fn is_compact_writeoff_intent(body: &[u8]) -> bool {
+    let Ok(envelope) = serde_json::from_slice::<Value>(body) else {
+        return false;
+    };
+    let input = envelope
+        .get("0")
+        .and_then(|value| value.get("json"))
+        .or_else(|| envelope.get("json"));
+    let Some(input) = input else { return false };
+    input.get("operationGuid").and_then(Value::as_str).is_some()
+        && input
+            .get("photoUrl")
+            .and_then(Value::as_str)
+            .is_none_or(|url| url.starts_with("cas:"))
+}
+
 fn should_retain_request_body(path: &str, body: &[u8]) -> bool {
     path.starts_with("/api/trpc/inventory.")
         || matches!(
@@ -89,6 +105,9 @@ fn should_retain_request_body(path: &str, body: &[u8]) -> bool {
         ) && body.len() <= 128 * 1024)
         || (path.starts_with("/api/trpc/interorg.") && body.len() <= 64 * 1024)
         || (path == "/api/trpc/bit.offer" && body.len() <= 16 * 1024)
+        || (path == "/api/trpc/history.writeOff"
+            && body.len() <= 16 * 1024
+            && is_compact_writeoff_intent(body))
         || (path == "/api/trpc/knowledge.save" && is_compact_knowledge_intent(body))
         || (path == "/api/trpc/chat.send" && is_compact_chat_intent(body))
 }
@@ -549,6 +568,31 @@ mod tests {
             &vec![0; 64 * 1024 + 1]
         ));
         assert!(requires_signature("interorg.send"));
+    }
+
+    #[test]
+    fn writeoff_request_body_is_retained_only_for_compact_cas_intent() {
+        let operation = uuid::Uuid::new_v4().to_string();
+        let compact = json!({"0":{"json":{
+            "operationGuid":operation,
+            "photoUrl":format!("cas:{}", "c".repeat(64))
+        }}});
+        assert!(should_retain_request_body(
+            "/api/trpc/history.writeOff",
+            compact.to_string().as_bytes()
+        ));
+        let inline = json!({"0":{"json":{
+            "operationGuid":uuid::Uuid::new_v4().to_string(),
+            "photoUrl":"data:image/png;base64,QUJD"
+        }}});
+        assert!(!should_retain_request_body(
+            "/api/trpc/history.writeOff",
+            inline.to_string().as_bytes()
+        ));
+        assert!(!should_retain_request_body(
+            "/api/trpc/history.writeOff",
+            &vec![0; 16 * 1024 + 1]
+        ));
     }
 
     #[test]

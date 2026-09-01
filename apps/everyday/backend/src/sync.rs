@@ -816,7 +816,7 @@ pub fn export_journal_since(conn: &Connection, recipient_frontier: Option<&Value
     }
     let mut history = Vec::new();
     if let Ok(mut stmt) = conn.prepare(
-        "SELECT id, workspace_id, item_id, type, actor_user_id, from_label, to_label, quantity_delta, comment, hash, created_at, guid, prev_hash, signature, pubkey,event_version,request_device_id,request_public_key,request_nonce,request_signature,request_hash,request_timestamp,request_path,request_body FROM history_entries ORDER BY id",
+        "SELECT id, workspace_id, item_id, type, actor_user_id, from_label, to_label, quantity_delta, comment, hash, created_at, guid, prev_hash, signature, pubkey,event_version,request_device_id,request_public_key,request_nonce,request_signature,request_hash,request_timestamp,request_path,request_body,photo_url FROM history_entries ORDER BY id",
     ) {
         for row in stmt.query_map([], |r| {
             let ws: i64 = r.get(1)?;
@@ -846,6 +846,7 @@ pub fn export_journal_since(conn: &Connection, recipient_frontier: Option<&Value
                 "requestTimestamp": r.get::<_, Option<String>>(21)?,
                 "requestPath": r.get::<_, Option<String>>(22)?,
                 "requestBody": r.get::<_, Option<String>>(23)?,
+                "photoUrl": r.get::<_, Option<String>>(24)?,
             }))
         }).into_iter().flatten().flatten() {
             history.push(row);
@@ -1438,7 +1439,15 @@ fn filter_journal_scope(journal: &mut Value, allowed: &HashSet<String>) {
     }
 
     let mut hashes = HashSet::new();
-    for key in ["photos", "documents", "knowledge", "messages", "custody"] {
+    for key in [
+        "photos",
+        "documents",
+        "knowledge",
+        "messages",
+        "custody",
+        "faults",
+        "history",
+    ] {
         if let Some(value) = object.get(key) {
             cas_hashes(value, &mut hashes);
         }
@@ -1508,7 +1517,13 @@ pub fn content_hash_allowed(conn: &Connection, allowed: &HashSet<String>, hash: 
          WHERE w.guid IN (SELECT value FROM json_each(?1)) AND lower(d.url)=?2
          UNION ALL
          SELECT 1 FROM custody_entries c JOIN workspaces w ON w.guid=c.workspace_guid
-         WHERE w.guid IN (SELECT value FROM json_each(?1)) AND lower(c.photo_url)=?2 LIMIT 1",
+         WHERE w.guid IN (SELECT value FROM json_each(?1)) AND lower(c.photo_url)=?2
+         UNION ALL
+         SELECT 1 FROM fault_records f
+         WHERE f.workspace_guid IN (SELECT value FROM json_each(?1)) AND lower(f.photo_url)=?2
+         UNION ALL
+         SELECT 1 FROM history_entries h JOIN workspaces w ON w.id=h.workspace_id
+         WHERE w.guid IN (SELECT value FROM json_each(?1)) AND lower(h.photo_url)=?2 LIMIT 1",
         params![serde_json::to_string(&allowed.iter().collect::<Vec<_>>()).unwrap_or_else(|_| "[]".into()), cas],
         |_| Ok(()),
     ).is_ok();
@@ -2820,8 +2835,8 @@ pub fn import_journal(conn: &Connection, journal: &Value) -> Value {
                 .and_then(|g| id_by_guid(conn, "users", g))
                 .unwrap_or(1);
             let _ = conn.execute(
-                "INSERT OR IGNORE INTO history_entries (workspace_id,item_id,type,actor_user_id,from_label,to_label,quantity_delta,comment,hash,created_at,guid,prev_hash,signature,pubkey,event_version,request_device_id,request_public_key,request_nonce,request_signature,request_hash,request_timestamp,request_path,request_body)
-                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23)",
+                "INSERT OR IGNORE INTO history_entries (workspace_id,item_id,type,actor_user_id,from_label,to_label,quantity_delta,comment,hash,created_at,guid,prev_hash,signature,pubkey,event_version,request_device_id,request_public_key,request_nonce,request_signature,request_hash,request_timestamp,request_path,request_body,photo_url)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24)",
                 params![
                     ws, item,
                     h.get("type").and_then(|v| v.as_str()).unwrap_or("update"),
@@ -2844,7 +2859,8 @@ pub fn import_journal(conn: &Connection, journal: &Value) -> Value {
                     h.get("requestHash").and_then(Value::as_str),
                     h.get("requestTimestamp").and_then(Value::as_str),
                     h.get("requestPath").and_then(Value::as_str),
-                    h.get("requestBody").and_then(Value::as_str)
+                    h.get("requestBody").and_then(Value::as_str),
+                    h.get("photoUrl").and_then(Value::as_str)
                 ],
             );
             ops += 1;
@@ -3502,6 +3518,9 @@ pub fn apply_remote_journal(conn: &Connection, journal: &Value, peer_url: &str) 
     if let Err(error) = verify_inventory_records(conn, journal) {
         return json!({"ok":false,"error":format!("Проверка летописи инвентаризации: {error}")});
     }
+    if let Err(error) = verify_writeoff_records(journal) {
+        return json!({"ok":false,"error":format!("Проверка списаний: {error}")});
+    }
     if let Err(error) = verify_photo_records(conn, journal) {
         return json!({"ok":false,"error":format!("Проверка фото-летописи: {error}")});
     }
@@ -3599,6 +3618,10 @@ pub fn apply_remote_journal(conn: &Connection, journal: &Value, peer_url: &str) 
     if let Err(error) = verify_stored_inventory_records(conn) {
         let _ = conn.execute_batch("ROLLBACK TO verified_sync; RELEASE verified_sync");
         return json!({"ok":false,"error":format!("Проверка сохранённой инвентаризации: {error}")});
+    }
+    if let Err(error) = verify_writeoff_records(&export_journal(conn)) {
+        let _ = conn.execute_batch("ROLLBACK TO verified_sync; RELEASE verified_sync");
+        return json!({"ok":false,"error":format!("Проверка сохранённых списаний: {error}")});
     }
     if let Err(error) = verify_photo_records(conn, &export_journal(conn)) {
         let _ = conn.execute_batch("ROLLBACK TO verified_sync; RELEASE verified_sync");
@@ -4889,6 +4912,92 @@ fn verify_inventory_intent(record: &Value, event: &Value) -> anyhow::Result<()> 
         }
     }
     Ok(())
+}
+
+fn writeoff_commitment(event: &Value) -> anyhow::Result<String> {
+    let required = |field: &str| {
+        event
+            .get(field)
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("writeoff event has no {field}"))
+    };
+    let payload = json!({
+        "domain":"everyday/writeoff/v1",
+        "operationGuid":required("fromLabel")?,
+        "workspaceGuid":required("workspaceGuid")?,
+        "itemGuid":required("itemGuid")?,
+        "actorGuid":required("actorGuid")?,
+        "quantityDelta":event.get("quantityDelta").filter(|value|!value.is_null()),
+        "comment":required("comment")?,
+        "photoUrl":event.get("photoUrl").filter(|value|!value.is_null()),
+    });
+    Ok(hex::encode(Sha256::digest(serde_json::to_vec(&payload)?)))
+}
+
+fn verify_writeoff_records(journal: &Value) -> anyhow::Result<(usize, usize)> {
+    let mut verified = 0;
+    let mut legacy = 0;
+    for event in journal
+        .get("history")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|event| event.get("type").and_then(Value::as_str) == Some("write_off"))
+    {
+        if event.get("eventVersion").and_then(Value::as_i64) != Some(3)
+            || event.get("requestPath").and_then(Value::as_str)
+                != Some("/api/trpc/history.writeOff")
+            || event.get("requestBody").and_then(Value::as_str).is_none()
+        {
+            legacy += 1;
+            continue;
+        }
+        let commitment = writeoff_commitment(event)?;
+        if event.get("toLabel").and_then(Value::as_str) != Some(commitment.as_str()) {
+            anyhow::bail!("writeoff commitment does not match ledger")
+        }
+        let body = event["requestBody"].as_str().unwrap_or_default();
+        if event.get("requestHash").and_then(Value::as_str)
+            != Some(hex::encode(Sha256::digest(body.as_bytes())).as_str())
+        {
+            anyhow::bail!("writeoff request body hash mismatch")
+        }
+        let envelope: Value = serde_json::from_str(body)?;
+        let input = trpc_request_input(&envelope)?;
+        for (input_field, event_field) in [
+            ("operationGuid", "fromLabel"),
+            ("workspaceGuid", "workspaceGuid"),
+            ("itemGuid", "itemGuid"),
+            ("comment", "comment"),
+            ("photoUrl", "photoUrl"),
+        ] {
+            let input_value = input.get(input_field).filter(|value| !value.is_null());
+            let event_value = event.get(event_field).filter(|value| !value.is_null());
+            if input_value != event_value {
+                anyhow::bail!("writeoff differs from signed user intent")
+            }
+        }
+        if let Some(delta) = event.get("quantityDelta").and_then(Value::as_f64) {
+            let quantity = input.get("quantity").and_then(Value::as_f64).unwrap_or(1.0);
+            if !quantity.is_finite() || quantity <= 0.0 || (delta + quantity).abs() > 1e-9 {
+                anyhow::bail!("writeoff quantity differs from signed user intent")
+            }
+        }
+        if event
+            .get("photoUrl")
+            .and_then(Value::as_str)
+            .is_some_and(|url| {
+                url.strip_prefix("cas:").is_none_or(|hash| {
+                    hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+                })
+            })
+        {
+            anyhow::bail!("writeoff photo is not CAS-backed")
+        }
+        verified += 1;
+    }
+    Ok((verified, legacy))
 }
 
 fn photo_commitment(photo: &Value) -> anyhow::Result<String> {
@@ -6904,6 +7013,7 @@ pub fn integrity_audit(conn: &Connection) -> Value {
     let item_state_result = verify_stored_item_state_versions(conn);
     let organization_node_result = verify_stored_organization_node_versions(conn);
     let inventory_result = verify_stored_inventory_records(conn);
+    let writeoff_result = verify_writeoff_records(&snapshot);
     let photo_result = verify_photo_records(conn, &snapshot);
     let document_result = verify_document_records(conn, &snapshot);
     let knowledge_intent_result = verify_knowledge_records(conn, &snapshot);
@@ -7006,6 +7116,7 @@ pub fn integrity_audit(conn: &Connection) -> Value {
         .err()
         .map(ToString::to_string);
     let inventory_error = inventory_result.as_ref().err().map(ToString::to_string);
+    let writeoff_error = writeoff_result.as_ref().err().map(ToString::to_string);
     let photo_error = photo_result.as_ref().err().map(ToString::to_string);
     let document_error = document_result.as_ref().err().map(ToString::to_string);
     let knowledge_intent_error = knowledge_intent_result
@@ -7039,6 +7150,7 @@ pub fn integrity_audit(conn: &Connection) -> Value {
         && item_state_result.is_ok()
         && organization_node_result.is_ok()
         && inventory_result.is_ok()
+        && writeoff_result.is_ok()
         && photo_result.is_ok()
         && document_result.is_ok()
         && knowledge_intent_result.is_ok()
@@ -7162,6 +7274,24 @@ pub fn integrity_audit(conn: &Connection) -> Value {
         object.insert(
             "inventoryRecordsVerified".into(),
             json!(inventory_result.unwrap_or(0)),
+        );
+        object.insert(
+            "writeoffsVerified".into(),
+            json!(writeoff_result
+                .as_ref()
+                .map(|(verified, _)| *verified)
+                .unwrap_or(0)),
+        );
+        object.insert(
+            "writeoffsLegacy".into(),
+            json!(writeoff_result
+                .as_ref()
+                .map(|(_, legacy)| *legacy)
+                .unwrap_or(0)),
+        );
+        object.insert(
+            "writeoffError".into(),
+            writeoff_error.map(Value::String).unwrap_or(Value::Null),
         );
         object.insert(
             "photoError".into(),

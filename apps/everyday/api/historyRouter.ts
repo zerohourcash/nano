@@ -83,6 +83,9 @@ export const historyRouter = createRouter({
     .input(
       z.object({
         itemId: z.number().int().positive(),
+        workspaceGuid: z.string().uuid(),
+        itemGuid: z.string().uuid(),
+        operationGuid: z.string().uuid(),
         quantity: z.number().positive().optional(),
         comment: z.string().optional(),
         // Фото-подтверждение списания, если этого требует настройка группы (ТЗ §8).

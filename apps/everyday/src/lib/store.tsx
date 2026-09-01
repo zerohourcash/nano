@@ -7,6 +7,7 @@ interface Workspace {
   name: string
   internalIdPrefix?: string
   guid?: string | null
+  requireWriteoffPhoto?: boolean
 }
 
 interface User {

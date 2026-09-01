@@ -710,15 +710,16 @@ function QuantityModal({
   onDone: (msg: string) => void
 }) {
   const utils = trpc.useUtils()
+  const { workspace } = useStore()
   const [qty, setQty] = useState(1)
   const [comment, setComment] = useState('')
   const [photo, setPhoto] = useState<string | null>(null)
+  const [operationGuid, setOperationGuid] = useState(() => crypto.randomUUID())
+  const [uploadError, setUploadError] = useState<string | null>(null)
   const isReplenish = mode === 'replenish'
-  // Требование фото — настройка группы, поэтому спрашиваем её у сервера.
-  const { data: workspaces } = trpc.admin.workspaces.list.useQuery(undefined, { retry: 0 })
   const photoRequired =
     !isReplenish &&
-    (workspaces ?? []).some((w) => w.id === item.workspaceId && w.requireWriteoffPhoto)
+    workspace?.id === item.workspaceId && workspace.requireWriteoffPhoto === true
 
   const onSuccess = () => {
     utils.items.byId.invalidate({ id: item.id })
@@ -728,10 +729,47 @@ function QuantityModal({
     onClose()
     setQty(1)
     setComment('')
+    setPhoto(null)
+    setOperationGuid(crypto.randomUUID())
+    setUploadError(null)
   }
   const replenish = trpc.history.replenish.useMutation({ onSuccess })
   const writeOff = trpc.history.writeOff.useMutation({ onSuccess })
-  const pending = replenish.isPending || writeOff.isPending
+  const ingestContent = trpc.content.ingest.useMutation()
+  const pending = replenish.isPending || writeOff.isPending || ingestContent.isPending
+
+  const submit = async () => {
+    if (isReplenish) {
+      replenish.mutate({ itemId: item.id, quantity: qty, comment: comment || undefined })
+      return
+    }
+    setUploadError(null)
+    try {
+      if (!workspace?.guid || workspace.id !== item.workspaceId || !item.guid) {
+        throw new Error('Не удалось определить GUID организации или карточки')
+      }
+      const uploaded = photo
+        ? await ingestContent.mutateAsync({
+            workspaceId: item.workspaceId,
+            itemId: item.id,
+            purpose: 'writeoff-photo',
+            operationGuid,
+            dataUrl: photo,
+          })
+        : null
+      await writeOff.mutateAsync({
+        itemId: item.id,
+        workspaceGuid: workspace.guid,
+        itemGuid: item.guid,
+        operationGuid,
+        quantity: qty,
+        comment: comment.trim(),
+        photoUrl: uploaded?.url,
+      })
+    } catch (error) {
+      setUploadError(error instanceof Error ? error.message : 'Не удалось сохранить списание')
+    }
+  }
 
   return (
     <Modal open={open} onClose={onClose} title={isReplenish ? 'Пополнить остаток' : 'Списать количество'}>
@@ -791,6 +829,7 @@ function QuantityModal({
                 В этой группе списание принимается только с фото.
               </p>
             )}
+            {uploadError && <p className="mt-2 text-[13px] text-danger">{uploadError}</p>}
           </div>
         )}
         <div className="flex justify-end gap-2">
@@ -802,16 +841,7 @@ function QuantityModal({
               (!isReplenish && !comment.trim()) ||
               (photoRequired && !photo)
             }
-            onClick={() =>
-              isReplenish
-                ? replenish.mutate({ itemId: item.id, quantity: qty, comment: comment || undefined })
-                : writeOff.mutate({
-                    itemId: item.id,
-                    quantity: qty,
-                    comment: comment.trim(),
-                    photoUrl: photo ?? undefined,
-                  })
-            }
+            onClick={() => void submit()}
           >
             {pending && <Loader2 size={16} className="animate-spin" />}
             {isReplenish ? 'Пополнить' : 'Списать'}

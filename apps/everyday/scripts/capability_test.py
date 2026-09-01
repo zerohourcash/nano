@@ -60,6 +60,7 @@ def main() -> int:
 
         photos = []
         chat_files = []
+        writeoff_files = []
         for workspace, title, byte in [(first, "Только A", b"organization-a"), (second, "Только B", b"organization-b")]:
             photo = "data:text/plain;base64," + base64.b64encode(byte).decode()
             item = node.call("items.create", {"workspaceId": workspace["id"], "title": title, "photos": [photo]})
@@ -79,8 +80,33 @@ def main() -> int:
             check(f"чат-файл {title} связан с signed сообщением",
                   sent_message.get("guid") == message_guid and len(uploaded.get("hash", "")) == 64)
             chat_files.append(uploaded["hash"])
+            writeoff_item = node.call("items.create", {
+                "workspaceId": workspace["id"], "title": f"Материал {title}",
+                "quantitative": True, "quantity": 5, "unit": "шт",
+            })
+            operation_guid = str(uuid.uuid4())
+            evidence_data = "data:image/png;base64," + base64.b64encode(b"writeoff-" + byte).decode()
+            evidence = node.call("content.ingest", {
+                "workspaceId": workspace["id"], "itemId": writeoff_item["id"],
+                "purpose": "writeoff-photo", "operationGuid": operation_guid,
+                "dataUrl": evidence_data,
+            })
+            node.call("history.writeOff", {
+                "itemId": writeoff_item["id"], "workspaceGuid": workspace["guid"],
+                "itemGuid": writeoff_item["guid"], "operationGuid": operation_guid,
+                "quantity": 1, "comment": f"Акт списания {title}", "photoUrl": evidence["url"],
+            })
+            writeoff_files.append(evidence["hash"])
 
         full = journal_from(node)
+        writeoff_events = [event for event in full.get("history", []) if event.get("type") == "write_off"]
+        check("списания хранят compact V3 CAS intent",
+              len(writeoff_events) == 2
+              and all(event.get("eventVersion") == 3
+                      and str(event.get("photoUrl", "")).startswith("cas:")
+                      and len(event.get("toLabel", "")) == 64
+                      and "data:image" not in (event.get("requestBody") or "")
+                      for event in writeoff_events), str(writeoff_events)[:500])
         node.stop(cleanup=False)
         node.env.pop("MESHKEEPER_SYNC_TOKEN", None)
         node.env["MESHKEEPER_SYNC_CAPABILITIES"] = json.dumps([
@@ -94,10 +120,10 @@ def main() -> int:
         status_b, journal_b = request_json(node, "/sync/journal", TOKEN_B)
         check("capability A получает только A", status_a == 200
               and [row["guid"] for row in journal_a["workspaces"]] == [first["guid"]]
-              and [row["title"] for row in journal_a["items"]] == ["Только A"], str(journal_a.get("items")))
+              and sorted(row["title"] for row in journal_a["items"]) == ["Материал Только A", "Только A"], str(journal_a.get("items")))
         check("capability B получает только B", status_b == 200
               and [row["guid"] for row in journal_b["workspaces"]] == [second["guid"]]
-              and [row["title"] for row in journal_b["items"]] == ["Только B"], str(journal_b.get("items")))
+              and sorted(row["title"] for row in journal_b["items"]) == ["Материал Только B", "Только B"], str(journal_b.get("items")))
         wrong_status, _ = request_json(node, "/sync/journal", "wrong-" + "x" * 40)
         check("неизвестный bearer отклонён", wrong_status == 401, wrong_status)
 
@@ -112,6 +138,12 @@ def main() -> int:
         check("свой CAS-файл чата доступен capability", own_chat_status == 200, own_chat_status)
         check("чужой CAS-файл чата закрыт даже при известном hash", foreign_chat_status == 403,
               foreign_chat_status)
+        own_writeoff_status, _ = request_json(node, f"/sync/blob/{writeoff_files[0]}?offset=0", TOKEN_A)
+        foreign_writeoff_status, _ = request_json(node, f"/sync/blob/{writeoff_files[1]}?offset=0", TOKEN_A)
+        check("своё фото списания доступно capability", own_writeoff_status == 200,
+              own_writeoff_status)
+        check("чужое фото списания закрыто даже при известном hash", foreign_writeoff_status == 403,
+              foreign_writeoff_status)
 
         sync_status = node.call("sync.status", None, mutation=False)
         check("панель показывает две capability", sync_status.get("workspaceScopeMode") == "capabilities"
@@ -140,7 +172,8 @@ def main() -> int:
             with sqlite3.connect(peer.db) as db:
                 return [row[0] for row in db.execute("SELECT title FROM items ORDER BY title")]
 
-        converged = wait_for(lambda: local_titles(peer_a) == ["Только A"] and local_titles(peer_b) == ["Только B"], timeout=35)
+        converged = wait_for(lambda: local_titles(peer_a) == ["Материал Только A", "Только A"]
+                             and local_titles(peer_b) == ["Материал Только B", "Только B"], timeout=35)
         check("два peer-loop независимо получили только свои организации", converged,
               f"A={local_titles(peer_a)} B={local_titles(peer_b)}")
         with sqlite3.connect(peer_a.db) as db_a, sqlite3.connect(peer_b.db) as db_b:
@@ -151,6 +184,10 @@ def main() -> int:
             check("full peer получает свой chat CAS и не получает чужой",
                   chat_files[0] in blobs_a and chat_files[1] not in blobs_a
                   and chat_files[1] in blobs_b and chat_files[0] not in blobs_b,
+                  f"A={blobs_a} B={blobs_b}")
+            check("full peer получает своё фото списания и не получает чужое",
+                  writeoff_files[0] in blobs_a and writeoff_files[1] not in blobs_a
+                  and writeoff_files[1] in blobs_b and writeoff_files[0] not in blobs_b,
                   f"A={blobs_a} B={blobs_b}")
     finally:
         if peer_a is not None:
