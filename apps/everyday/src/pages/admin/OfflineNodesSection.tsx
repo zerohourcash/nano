@@ -202,6 +202,14 @@ export default function OfflineNodesSection() {
           <div>
             Трафик: <b>{Math.round(((st?.bytesSent ?? 0) + (st?.bytesReceived ?? 0)) / 1024)} КБ</b>
           </div>
+          <div className="sm:col-span-2">
+            Scope организаций: <b>{st?.workspaceScopeMode === 'restricted' ? `${st.workspaceScope.length} разрешено` : 'вся база (доверенная нода)'}</b>
+          </div>
+          {st?.workspaceScopeMode === 'restricted' && (
+            <div className="sm:col-span-2 break-all font-mono-num text-[11px] text-ink-500">
+              {st.workspaceScope.length ? st.workspaceScope.join(', ') : 'Ни одна организация не разрешена: синхронизация закрыта'}
+            </div>
+          )}
         </div>
 
         {st?.upstream && (

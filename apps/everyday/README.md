@@ -164,6 +164,12 @@ revision DAG, явно показывают конфликт и детермин
 | --- | --- |
 | Принимающий/mesh-узел | `MESHKEEPER_SYNC_TOKEN` |
 | Узел с постоянным peer | `MESHKEEPER_SYNC_TOKEN` + `MESHKEEPER_UPSTREAM` |
+
+Для базы с несколькими организациями добавьте
+`MESHKEEPER_SYNC_WORKSPACES=<workspace-guid-1>,<workspace-guid-2>`. Это не
+frontend-фильтр: scope проверяется при выдаче и приёме подписанного журнала,
+offline bundle и каждого CAS-файла. Нода без этой переменной считается
+доверенной инфраструктурной нодой и синхронизирует все организации.
 | Самоорганизующаяся offline LAN | предыдущие + `MESHKEEPER_DISCOVERY_BIND` |
 | Полностью изолированный | ничего |
 

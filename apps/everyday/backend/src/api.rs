@@ -845,7 +845,9 @@ fn dispatch_inner(
         "sync.clearDiagnostics" => Ok(crate::diagnostics::clear_resolved(conn)),
         "sync.exportBundle" => {
             let token = crate::sync_token();
-            let result = crate::sync::export_transport_bundle(conn, token.as_deref());
+            let scope = crate::sync_workspace_scope();
+            let result =
+                crate::sync::export_transport_bundle_scoped(conn, token.as_deref(), scope.as_ref());
             if result.get("ok").and_then(Value::as_bool) == Some(false) {
                 crate::diagnostics::record(
                     conn,
@@ -873,7 +875,13 @@ fn dispatch_inner(
                 .get("bundle")
                 .ok_or_else(|| ApiError::bad("Нет transport bundle"))?;
             let token = crate::sync_token();
-            let result = crate::sync::import_transport_bundle(conn, bundle, token.as_deref());
+            let scope = crate::sync_workspace_scope();
+            let result = crate::sync::import_transport_bundle_scoped(
+                conn,
+                bundle,
+                token.as_deref(),
+                scope.as_ref(),
+            );
             if result.get("ok").and_then(Value::as_bool) == Some(false) {
                 crate::diagnostics::record(
                     conn,

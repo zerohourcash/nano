@@ -433,7 +433,14 @@ pub fn status(conn: &Connection) -> Value {
                     coalesce(sum(CASE WHEN b.hash IS NULL THEN c.size ELSE 0 END),0)
              FROM content_catalog c LEFT JOIN content_blobs b ON b.hash=c.hash",
             [],
-            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?, row.get::<_, i64>(3)?)),
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            },
         )
         .unwrap_or((0, 0, 0, 0));
     json!({"mode":mode(conn),"blobs":count("content_blobs"),

@@ -466,6 +466,284 @@ pub fn export_journal(conn: &Connection) -> Value {
     export_journal_since(conn, None)
 }
 
+fn retain_workspace(entries: &mut Value, allowed: &HashSet<String>) {
+    if let Some(rows) = entries.as_array_mut() {
+        rows.retain(|row| {
+            row.get("workspaceGuid")
+                .and_then(Value::as_str)
+                .is_some_and(|guid| allowed.contains(guid))
+        });
+    }
+}
+
+fn cas_hashes(value: &Value, out: &mut HashSet<String>) {
+    match value {
+        Value::String(text) => {
+            if let Some(hash) = text.strip_prefix("cas:") {
+                if hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                    out.insert(hash.to_ascii_lowercase());
+                }
+            }
+        }
+        Value::Array(values) => values.iter().for_each(|value| cas_hashes(value, out)),
+        Value::Object(values) => values.values().for_each(|value| cas_hashes(value, out)),
+        _ => {}
+    }
+}
+
+/// Redacts a signed snapshot to the exact set of organizations authorized for
+/// one mesh capability. The result must be signed again by the exporting node.
+fn filter_journal_scope(journal: &mut Value, allowed: &HashSet<String>) {
+    let Some(object) = journal.as_object_mut() else {
+        return;
+    };
+    if let Some(rows) = object.get_mut("workspaces").and_then(Value::as_array_mut) {
+        rows.retain(|row| {
+            row.get("guid")
+                .and_then(Value::as_str)
+                .is_some_and(|guid| allowed.contains(guid))
+        });
+    }
+    for key in [
+        "organizationNodes",
+        "items",
+        "history",
+        "invites",
+        "memberships",
+        "messages",
+        "frontier",
+    ] {
+        if let Some(value) = object.get_mut(key) {
+            retain_workspace(value, allowed);
+        }
+    }
+
+    let item_guids: HashSet<String> = object
+        .get("items")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|row| row.get("guid").and_then(Value::as_str).map(str::to_owned))
+        .collect();
+    for key in ["photos", "documents"] {
+        if let Some(rows) = object.get_mut(key).and_then(Value::as_array_mut) {
+            rows.retain(|row| {
+                row.get("itemGuid")
+                    .and_then(Value::as_str)
+                    .is_some_and(|guid| item_guids.contains(guid))
+            });
+        }
+    }
+
+    let mut account_guids = HashSet::new();
+    let mut transaction_guids = HashSet::new();
+    if let Some(accounting) = object.get_mut("accounting").and_then(Value::as_object_mut) {
+        if let Some(accounts) = accounting.get_mut("accounts") {
+            retain_workspace(accounts, allowed);
+            account_guids.extend(
+                accounts
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|row| row.get("guid").and_then(Value::as_str).map(str::to_owned)),
+            );
+        }
+        if let Some(transactions) = accounting.get_mut("transactions") {
+            retain_workspace(transactions, allowed);
+            transaction_guids.extend(
+                transactions
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|row| row.get("guid").and_then(Value::as_str).map(str::to_owned)),
+            );
+        }
+        if let Some(lines) = accounting.get_mut("lines").and_then(Value::as_array_mut) {
+            lines.retain(|row| {
+                row.get("transactionGuid")
+                    .and_then(Value::as_str)
+                    .is_some_and(|guid| transaction_guids.contains(guid))
+                    && row
+                        .get("accountGuid")
+                        .and_then(Value::as_str)
+                        .is_some_and(|guid| account_guids.contains(guid))
+            });
+        }
+    }
+
+    let mut page_guids = HashSet::new();
+    if let Some(knowledge) = object.get_mut("knowledge").and_then(Value::as_object_mut) {
+        if let Some(pages) = knowledge.get_mut("pages") {
+            retain_workspace(pages, allowed);
+            page_guids.extend(
+                pages
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|row| row.get("guid").and_then(Value::as_str).map(str::to_owned)),
+            );
+        }
+        if let Some(revisions) = knowledge.get_mut("revisions").and_then(Value::as_array_mut) {
+            revisions.retain(|row| {
+                row.get("pageGuid")
+                    .and_then(Value::as_str)
+                    .is_some_and(|guid| page_guids.contains(guid))
+            });
+        }
+    }
+
+    let mut user_guids = HashSet::new();
+    for key in ["memberships", "messages"] {
+        if let Some(rows) = object.get(key).and_then(Value::as_array) {
+            user_guids.extend(rows.iter().filter_map(|row| {
+                row.get("userGuid")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            }));
+        }
+    }
+    for (key, field) in [
+        ("items", "responsibleGuid"),
+        ("history", "actorGuid"),
+        ("organizationNodes", "responsibleGuid"),
+    ] {
+        if let Some(rows) = object.get(key).and_then(Value::as_array) {
+            user_guids.extend(
+                rows.iter()
+                    .filter_map(|row| row.get(field).and_then(Value::as_str).map(str::to_owned)),
+            );
+        }
+    }
+    if let Some(accounting) = object.get("accounting") {
+        for key in ["accounts", "transactions"] {
+            if let Some(rows) = accounting.get(key).and_then(Value::as_array) {
+                for row in rows {
+                    for field in ["ownerGuid", "actorGuid"] {
+                        if let Some(guid) = row.get(field).and_then(Value::as_str) {
+                            user_guids.insert(guid.to_owned());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if let Some(revisions) = object
+        .get("knowledge")
+        .and_then(|v| v.get("revisions"))
+        .and_then(Value::as_array)
+    {
+        user_guids.extend(revisions.iter().filter_map(|row| {
+            row.get("authorGuid")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        }));
+    }
+    if let Some(users) = object.get_mut("users").and_then(Value::as_array_mut) {
+        users.retain(|row| {
+            row.get("guid")
+                .and_then(Value::as_str)
+                .is_some_and(|guid| user_guids.contains(guid))
+        });
+    }
+
+    let mut hashes = HashSet::new();
+    for key in ["photos", "documents", "knowledge"] {
+        if let Some(value) = object.get(key) {
+            cas_hashes(value, &mut hashes);
+        }
+    }
+    for key in ["blobs", "contentCatalog", "contentProviders"] {
+        if let Some(rows) = object.get_mut(key).and_then(Value::as_array_mut) {
+            rows.retain(|row| {
+                row.get("hash")
+                    .and_then(Value::as_str)
+                    .is_some_and(|hash| hashes.contains(&hash.to_ascii_lowercase()))
+            });
+        }
+    }
+}
+
+pub fn export_journal_scoped(
+    conn: &Connection,
+    recipient_frontier: Option<&Value>,
+    allowed: Option<&HashSet<String>>,
+) -> Value {
+    let mut journal = export_journal_since(conn, recipient_frontier);
+    if let Some(allowed) = allowed {
+        filter_journal_scope(&mut journal, allowed);
+        if let Err(error) = ledger::sign_journal(conn, &mut journal) {
+            return json!({"ok":false,"error":format!("Не удалось подписать scoped-журнал: {error}")});
+        }
+    }
+    journal
+}
+
+pub fn journal_within_scope(journal: &Value, allowed: &HashSet<String>) -> bool {
+    let mut filtered = journal.clone();
+    filter_journal_scope(&mut filtered, allowed);
+    for value in [&mut filtered] {
+        if let Some(object) = value.as_object_mut() {
+            object.remove("journalHash");
+            object.remove("journalSignature");
+            object.remove("journalPublicKey");
+        }
+    }
+    let mut original = journal.clone();
+    if let Some(object) = original.as_object_mut() {
+        object.remove("journalHash");
+        object.remove("journalSignature");
+        object.remove("journalPublicKey");
+    }
+    filtered == original
+}
+
+/// Blob endpoint authorization is checked independently of journal filtering:
+/// knowing a hash from another organization must not turn the shared transport
+/// token into a cross-organization file oracle.
+pub fn content_hash_allowed(conn: &Connection, allowed: &HashSet<String>, hash: &str) -> bool {
+    if hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return false;
+    }
+    let cas = format!("cas:{}", hash.to_ascii_lowercase());
+    let direct = conn.query_row(
+        "SELECT 1 FROM item_photos p JOIN items i ON i.id=p.item_id JOIN workspaces w ON w.id=i.workspace_id
+         WHERE w.guid IN (SELECT value FROM json_each(?1)) AND (lower(p.url)=?2 OR lower(p.thumb_url)=?2)
+         UNION ALL
+         SELECT 1 FROM item_documents d JOIN items i ON i.id=d.item_id JOIN workspaces w ON w.id=i.workspace_id
+         WHERE w.guid IN (SELECT value FROM json_each(?1)) AND lower(d.url)=?2 LIMIT 1",
+        params![serde_json::to_string(&allowed.iter().collect::<Vec<_>>()).unwrap_or_else(|_| "[]".into()), cas],
+        |_| Ok(()),
+    ).is_ok();
+    if direct {
+        return true;
+    }
+    let Ok(mut statement) = conn.prepare(
+        "SELECT r.attachments_json FROM knowledge_revisions r
+         JOIN knowledge_pages p ON p.guid=r.page_guid JOIN workspaces w ON w.id=p.workspace_id
+         WHERE w.guid IN (SELECT value FROM json_each(?1))",
+    ) else {
+        return false;
+    };
+    let scope =
+        serde_json::to_string(&allowed.iter().collect::<Vec<_>>()).unwrap_or_else(|_| "[]".into());
+    let found = statement
+        .query_map([scope], |row| row.get::<_, String>(0))
+        .ok()
+        .into_iter()
+        .flatten()
+        .flatten()
+        .any(|raw| {
+            serde_json::from_str::<Value>(&raw)
+                .ok()
+                .is_some_and(|value| {
+                    let mut hashes = HashSet::new();
+                    cas_hashes(&value, &mut hashes);
+                    hashes.contains(&hash.to_ascii_lowercase())
+                })
+        });
+    found
+}
+
 /// Транспортно-независимый пакет: его можно передать файлом, Bluetooth Share,
 /// Wi-Fi Direct, USB или любым store-and-forward каналом. Бинарные CAS-объекты
 /// сюда намеренно не входят; journal содержит только manifests и ссылки.
@@ -542,7 +820,16 @@ fn decrypt_transport_journal(bundle: &Value, secret: &str) -> anyhow::Result<Val
     Ok(serde_json::from_slice(&plaintext)?)
 }
 
+#[cfg(test)]
 pub fn export_transport_bundle(conn: &Connection, secret: Option<&str>) -> Value {
+    export_transport_bundle_scoped(conn, secret, None)
+}
+
+pub fn export_transport_bundle_scoped(
+    conn: &Connection,
+    secret: Option<&str>,
+    allowed: Option<&HashSet<String>>,
+) -> Value {
     if let Ok(public_key) = ledger::node_public_key(conn) {
         let _ = conn.execute(
             "INSERT OR IGNORE INTO trusted_node_keys(public_key,label,source,created_at) VALUES(?1,'Этот узел','local',?2)",
@@ -552,11 +839,21 @@ pub fn export_transport_bundle(conn: &Connection, secret: Option<&str>) -> Value
     let Some(secret) = secret else {
         return json!({"ok":false,"error":"Для защищённого offline bundle задайте MESHKEEPER_SYNC_TOKEN"});
     };
-    encrypt_transport_journal(&export_journal(conn), secret)
+    encrypt_transport_journal(&export_journal_scoped(conn, None, allowed), secret)
         .unwrap_or_else(|error| json!({"ok":false,"error":error.to_string()}))
 }
 
+#[cfg(test)]
 pub fn import_transport_bundle(conn: &Connection, bundle: &Value, secret: Option<&str>) -> Value {
+    import_transport_bundle_scoped(conn, bundle, secret, None)
+}
+
+pub fn import_transport_bundle_scoped(
+    conn: &Connection,
+    bundle: &Value,
+    secret: Option<&str>,
+    allowed: Option<&HashSet<String>>,
+) -> Value {
     if bundle.get("format").and_then(Value::as_str) != Some("everyday-sync-bundle") {
         return json!({"ok":false,"error":"Неподдерживаемый формат transport bundle"});
     }
@@ -581,6 +878,9 @@ pub fn import_transport_bundle(conn: &Connection, bundle: &Value, secret: Option
     };
     if serde_json::to_vec(journal).map_or(true, |bytes| bytes.len() > TRANSPORT_BUNDLE_LIMIT) {
         return json!({"ok":false,"error":"Transport bundle превышает лимит 30 МБ"});
+    }
+    if allowed.is_some_and(|scope| !journal_within_scope(journal, scope)) {
+        return json!({"ok":false,"error":"Transport bundle содержит организацию вне capability scope"});
     }
     // Файл не доказывает, что объявленный HTTP-адрес сейчас принадлежит
     // непосредственному отправителю: не добавляем его автоматически в peers.
@@ -1671,6 +1971,12 @@ pub fn status(conn: &Connection) -> Value {
     } else {
         "server"
     };
+    let configured_scope = crate::sync_workspace_scope();
+    let mut workspace_scope: Vec<String> = configured_scope
+        .as_ref()
+        .map(|values| values.iter().cloned().collect())
+        .unwrap_or_default();
+    workspace_scope.sort();
     json!({
         "nodeId": id,
         "name": name,
@@ -1685,6 +1991,8 @@ pub fn status(conn: &Connection) -> Value {
         ,"bytesSent": metric(conn, "sync_bytes_sent")
         ,"bytesReceived": metric(conn, "sync_bytes_received")
         ,"syncSuccesses": metric(conn, "sync_successes")
+        ,"workspaceScopeMode": if configured_scope.is_some() { "restricted" } else { "all" }
+        ,"workspaceScope": workspace_scope
     })
 }
 
@@ -1849,6 +2157,92 @@ pub fn resolve_peer_error(conn: &Connection, url: &str) {
 mod tests {
     use super::*;
     const BUNDLE_SECRET: &str = "offline-bundle-test-secret-at-least-32-chars";
+
+    #[test]
+    fn organization_scope_redacts_state_users_and_cas_and_rejects_foreign_journal() {
+        let path = std::env::temp_dir().join(format!("scope-{}.db", uuid::Uuid::new_v4()));
+        let db = crate::db::open(&path).unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        for (guid, name, phone, byte) in [
+            ("org-a", "Организация A", "+70000000001", "QQ=="),
+            ("org-b", "Организация B", "+70000000002", "Qg=="),
+        ] {
+            db.execute("INSERT INTO workspaces(name,internal_id_prefix,created_at,guid) VALUES(?1,'T-',?2,?3)", params![name,now,guid]).unwrap();
+            let workspace = db.last_insert_rowid();
+            db.execute("INSERT INTO users(full_name,phone,password_hash,created_at,guid) VALUES(?1,?2,'secret-hash',?3,?4)",params![format!("Участник {name}"),phone,now,format!("user-{guid}")]).unwrap();
+            let user = db.last_insert_rowid();
+            db.execute(
+                "INSERT INTO user_workspaces(user_id,workspace_id) VALUES(?1,?2)",
+                params![user, workspace],
+            )
+            .unwrap();
+            db.execute("INSERT INTO items(internal_id,title,workspace_id,responsible_user_id,created_at,guid) VALUES(?1,?2,?3,?4,?5,?6)",params![format!("{guid}-1"),format!("Инструмент {name}"),workspace,user,now,format!("item-{guid}")]).unwrap();
+            let item = db.last_insert_rowid();
+            let cas =
+                crate::content::ingest_data_url(&db, &format!("data:text/plain;base64,{byte}"))
+                    .unwrap()
+                    .unwrap();
+            db.execute("INSERT INTO item_photos(item_id,url,thumb_url,is_title,guid) VALUES(?1,?2,?2,1,?3)",params![item,cas,format!("photo-{guid}")]).unwrap();
+        }
+        let full = export_journal(&db);
+        let allowed = HashSet::from(["org-a".to_string()]);
+        assert!(!journal_within_scope(&full, &allowed));
+        let scoped = export_journal_scoped(&db, None, Some(&allowed));
+        ledger::verify_journal(&scoped).unwrap();
+        assert!(journal_within_scope(&scoped, &allowed));
+        assert_eq!(scoped["workspaces"].as_array().unwrap().len(), 1);
+        assert_eq!(scoped["users"].as_array().unwrap().len(), 1);
+        assert_eq!(scoped["items"].as_array().unwrap().len(), 1);
+        assert_eq!(scoped["photos"].as_array().unwrap().len(), 1);
+        assert_eq!(scoped["contentCatalog"].as_array().unwrap().len(), 1);
+        let allowed_hash = scoped["contentCatalog"][0]["hash"].as_str().unwrap();
+        assert!(content_hash_allowed(&db, &allowed, allowed_hash));
+        let foreign_hash = full["contentCatalog"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find_map(|entry| {
+                let hash = entry["hash"].as_str()?;
+                (hash != allowed_hash).then_some(hash)
+            })
+            .unwrap();
+        assert!(!content_hash_allowed(&db, &allowed, foreign_hash));
+        let target_path =
+            std::env::temp_dir().join(format!("scope-target-{}.db", uuid::Uuid::new_v4()));
+        let target = crate::db::open(&target_path).unwrap();
+        let unscoped_bundle = export_transport_bundle(&db, Some(BUNDLE_SECRET));
+        assert_eq!(
+            import_transport_bundle_scoped(
+                &target,
+                &unscoped_bundle,
+                Some(BUNDLE_SECRET),
+                Some(&allowed)
+            )["ok"],
+            false
+        );
+        let scoped_bundle =
+            export_transport_bundle_scoped(&db, Some(BUNDLE_SECRET), Some(&allowed));
+        assert_eq!(
+            import_transport_bundle_scoped(
+                &target,
+                &scoped_bundle,
+                Some(BUNDLE_SECRET),
+                Some(&allowed)
+            )["ok"],
+            true
+        );
+        assert_eq!(
+            target
+                .query_row("SELECT count(*) FROM workspaces", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        drop(db);
+        let _ = std::fs::remove_file(path);
+        drop(target);
+        let _ = std::fs::remove_file(target_path);
+    }
 
     #[test]
     fn transport_bundle_round_trips_and_rejects_tampering() {

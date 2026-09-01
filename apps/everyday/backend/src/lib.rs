@@ -26,7 +26,11 @@ use rusqlite::Connection;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::Sha256;
-use std::{collections::HashMap, path::PathBuf, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    path::PathBuf,
+    sync::Arc,
+};
 use tower_http::services::ServeDir;
 
 struct AppState {
@@ -363,6 +367,21 @@ pub(crate) fn sync_token() -> Option<String> {
         .filter(|t| t.chars().count() >= 32)
 }
 
+/// Optional organization allowlist bound to the mesh capability deployed on
+/// this node. GUIDs are used because local numeric IDs differ between peers.
+pub(crate) fn sync_workspace_scope() -> Option<HashSet<String>> {
+    let raw = std::env::var("MESHKEEPER_SYNC_WORKSPACES").ok()?;
+    let values: HashSet<String> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .collect();
+    // Explicitly empty is fail-closed. Only an absent variable enables the
+    // legacy trusted-infrastructure scope containing every organization.
+    Some(values)
+}
+
 fn sync_authorized(headers: &HeaderMap) -> bool {
     let Some(secret) = sync_token() else {
         return false;
@@ -434,7 +453,12 @@ async fn sync_journal_get(
             .into_response();
     }
     let db = state.db.lock();
-    Json(sync::export_journal(&db)).into_response()
+    Json(sync::export_journal_scoped(
+        &db,
+        None,
+        sync_workspace_scope().as_ref(),
+    ))
+    .into_response()
 }
 
 async fn sync_journal_post(
@@ -450,6 +474,16 @@ async fn sync_journal_post(
             .into_response();
     }
     let db = state.db.lock();
+    if sync_workspace_scope()
+        .as_ref()
+        .is_some_and(|scope| !sync::journal_within_scope(&body, scope))
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({"ok":false,"error":"журнал содержит организацию вне capability scope"})),
+        )
+            .into_response();
+    }
     let from = body
         .get("nodeUrl")
         .and_then(|v| v.as_str())
@@ -471,7 +505,12 @@ async fn sync_journal_pull(
     }
     let requested = body.get("frontier").unwrap_or(&Value::Null);
     let db = state.db.lock();
-    Json(sync::export_journal_since(&db, Some(requested))).into_response()
+    Json(sync::export_journal_scoped(
+        &db,
+        Some(requested),
+        sync_workspace_scope().as_ref(),
+    ))
+    .into_response()
 }
 
 #[derive(Deserialize)]
@@ -493,6 +532,16 @@ async fn sync_blob_get(
             .into_response();
     }
     let db = state.db.lock();
+    if sync_workspace_scope()
+        .as_ref()
+        .is_some_and(|scope| !sync::content_hash_allowed(&db, scope, &hash))
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({"error":"CAS-объект вне organization scope"})),
+        )
+            .into_response();
+    }
     match content::chunk(&db, &hash, query.offset.unwrap_or(0)) {
         Ok(chunk) => Json(chunk).into_response(),
         Err(error) => (
@@ -658,6 +707,18 @@ async fn sync_once(client: &reqwest::Client, state: &Arc<AppState>, upstream: &s
         Ok(resp) if resp.status().is_success() => match resp.bytes().await {
             Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
                 Ok(journal) => {
+                    if sync_workspace_scope()
+                        .as_ref()
+                        .is_some_and(|scope| !sync::journal_within_scope(&journal, scope))
+                    {
+                        let db = state.db.lock();
+                        sync::touch_peer_error(
+                            &db,
+                            upstream,
+                            "peer прислал организацию вне capability scope",
+                        );
+                        return;
+                    }
                     let remote_frontier = journal.get("frontier").cloned().unwrap_or(Value::Null);
                     let db = state.db.lock();
                     sync::metric_add(&db, "sync_bytes_received", bytes.len() as u64);
@@ -717,11 +778,11 @@ async fn sync_once(client: &reqwest::Client, state: &Arc<AppState>, upstream: &s
     // 2. Отдаём свои.
     let mine = {
         let db = state.db.lock();
-        if used_frontier_protocol && remote_frontier.is_array() {
-            sync::export_journal_since(&db, Some(&remote_frontier))
-        } else {
-            sync::export_journal(&db)
-        }
+        sync::export_journal_scoped(
+            &db,
+            (used_frontier_protocol && remote_frontier.is_array()).then_some(&remote_frontier),
+            sync_workspace_scope().as_ref(),
+        )
     };
     let mine_bytes = match serde_json::to_vec(&mine) {
         Ok(value) => value,

@@ -24,6 +24,8 @@ export const syncRouter = createRouter({
     bytesSent: 0,
     bytesReceived: 0,
     syncSuccesses: 0,
+    workspaceScopeMode: "all" as "all" | "restricted",
+    workspaceScope: [] as string[],
   })),
   audit: publicQuery.query(async () => ({
     healthy: true,

@@ -145,6 +145,7 @@ test('browser signs a real custody transaction and ledger retains its proof', as
   await expect(page.getByText(/Snapshot:/)).toContainText(/[a-f0-9]{64}/)
   await expect(page.getByRole('heading', { name: 'Ключи mesh-нод' })).toBeVisible()
   await expect(page.getByRole('heading', { name: 'Этот узел' })).toBeVisible()
+  await expect(page.getByText(/Scope организаций:/)).toContainText('вся база')
   await expect(page.getByTestId('content-node-mode')).toContainText('Подписанная летопись, транзакции и текст синхронизируются всегда')
   await expect(page.getByTestId('content-node-mode')).toContainText('Полная нода')
   await expect(page.getByTestId('content-node-mode')).toContainText('В каталоге:')
