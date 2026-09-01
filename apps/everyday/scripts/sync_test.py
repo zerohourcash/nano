@@ -39,6 +39,8 @@ OWNER_PHONE = "+7 900 111-22-33"
 OWNER_PASSWORD = "SuperSecret123"
 PHOTO_BYTES = bytes((index * 31) % 256 for index in range(150_000))
 PHOTO_DATA_URL = "data:image/png;base64," + base64.b64encode(PHOTO_BYTES).decode()
+DOCUMENT_BYTES = b"%PDF-1.7\n" + bytes((index * 17) % 256 for index in range(90_000))
+DOCUMENT_DATA_URL = "data:application/pdf;base64," + base64.b64encode(DOCUMENT_BYTES).decode()
 
 # Консоль Windows по умолчанию не в UTF-8: без этого падает первый же вывод.
 for stream in (sys.stdout, sys.stderr):
@@ -174,6 +176,14 @@ def item_named(node: Node, workspace_id: int, title: str):
     return next((row for row in rows if row.get("title") == title), None)
 
 
+def item_full_named(node: Node, workspace_id: int, title: str):
+    summary = item_named(node, workspace_id, title)
+    if not isinstance(summary, dict) or not summary.get("id"):
+        return None
+    detail = node.call("items.byId", {"id": summary["id"]}, mutation=False)
+    return detail if isinstance(detail, dict) else None
+
+
 def pull_delta(node: Node, frontier: list[dict]) -> dict:
     request = urllib.request.Request(
         f"{node.base}/sync/journal/pull",
@@ -184,6 +194,31 @@ def pull_delta(node: Node, frontier: list[dict]) -> dict:
     request.add_header("content-type", "application/json")
     with urllib.request.urlopen(request, timeout=10) as response:
         return json.loads(response.read().decode())
+
+
+def session_call(base: str, opener, proc: str, payload=None, mutation: bool = True):
+    """Небольшой независимый клиент для проверки ACL второй сессией."""
+    body = json.dumps({"0": {"json": payload}})
+    if mutation:
+        request = urllib.request.Request(
+            f"{base}/api/trpc/{proc}?batch=1",
+            data=body.encode(),
+            method="POST",
+        )
+        request.add_header("content-type", "application/json")
+    else:
+        query = urllib.parse.quote(body)
+        request = urllib.request.Request(
+            f"{base}/api/trpc/{proc}?batch=1&input={query}", method="GET"
+        )
+    request.add_header("origin", base)
+    with opener.open(request, timeout=20) as response:
+        data = json.loads(response.read().decode())
+    if isinstance(data, list):
+        data = data[0]
+    if "error" in data:
+        return {"__err": data["error"]["json"].get("message")}
+    return data["result"]["data"]["json"]
 
 
 def journal_from(node: Node) -> dict:
@@ -502,6 +537,126 @@ def main() -> int:
             },
         )
         check("предмет создан на узле", isinstance(created, dict) and "id" in created, str(created)[:140])
+
+        # Реальный offline-разрыв: upstream-процесс недоступен, но телефонная
+        # нода продолжает принимать подписанные текстовые транзакции и CAS bytes.
+        server.stop(cleanup=False)
+        offline_blob = node.call(
+            "content.ingest",
+            {"workspaceId": node_ws_id, "dataUrl": DOCUMENT_DATA_URL},
+        )
+        document_guid = str(uuid.uuid4())
+        offline_document = node.call(
+            "items.addDocument",
+            {
+                "itemId": created["id"],
+                "itemGuid": created["guid"],
+                "documentGuid": document_guid,
+                "name": "Офлайн-паспорт.pdf",
+                "url": offline_blob.get("url"),
+                "mime": "application/pdf",
+                "accessLevel": "accounting",
+            },
+        )
+        offline_snapshot = journal_from(node)
+        portable_document = next(
+            (row for row in offline_snapshot.get("documents", []) if row.get("guid") == document_guid),
+            None,
+        )
+        document_event = next(
+            (event for event in offline_snapshot.get("history", []) if event.get("type") == "document_add" and event.get("fromLabel") == document_guid),
+            None,
+        )
+        check(
+            "при недоступном upstream документ остаётся локальной signed-транзакцией",
+            offline_document.get("guid") == document_guid
+            and isinstance(portable_document, dict)
+            and portable_document.get("url", "").startswith("cas:")
+            and portable_document.get("accessLevel") == "accounting"
+            and isinstance(document_event, dict)
+            and document_event.get("eventVersion") == 3
+            and bool(document_event.get("requestDeviceId")),
+            str({"document": portable_document, "event": document_event})[:600],
+        )
+        check(
+            "offline snapshot не содержит байты документа",
+            DOCUMENT_DATA_URL not in json.dumps(offline_snapshot)
+            and base64.b64encode(DOCUMENT_BYTES[:256]).decode() not in json.dumps(offline_snapshot),
+        )
+
+        server.restart()
+        check("upstream восстановился после разрыва", server.wait_ready())
+        node.call("sync.pullNow", {})
+        remote_document_arrived = wait_for(
+            lambda: any(
+                document.get("guid") == document_guid
+                and document.get("url") == DOCUMENT_DATA_URL
+                and document.get("accessLevel") == "accounting"
+                for document in (item_full_named(server, ws_id, "Шуруповёрт с узла") or {}).get("documents", [])
+            ),
+            timeout=30,
+        )
+        check(
+            "после восстановления full-node получил транзакцию и CAS-документ",
+            remote_document_arrived,
+            str({
+                "documents": (item_full_named(server, ws_id, "Шуруповёрт с узла") or {}).get("documents", []),
+                "content": server.call("content.status", None, mutation=False),
+            })[:500],
+        )
+        server_snapshot = journal_from(server)
+        restored_document = next(
+            (row for row in server_snapshot.get("documents", []) if row.get("guid") == document_guid),
+            None,
+        )
+        check(
+            "ACL и ledgerHash документа пережили offline-синхронизацию",
+            isinstance(restored_document, dict)
+            and restored_document.get("accessLevel") == "accounting"
+            and restored_document.get("url", "").startswith("cas:")
+            and bool(restored_document.get("ledgerHash")),
+            str(restored_document),
+        )
+        viewer_opener = urllib.request.build_opener(
+            urllib.request.HTTPCookieProcessor(CookieJar())
+        )
+        viewer_joined = session_call(
+            server.base,
+            viewer_opener,
+            "auth.joinRegister",
+            {
+                "token": mesh_invite["token"],
+                "fullName": "Удалённый наблюдатель",
+                "phone": "+7 900 777-00-01",
+                "password": "ViewerSecret123",
+            },
+        )
+        remote_summary = item_named(server, ws_id, "Шуруповёрт с узла") or {}
+        viewer_card = session_call(
+            server.base,
+            viewer_opener,
+            "items.byId",
+            {"id": remote_summary.get("id")},
+            mutation=False,
+        )
+        check(
+            "удалённая viewer-сессия не получает защищённые документы",
+            bool(viewer_joined.get("id"))
+            and isinstance(viewer_card, dict)
+            and "documents" not in viewer_card,
+            str(viewer_card)[:300],
+        )
+        stale_document_replay = push_journal(server, offline_snapshot)
+        check(
+            "запоздавший повтор offline-snapshot не откатывает full-node",
+            stale_document_replay.get("ok") is False
+            and any(
+                marker in str(stale_document_replay.get("error", "")).lower()
+                for marker in ("rollback", "sequence", "откат")
+            )
+            and bool((item_full_named(server, ws_id, "Шуруповёрт с узла") or {}).get("documents")),
+            str(stale_document_replay),
+        )
         material = node.call(
             "items.create",
             {
