@@ -22,6 +22,7 @@
 | Смена Wi‑Fi/hotspot | NetworkCallback → JNI, динамический HMAC-анонс | Android contract, `npm run discovery:test` | Проверено на host/JNI build |
 | SQLCipher | отдельный feature, обязательный ключ, wrong-key rejection | `npm run encrypted-db:test` | Проверено Linux |
 | Backup/restore | online `.backup`, шифрование, integrity-check, новый target | `npm run backup:restore:test` | Проверено Linux |
+| Потоковый transport core | MTU frames, out-of-order, duplicate, missing ranges, SHA-256 | Rust `stream_transport::tests`, encrypted bundle round-trip | Проверено |
 
 ## Release gates
 
@@ -37,7 +38,8 @@ npm run production:audit
 
 ## Не закрыто и поэтому не заявляется production-ready
 
-- Потоковый BLE Mesh/LoRa adapter пока не реализован. Без IP уже работает
+- BLE Mesh/LoRa radio adapter пока не реализован. Общий bounded MTU framing,
+  out-of-order сборка и resume готовы и тестируются; без IP также работает
   зашифрованный store-and-forward bundle через системный Bluetooth/Wi‑Fi
   Direct/USB Share, но это ручной перенос, не фоновый BLE gossip.
 - iOS native shell и его Keychain/lifecycle тест отсутствуют; на iOS доступна

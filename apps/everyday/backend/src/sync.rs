@@ -2253,6 +2253,21 @@ mod tests {
         assert_eq!(bundle["format"], "everyday-sync-bundle");
         assert_eq!(bundle["version"], 2);
         assert!(bundle.get("journal").is_none());
+        let encoded = serde_json::to_vec(&bundle).unwrap();
+        let frames = crate::stream_transport::fragment(
+            crate::stream_transport::PayloadKind::EncryptedBundle,
+            &encoded,
+            185,
+        )
+        .unwrap();
+        let mut assembler = crate::stream_transport::Assembler::default();
+        let mut transported = None;
+        for frame in frames.into_iter().rev() {
+            if let Some(done) = assembler.accept(&frame).unwrap() {
+                transported = Some(done.bytes);
+            }
+        }
+        let bundle: Value = serde_json::from_slice(&transported.unwrap()).unwrap();
         assert_eq!(
             import_transport_bundle(&target, &bundle, Some(BUNDLE_SECRET))["ok"],
             true

@@ -131,7 +131,7 @@ Bluetooth/Wi‑Fi Direct `content://` поток читается в отдел�
 организации. Для нескольких capability UDP discovery намеренно выключен, пока
 адаптер не сможет анонсировать несколько HMAC-доменов через один socket.
 
-## Контракт будущего потокового адаптера
+## Потоковый adapter core
 
 BLE GATT, Bluetooth Mesh, Wi‑Fi Direct, WebRTC, LoRa или последовательный порт
 должны переносить неизменённый signed journal/bundle и CAS chunks. Минимальный
@@ -149,6 +149,19 @@ CRC/MTU-фрагментация допустимы как защита кана
 отдельное end-to-end шифрование: текущий journal подписан, но его текст не
 зашифрован.
 
+Transport-neutral реализация уже находится в `backend/src/stream_transport.rs`.
+Она принимает только opaque encrypted bundle или CAS object и режет его на
+`MKST` v1 frames заданного MTU. Каждый кадр содержит случайный 128-битный
+transfer ID, sequence/count, общий SHA-256, размер и доменно отделённый
+64-битный chunk tag. Приём допускает произвольный порядок и одинаковые повторы,
+возвращает компактные missing ranges, но отклоняет конфликтующий повтор,
+смешивание transfers, неверные размеры и повреждение. Лимиты: 32 МиБ и 262144
+кадра. После сборки обязательно проверяется полный SHA-256; затем существующий
+bundle importer независимо проверяет XChaCha20-Poly1305 и Ed25519.
+
+Это готовое ядро протокола, но не заявление о доступе к BLE radio: Android/iOS
+GATT service и конкретная маршрутизация Bluetooth Mesh остаются platform layer.
+
 ## Реальный статус платформ
 
 - Windows, Linux и macOS: один Rust-бинарник с локальной SQLite и PWA.
@@ -158,5 +171,6 @@ CRC/MTU-фрагментация допустимы как защита кана
   NetworkCallback обновляет advertised endpoint при смене Wi‑Fi/хотспота, а
   discovery вычисляет адрес заново перед каждым подписанным анонсом.
 - Обмен телефонов без IP: уже возможен вручную через системный файловый Share.
-- iOS-оболочка и потоковый BLE Mesh adapter ещё не реализованы; документация не
-  должна заявлять обратное. Android ABI/APK проверяются отдельным CI job.
+- iOS-оболочка и BLE radio adapter ещё не реализованы; общий MTU framing,
+  resume и проверка encrypted payload уже реализованы и не зависят от radio.
+  Android ABI/APK проверяются отдельным CI job.

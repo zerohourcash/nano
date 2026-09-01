@@ -9,6 +9,7 @@ mod discovery;
 mod json;
 mod knowledge;
 mod ledger;
+pub mod stream_transport;
 mod sync;
 
 use axum::{
