@@ -43,6 +43,11 @@ capability, затем применяют только её scope. Неверн�
 - Сессионный токен хранится в БД только как SHA-256, cookie — HttpOnly,
   SameSite=Strict и Secure в production.
 - Изменяющие browser-запросы требуют same-origin `Origin`.
+- За reverse proxy внешний origin задаётся точным
+  `MESHKEEPER_PUBLIC_ORIGIN=https://host[:port]`. Он проходит строгий startup
+  parse без path/query/userinfo; backend не доверяет клиентским
+  `X-Forwarded-Host/Proto`. Это сохраняет CSRF-защиту при отличающемся внешнем
+  порте и не расширяет allowlist на другие домены.
 - Все запросы ограничены 32 МБ; `metadata_json` — 64 КБ.
 - Опциональная выдача Android test APK включается только парой
   `MESHKEEPER_ANDROID_APK_PATH`/`MESHKEEPER_ANDROID_APK_SHA256`. Узел читает файл
@@ -59,6 +64,10 @@ capability, затем применяют только её scope. Неверн�
   набор файлов, размер и SHA-256 каждого из них и запрещает DB, приватные ключи,
   keystore и APK до публикации CI artifact; затем пакет запускается на новой
   временной базе и обязан отдать настоящий `/health` и offline `index.html`.
+- Passwordless `auth.directory` является только демонстрационным режимом.
+  Startup требует одновременно `MESHKEEPER_DEMO_DATA=1` и
+  `MESHKEEPER_DEMO_LOGIN=1`; любая неполная комбинация fail-closed отклоняется
+  до открытия SQLite. В production обе переменные должны отсутствовать.
 - CSP, запрет iframe/MIME sniffing, строгая referrer-policy и Permissions-Policy.
 - API и sync-ответы получают `Cache-Control: no-store`.
 - Не-loopback bind требует secure-cookie; каждый peer синхронизации требует HTTPS.

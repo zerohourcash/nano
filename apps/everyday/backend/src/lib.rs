@@ -120,6 +120,42 @@ fn validated_release(
     Ok(Some(path))
 }
 
+fn validate_demo_mode(demo_data: bool, demo_login: bool) -> anyhow::Result<()> {
+    if demo_data != demo_login {
+        anyhow::bail!(
+            "MESHKEEPER_DEMO_DATA=1 and MESHKEEPER_DEMO_LOGIN=1 must be enabled together"
+        );
+    }
+    Ok(())
+}
+
+fn configured_public_origin() -> anyhow::Result<Option<String>> {
+    let Ok(raw) = std::env::var("MESHKEEPER_PUBLIC_ORIGIN") else {
+        return Ok(None);
+    };
+    let origin = raw.trim().trim_end_matches('/');
+    let parsed = reqwest::Url::parse(origin).map_err(|_| {
+        anyhow::anyhow!("MESHKEEPER_PUBLIC_ORIGIN must be an absolute HTTP(S) origin")
+    })?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || parsed.host_str().is_none()
+        || parsed.username() != ""
+        || parsed.password().is_some()
+        || parsed.path() != "/"
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        anyhow::bail!("MESHKEEPER_PUBLIC_ORIGIN must contain only scheme, host and optional port");
+    }
+    Ok(Some(origin.to_owned()))
+}
+
+fn same_origin_allowed(origin: &str, host: &str, public_origin: Option<&str>) -> bool {
+    origin == format!("http://{host}")
+        || origin == format!("https://{host}")
+        || public_origin.is_some_and(|configured| origin == configured)
+}
+
 /// Единый защитный контур для API и SPA. Заголовки выставляются самим узлом,
 /// поэтому защита остаётся и при ошибочной конфигурации reverse proxy.
 async fn security_headers(request: Request<Body>, next: Next) -> Response {
@@ -301,7 +337,13 @@ async fn trpc_request(
             .get("host")
             .and_then(|v| v.to_str().ok())
             .unwrap_or_default();
-        let allowed = origin == format!("http://{host}") || origin == format!("https://{host}");
+        let public_origin = match configured_public_origin() {
+            Ok(value) => value,
+            Err(_) => {
+                return (StatusCode::INTERNAL_SERVER_ERROR, "invalid public origin").into_response()
+            }
+        };
+        let allowed = same_origin_allowed(origin, host, public_origin.as_deref());
         if !allowed {
             return (StatusCode::FORBIDDEN, "cross-site request rejected").into_response();
         }
@@ -1274,6 +1316,11 @@ fn short_net_error(e: &reqwest::Error) -> String {
 /// Запускает тот же узел из desktop binary или мобильного JNI bridge.
 pub async fn run() -> anyhow::Result<()> {
     let dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    validate_demo_mode(
+        std::env::var("MESHKEEPER_DEMO_DATA").as_deref() == Ok("1"),
+        std::env::var("MESHKEEPER_DEMO_LOGIN").as_deref() == Ok("1"),
+    )?;
+    let _ = configured_public_origin()?;
     // Проверяем распространяемый пакет до открытия/миграции рабочей базы:
     // ошибочная публикация не должна запускать узел даже частично.
     let android_test_release = validated_release(
@@ -1535,6 +1582,33 @@ mod capability_tests {
         assert!(constant_time_eq(b"same-token", b"same-token"));
         assert!(!constant_time_eq(b"same-token", b"same-tokee"));
         assert!(!constant_time_eq(b"short", b"longer"));
+    }
+
+    #[test]
+    fn demo_data_and_passwordless_directory_are_an_explicit_pair() {
+        assert!(validate_demo_mode(false, false).is_ok());
+        assert!(validate_demo_mode(true, true).is_ok());
+        assert!(validate_demo_mode(true, false).is_err());
+        assert!(validate_demo_mode(false, true).is_err());
+    }
+
+    #[test]
+    fn explicit_public_origin_handles_reverse_proxy_port_without_weakening_csrf() {
+        assert!(same_origin_allowed(
+            "https://inventory.example:8443",
+            "inventory.example",
+            Some("https://inventory.example:8443")
+        ));
+        assert!(!same_origin_allowed(
+            "https://attacker.example",
+            "inventory.example",
+            Some("https://inventory.example:8443")
+        ));
+        assert!(same_origin_allowed(
+            "http://127.0.0.1:8080",
+            "127.0.0.1:8080",
+            None
+        ));
     }
 }
 
