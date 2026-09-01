@@ -86,6 +86,7 @@ export default function Knowledge() {
     },
     onError: (error) => toast.error(error.message),
   })
+  const ingestContent = trpc.content.ingest.useMutation()
 
   const startCreate = () => {
     setTitle('')
@@ -124,18 +125,27 @@ export default function Knowledge() {
     }
   }
 
-  const onSubmit = (event: FormEvent) => {
+  const onSubmit = async (event: FormEvent) => {
     event.preventDefault()
     if (!workspace || !title.trim() || !slug.trim()) return
-    save.mutate({
-      workspaceId: workspace.id,
-      title: title.trim(),
-      slug: slugify(slug),
-      content,
-      visibility,
-      parentRevisionGuid: page?.slug === slugify(slug) ? page.currentRevisionGuid ?? undefined : undefined,
-      attachments: attachments.map(({ name, url, mime }) => ({ name, url, ...(mime ? { mime } : {}) })),
-    })
+    try {
+      const compactAttachments = await Promise.all(attachments.map(async ({ name, url, mime }) => {
+        if (!url.startsWith('data:')) return { name, url, ...(mime ? { mime } : {}) }
+        const uploaded = await ingestContent.mutateAsync({ workspaceId: workspace.id, dataUrl: url })
+        return { name, url: uploaded.url, mime: uploaded.mime }
+      }))
+      save.mutate({
+        workspaceId: workspace.id,
+        title: title.trim(),
+        slug: slugify(slug),
+        content,
+        visibility,
+        parentRevisionGuid: page?.slug === slugify(slug) ? page.currentRevisionGuid ?? undefined : undefined,
+        attachments: compactAttachments,
+      })
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : 'Не удалось сохранить вложение в CAS')
+    }
   }
 
   const revisionLabel = page?.current?.revisionHash?.slice(0, 12)
@@ -205,8 +215,8 @@ export default function Knowledge() {
                 ))}
               </div>
               <div className="flex flex-wrap gap-2">
-                <button disabled={save.isPending} className="inline-flex items-center gap-2 rounded-xl bg-accent px-4 py-2.5 text-sm font-semibold text-white disabled:opacity-50">
-                  {save.isPending ? <Loader2 size={16} className="animate-spin" /> : <Save size={16} />} Подписать ревизию
+                <button disabled={save.isPending || ingestContent.isPending} className="inline-flex items-center gap-2 rounded-xl bg-accent px-4 py-2.5 text-sm font-semibold text-white disabled:opacity-50">
+                  {save.isPending || ingestContent.isPending ? <Loader2 size={16} className="animate-spin" /> : <Save size={16} />} Подписать ревизию
                 </button>
                 <button type="button" onClick={() => setEditing(false)} className="rounded-xl border border-brand-100 px-4 py-2.5 text-sm font-semibold text-ink-700">Отмена</button>
               </div>

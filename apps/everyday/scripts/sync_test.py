@@ -41,6 +41,7 @@ PHOTO_BYTES = bytes((index * 31) % 256 for index in range(150_000))
 PHOTO_DATA_URL = "data:image/png;base64," + base64.b64encode(PHOTO_BYTES).decode()
 DOCUMENT_BYTES = b"%PDF-1.7\n" + bytes((index * 17) % 256 for index in range(90_000))
 DOCUMENT_DATA_URL = "data:application/pdf;base64," + base64.b64encode(DOCUMENT_BYTES).decode()
+KNOWLEDGE_DATA_URL = "data:text/plain;base64,0J/RgNC+0LLQtdGA0LrQsA=="
 
 # Консоль Windows по умолчанию не в UTF-8: без этого падает первый же вывод.
 for stream in (sys.stdout, sys.stderr):
@@ -703,10 +704,22 @@ def main() -> int:
                 "slug": "offline/safety",
                 "title": "Офлайн-инструкция",
                 "content": "# Безопасность\nПроверить инструмент перед работой.",
-                "attachments": [{"name": "Памятка", "url": "data:text/plain;base64,0J/RgNC+0LLQtdGA0LrQsA=="}],
+                "attachments": [{"name": "Памятка", "url": KNOWLEDGE_DATA_URL}],
             },
         )
         check("ревизия локальной базы знаний подписана", bool(knowledge.get("savedRevisionHash")), str(knowledge)[:180])
+        knowledge_snapshot = journal_from(node)
+        exported_attachment = (
+            knowledge_snapshot.get("knowledge", {})
+            .get("revisions", [{}])[-1]
+            .get("attachments", [{}])[0]
+        )
+        check(
+            "wiki snapshot передаёт CAS-ссылку без байтов вложения",
+            exported_attachment.get("url", "").startswith("cas:")
+            and KNOWLEDGE_DATA_URL not in json.dumps(knowledge_snapshot),
+            str(exported_attachment),
+        )
         fault = node.call(
             "items.reportFault",
             {"itemId": created["id"], "severity": "high", "description": "Офлайн: искрит выключатель"},

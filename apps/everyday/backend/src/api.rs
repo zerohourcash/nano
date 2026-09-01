@@ -7993,6 +7993,12 @@ mod tests {
             .as_str()
             .unwrap()
             .starts_with("data:image/png"));
+        let portable = crate::knowledge::export(&conn);
+        assert!(portable["revisions"][0]["attachments"][0]["url"]
+            .as_str()
+            .unwrap()
+            .starts_with("cas:"));
+        assert!(!portable.to_string().contains("data:image/png"));
         crate::knowledge::verify(&conn).unwrap();
         let limited = json!({"viewKnowledge":true,"editKnowledge":false,"viewAccounting":false});
         conn.execute(
