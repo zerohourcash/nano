@@ -93,7 +93,7 @@ fn photos(conn: &Connection, item_id: i64) -> Vec<Value> {
 pub fn storage_obj(conn: &Connection, id: Option<i64>) -> Value {
     let Some(id) = id else { return Value::Null };
     conn.query_row(
-        "SELECT id, name, responsible_user_id, workspace_id, address FROM storages WHERE id=?1",
+        "SELECT id, name, responsible_user_id, workspace_id, address, guid FROM storages WHERE id=?1",
         params![id],
         |r| {
             Ok(json!({
@@ -102,6 +102,7 @@ pub fn storage_obj(conn: &Connection, id: Option<i64>) -> Value {
                 "responsibleUserId": r.get::<_, Option<i64>>(2)?,
                 "workspaceId": r.get::<_, i64>(3)?,
                 "address": r.get::<_, Option<String>>(4)?,
+                "guid": r.get::<_, Option<String>>(5)?,
             }))
         },
     )

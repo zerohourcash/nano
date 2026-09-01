@@ -1095,33 +1095,21 @@ fn dispatch_inner(
         "admin.workspaces.createInvite" => ws_create_invite(conn, input, user_id),
         "admin.workspaces.invites" => ws_invites(conn, input),
         "admin.storages.list" => storages_list(conn, input),
-        "admin.storages.create" => storage_create(conn, input),
-        "admin.storages.update" => storage_update(conn, input),
-        "admin.storages.remove" => {
-            conn.execute(
-                "DELETE FROM storages WHERE id=?1",
-                params![i64v(input, "id").unwrap_or(0)],
-            )?;
-            Ok(json!({"ok": true}))
-        }
+        "admin.storages.create" => storage_create(conn, input, user_id),
+        "admin.storages.update" => storage_update(conn, input, user_id),
+        "admin.storages.remove" => storage_remove(conn, input, user_id),
         "admin.buildingSites.list" => sites_list(conn, input),
-        "admin.buildingSites.create" => site_create(conn, input),
-        "admin.buildingSites.update" => site_update(conn, input),
-        "admin.buildingSites.remove" => {
-            conn.execute(
-                "DELETE FROM building_sites WHERE id=?1",
-                params![i64v(input, "id").unwrap_or(0)],
-            )?;
-            Ok(json!({"ok": true}))
-        }
+        "admin.buildingSites.create" => site_create(conn, input, user_id),
+        "admin.buildingSites.update" => site_update(conn, input, user_id),
+        "admin.buildingSites.remove" => site_remove(conn, input, user_id),
         "admin.organizationNodes.list" => organization_nodes_list(conn, input),
         "admin.organizationNodes.create" => organization_node_create(conn, input, user_id),
         "admin.organizationNodes.update" => organization_node_update(conn, input, user_id),
         "admin.organizationNodes.remove" => organization_node_remove(conn, input, user_id),
         "admin.dictionaries.list" => dict_list(conn, input),
-        "admin.dictionaries.create" => dict_create(conn, input),
-        "admin.dictionaries.update" => dict_update(conn, input),
-        "admin.dictionaries.remove" => dict_remove(conn, input),
+        "admin.dictionaries.create" => dict_create(conn, input, user_id),
+        "admin.dictionaries.update" => dict_update(conn, input, user_id),
+        "admin.dictionaries.remove" => dict_remove(conn, input, user_id),
         _ => Err(ApiError::not_found(format!("Нет процедуры {procedure}"))),
     }
 }
@@ -4334,9 +4322,176 @@ fn ws_invites(conn: &Connection, input: &Value) -> ApiResult {
     Ok(Value::Array(rows))
 }
 
+fn config_kind_table(kind: &str) -> Result<&'static str, ApiError> {
+    match kind {
+        "storage" => Ok("storages"),
+        "site" => Ok("building_sites"),
+        "category" => Ok("categories"),
+        "brand" => Ok("brands"),
+        "status" => Ok("statuses"),
+        _ => Err(ApiError::bad("Некорректный тип конфигурации")),
+    }
+}
+
+fn config_fields(
+    conn: &Connection,
+    kind: &str,
+    id: i64,
+) -> Result<(i64, String, Value, bool), ApiError> {
+    let table = config_kind_table(kind)?;
+    let common = format!("SELECT workspace_id,guid,name,archived FROM {table} WHERE id=?1");
+    let (ws, guid, name, archived): (i64, String, String, i64) = conn
+        .query_row(&common, [id], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+        })
+        .map_err(|_| ApiError::not_found("Элемент конфигурации не найден"))?;
+    let fields = match kind {
+        "storage" => {
+            let (responsible, address): (Option<i64>, Option<String>) = conn.query_row(
+                "SELECT responsible_user_id,address FROM storages WHERE id=?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            json!({"name":name,"responsibleGuid":responsible.map(|uid|ledger::guid(conn,"users",uid)).transpose().map_err(|e|ApiError::internal(e.to_string()))?,"address":address})
+        }
+        "site" => {
+            let responsible: Option<i64> = conn.query_row(
+                "SELECT responsible_user_id FROM building_sites WHERE id=?1",
+                [id],
+                |r| r.get(0),
+            )?;
+            json!({"name":name,"responsibleGuid":responsible.map(|uid|ledger::guid(conn,"users",uid)).transpose().map_err(|e|ApiError::internal(e.to_string()))?})
+        }
+        "category" | "brand" => {
+            let description: Option<String> = conn.query_row(
+                &format!("SELECT description FROM {table} WHERE id=?1"),
+                [id],
+                |r| r.get(0),
+            )?;
+            json!({"name":name,"description":description})
+        }
+        "status" => {
+            let (description, slug, color, bg): (
+                Option<String>,
+                String,
+                Option<String>,
+                Option<String>,
+            ) = conn.query_row(
+                "SELECT description,slug,color,bg FROM statuses WHERE id=?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )?;
+            json!({"name":name,"description":description,"slug":slug,"color":color,"bg":bg})
+        }
+        _ => unreachable!(),
+    };
+    Ok((ws, guid, fields, archived != 0))
+}
+
+fn config_payload_hash(
+    kind: &str,
+    guid: &str,
+    parent: Option<&str>,
+    depth: i64,
+    workspace: &str,
+    actor: &str,
+    active: bool,
+    fields: &Value,
+    updated_at: &str,
+) -> String {
+    let payload = json!({"domain":"everyday/config-version/v1","kind":kind,"entityGuid":guid,"parentHash":parent,"depth":depth,"workspaceGuid":workspace,"actorGuid":actor,"active":active,"fields":fields,"updatedAt":updated_at});
+    format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&payload).expect("JSON serialization"))
+    )
+}
+
+fn config_version_hash(payload_hash: &str, ledger_hash: &str) -> String {
+    format!(
+        "{:x}",
+        Sha256::digest(
+            format!("everyday/config-version-ledger/v1\n{payload_hash}\n{ledger_hash}").as_bytes()
+        )
+    )
+}
+
+fn validate_config_responsible(
+    conn: &Connection,
+    workspace_id: i64,
+    responsible_user_id: Option<i64>,
+) -> Result<(), ApiError> {
+    let Some(user_id) = responsible_user_id else {
+        return Ok(());
+    };
+    let member: i64 = conn.query_row(
+        "SELECT count(*) FROM user_workspaces WHERE workspace_id=?1 AND user_id=?2 AND removed_at IS NULL",
+        params![workspace_id,user_id], |row| row.get(0),
+    )?;
+    if member == 0 {
+        return Err(ApiError::bad("Ответственный не состоит в этой организации"));
+    }
+    Ok(())
+}
+
+fn record_config_version(
+    conn: &Connection,
+    kind: &str,
+    id: i64,
+    uid: i64,
+    operation: &str,
+) -> Result<Value, ApiError> {
+    let (ws, guid, fields, archived) = config_fields(conn, kind, id)?;
+    let parent:Option<(String,i64)>=conn.query_row("SELECT version_hash,depth FROM config_versions WHERE kind=?1 AND entity_guid=?2 ORDER BY depth DESC,version_hash DESC LIMIT 1",params![kind,guid],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+    let (parent_hash, depth, event_type) = match (parent, operation) {
+        (Some((hash, depth)), "archive") => (Some(hash), depth + 1, "config_archive"),
+        (Some((hash, depth)), _) => (Some(hash), depth + 1, "config_update"),
+        (None, "create") => (None, 0, "config_create"),
+        (None, _) => (None, 0, "config_adopt"),
+    };
+    let workspace_guid =
+        ledger::guid(conn, "workspaces", ws).map_err(|e| ApiError::internal(e.to_string()))?;
+    let actor_guid =
+        ledger::guid(conn, "users", uid).map_err(|e| ApiError::internal(e.to_string()))?;
+    let updated_at = now();
+    let payload_hash = config_payload_hash(
+        kind,
+        &guid,
+        parent_hash.as_deref(),
+        depth,
+        &workspace_guid,
+        &actor_guid,
+        !archived,
+        &fields,
+        &updated_at,
+    );
+    let event = ledger::append(
+        conn,
+        ws,
+        uid,
+        None,
+        event_type,
+        Some(&guid),
+        Some(&payload_hash),
+        None,
+        Some(&format!(
+            "Конфигурация {kind}: {}",
+            fields["name"].as_str().unwrap_or("элемент")
+        )),
+    )
+    .map_err(|e| ApiError::internal(format!("Ошибка журнала: {e}")))?;
+    let ledger_hash = event["opId"]
+        .as_str()
+        .ok_or_else(|| ApiError::internal("Ledger не вернул hash"))?;
+    let version_hash = config_version_hash(&payload_hash, ledger_hash);
+    conn.execute("INSERT INTO config_versions(version_hash,entity_guid,kind,parent_hash,depth,workspace_guid,actor_guid,active,fields_json,payload_hash,ledger_hash,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",params![version_hash,guid,kind,parent_hash,depth,workspace_guid,actor_guid,!archived,fields.to_string(),payload_hash,ledger_hash,updated_at])?;
+    Ok(
+        json!({"guid":guid,"versionHash":version_hash,"ledgerHash":ledger_hash,"depth":depth,"active":!archived}),
+    )
+}
+
 fn storages_list(conn: &Connection, input: &Value) -> ApiResult {
     let ws = i64v(input, "workspaceId").unwrap_or_else(|| ws_fallback(conn));
-    let mut stmt = conn.prepare("SELECT id FROM storages WHERE workspace_id=?1")?;
+    let mut stmt = conn.prepare("SELECT id FROM storages WHERE workspace_id=?1 AND archived=0")?;
     let ids: Vec<i64> = stmt
         .query_map(params![ws], |r| r.get(0))?
         .filter_map(|x| x.ok())
@@ -4351,56 +4506,149 @@ fn storages_list(conn: &Connection, input: &Value) -> ApiResult {
     }
     Ok(Value::Array(out))
 }
-fn storage_create(conn: &Connection, input: &Value) -> ApiResult {
-    let ws = i64v(input, "workspaceId").unwrap_or_else(|| ws_fallback(conn));
-    conn.execute("INSERT INTO storages (name, responsible_user_id, workspace_id, address) VALUES (?1,?2,?3,?4)",
-        params![s(input,"name").unwrap_or("Склад".into()), i64v(input,"responsibleUserId"), ws, s(input,"address")])?;
-    Ok(jsn::storage_obj(conn, Some(conn.last_insert_rowid())))
+fn storage_create(conn: &mut Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
+    atomic(conn, |conn| storage_create_atomic(conn, input, user_id))
 }
-fn storage_update(conn: &Connection, input: &Value) -> ApiResult {
+fn storage_create_atomic(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
+    let uid = require_user(conn, user_id)?;
+    let ws = i64v(input, "workspaceId").unwrap_or_else(|| ws_fallback(conn));
+    let name = s(input, "name").unwrap_or("Склад".into());
+    validate_node_text(&name, "Название", 120)?;
+    validate_config_responsible(conn, ws, i64v(input, "responsibleUserId"))?;
+    conn.execute("INSERT INTO storages(name,responsible_user_id,workspace_id,address,guid) VALUES(?1,?2,?3,?4,?5)",params![name,i64v(input,"responsibleUserId"),ws,s(input,"address"),Uuid::new_v4().to_string()])?;
+    let id = conn.last_insert_rowid();
+    let proof = record_config_version(conn, "storage", id, uid, "create")?;
+    let mut result = jsn::storage_obj(conn, Some(id));
+    result["guid"] = proof["guid"].clone();
+    result["versionHash"] = proof["versionHash"].clone();
+    Ok(result)
+}
+fn storage_update(conn: &mut Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
+    atomic(conn, |conn| storage_update_atomic(conn, input, user_id))
+}
+fn storage_update_atomic(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
+    let uid = require_user(conn, user_id)?;
     let id = i64v(input, "id").ok_or_else(|| ApiError::bad("id"))?;
-    conn.execute("UPDATE storages SET name=COALESCE(?2,name), responsible_user_id=?3, address=COALESCE(?4,address) WHERE id=?1",
-        params![id, s(input,"name"), i64v(input,"responsibleUserId"), s(input,"address")])?;
-    Ok(jsn::storage_obj(conn, Some(id)))
+    if let Some(name) = s(input, "name") {
+        validate_node_text(&name, "Название", 120)?;
+    }
+    let ws: i64 = conn.query_row(
+        "SELECT workspace_id FROM storages WHERE id=?1 AND archived=0",
+        [id],
+        |r| r.get(0),
+    )?;
+    if input.get("responsibleUserId").is_some() {
+        validate_config_responsible(conn, ws, i64v(input, "responsibleUserId"))?;
+    }
+    conn.execute("UPDATE storages SET name=COALESCE(?2,name),responsible_user_id=CASE WHEN ?3 THEN ?4 ELSE responsible_user_id END,address=CASE WHEN ?5 THEN ?6 ELSE address END WHERE id=?1 AND archived=0",params![id,s(input,"name"),input.get("responsibleUserId").is_some(),i64v(input,"responsibleUserId"),input.get("address").is_some(),s(input,"address")])?;
+    let proof = record_config_version(conn, "storage", id, uid, "update")?;
+    let mut result = jsn::storage_obj(conn, Some(id));
+    result["guid"] = proof["guid"].clone();
+    result["versionHash"] = proof["versionHash"].clone();
+    Ok(result)
+}
+fn storage_remove(conn: &mut Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
+    atomic(conn, |conn| {
+        let uid = require_user(conn, user_id)?;
+        let id = i64v(input, "id").ok_or_else(|| ApiError::bad("id"))?;
+        let used: i64 = conn.query_row(
+            "SELECT count(*) FROM items WHERE storage_id=?1 AND archived=0",
+            [id],
+            |r| r.get(0),
+        )?;
+        if used > 0 {
+            return Err(ApiError::conflict("Склад используется в карточках ТМЦ"));
+        }
+        conn.execute("UPDATE storages SET archived=1 WHERE id=?1", [id])?;
+        let proof = record_config_version(conn, "storage", id, uid, "archive")?;
+        Ok(
+            json!({"ok":true,"archived":true,"id":id,"guid":proof["guid"],"versionHash":proof["versionHash"]}),
+        )
+    })
 }
 fn sites_list(conn: &Connection, input: &Value) -> ApiResult {
     let ws = i64v(input, "workspaceId").unwrap_or_else(|| ws_fallback(conn));
-    let mut stmt = conn.prepare("SELECT id, name, responsible_user_id, workspace_id FROM building_sites WHERE workspace_id=?1")?;
+    let mut stmt=conn.prepare("SELECT id,name,responsible_user_id,workspace_id,guid FROM building_sites WHERE workspace_id=?1 AND archived=0")?;
     let rows: Vec<Value> = stmt
         .query_map(params![ws], |r| {
             let uid: Option<i64> = r.get(2)?;
             Ok(json!({
                 "id": r.get::<_, i64>(0)?, "name": r.get::<_, String>(1)?,
                 "responsibleUserId": uid, "workspaceId": r.get::<_, i64>(3)?,
-                "responsible": uid.and_then(|i| jsn::user_public(conn, i))
+                "responsible":uid.and_then(|i|jsn::user_public(conn,i)),"guid":r.get::<_,Option<String>>(4)?
             }))
         })?
         .filter_map(|x| x.ok())
         .collect();
     Ok(Value::Array(rows))
 }
-fn site_create(conn: &Connection, input: &Value) -> ApiResult {
+fn site_create(conn: &mut Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
+    atomic(conn, |conn| site_create_atomic(conn, input, user_id))
+}
+fn site_create_atomic(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
+    let uid = require_user(conn, user_id)?;
     let ws = i64v(input, "workspaceId").unwrap_or_else(|| ws_fallback(conn));
+    let name = s(input, "name").unwrap_or("Объект".into());
+    validate_node_text(&name, "Название", 120)?;
+    validate_config_responsible(conn, ws, i64v(input, "responsibleUserId"))?;
     conn.execute(
-        "INSERT INTO building_sites (name, responsible_user_id, workspace_id) VALUES (?1,?2,?3)",
+        "INSERT INTO building_sites(name,responsible_user_id,workspace_id,guid) VALUES(?1,?2,?3,?4)",
         params![
-            s(input, "name").unwrap_or("Объект".into()),
+            name,
             i64v(input, "responsibleUserId"),
-            ws
+            ws,Uuid::new_v4().to_string()
         ],
     )?;
     let id = conn.last_insert_rowid();
+    let proof = record_config_version(conn, "site", id, uid, "create")?;
     Ok(
-        json!({"id": id, "name": s(input,"name"), "workspaceId": ws, "responsibleUserId": i64v(input,"responsibleUserId")}),
+        json!({"id":id,"guid":proof["guid"],"versionHash":proof["versionHash"],"name":s(input,"name"),"workspaceId":ws,"responsibleUserId":i64v(input,"responsibleUserId")}),
     )
 }
-fn site_update(conn: &Connection, input: &Value) -> ApiResult {
+fn site_update(conn: &mut Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
+    atomic(conn, |conn| site_update_atomic(conn, input, user_id))
+}
+fn site_update_atomic(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
+    let uid = require_user(conn, user_id)?;
     let id = i64v(input, "id").ok_or_else(|| ApiError::bad("id"))?;
-    conn.execute(
-        "UPDATE building_sites SET name=COALESCE(?2,name), responsible_user_id=?3 WHERE id=?1",
-        params![id, s(input, "name"), i64v(input, "responsibleUserId")],
+    if let Some(name) = s(input, "name") {
+        validate_node_text(&name, "Название", 120)?;
+    }
+    let ws: i64 = conn.query_row(
+        "SELECT workspace_id FROM building_sites WHERE id=?1 AND archived=0",
+        [id],
+        |r| r.get(0),
     )?;
-    Ok(json!({"id": id, "name": s(input,"name")}))
+    if input.get("responsibleUserId").is_some() {
+        validate_config_responsible(conn, ws, i64v(input, "responsibleUserId"))?;
+    }
+    conn.execute(
+        "UPDATE building_sites SET name=COALESCE(?2,name),responsible_user_id=CASE WHEN ?3 THEN ?4 ELSE responsible_user_id END WHERE id=?1 AND archived=0",
+        params![id,s(input,"name"),input.get("responsibleUserId").is_some(),i64v(input,"responsibleUserId")],
+    )?;
+    let proof = record_config_version(conn, "site", id, uid, "update")?;
+    Ok(
+        json!({"id":id,"guid":proof["guid"],"versionHash":proof["versionHash"],"name":s(input,"name")}),
+    )
+}
+fn site_remove(conn: &mut Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
+    atomic(conn, |conn| {
+        let uid = require_user(conn, user_id)?;
+        let id = i64v(input, "id").ok_or_else(|| ApiError::bad("id"))?;
+        let used: i64 = conn.query_row(
+            "SELECT count(*) FROM items WHERE building_site_id=?1 AND archived=0",
+            [id],
+            |r| r.get(0),
+        )?;
+        if used > 0 {
+            return Err(ApiError::conflict("Объект используется в карточках ТМЦ"));
+        }
+        conn.execute("UPDATE building_sites SET archived=1 WHERE id=?1", [id])?;
+        let proof = record_config_version(conn, "site", id, uid, "archive")?;
+        Ok(
+            json!({"ok":true,"archived":true,"id":id,"guid":proof["guid"],"versionHash":proof["versionHash"]}),
+        )
+    })
 }
 
 fn organization_node_json(conn: &Connection, id: i64) -> Option<Value> {
@@ -4644,9 +4892,9 @@ fn dict_list(conn: &Connection, input: &Value) -> ApiResult {
     let table = dict_table(&kind)?;
     let ws = i64v(input, "workspaceId").unwrap_or_else(|| ws_fallback(conn));
     let sql = if table == "statuses" {
-        format!("SELECT id, name, description, workspace_id, type, slug, color, bg FROM {table} WHERE workspace_id=?1")
+        format!("SELECT id,name,description,workspace_id,type,slug,color,bg,guid FROM {table} WHERE workspace_id=?1 AND archived=0")
     } else {
-        format!("SELECT id, name, description, workspace_id, type, NULL, NULL, NULL FROM {table} WHERE workspace_id=?1")
+        format!("SELECT id,name,description,workspace_id,type,NULL,NULL,NULL,guid FROM {table} WHERE workspace_id=?1 AND archived=0")
     };
     let mut stmt = conn.prepare(&sql)?;
     let rows: Vec<Value> = stmt
@@ -4656,20 +4904,34 @@ fn dict_list(conn: &Connection, input: &Value) -> ApiResult {
                 "description": r.get::<_, Option<String>>(2)?, "workspaceId": r.get::<_, i64>(3)?,
                 "type": r.get::<_, String>(4)?, "slug": r.get::<_, Option<String>>(5)?,
                 "color": r.get::<_, Option<String>>(6)?, "bg": r.get::<_, Option<String>>(7)?,
+                "guid":r.get::<_,Option<String>>(8)?,
             }))
         })?
         .filter_map(|x| x.ok())
         .collect();
     Ok(Value::Array(rows))
 }
-fn dict_create(conn: &Connection, input: &Value) -> ApiResult {
+fn dict_kind(kind: &str) -> Result<&'static str, ApiError> {
+    match kind {
+        "categories" => Ok("category"),
+        "brands" => Ok("brand"),
+        "statuses" => Ok("status"),
+        _ => Err(ApiError::bad("kind")),
+    }
+}
+fn dict_create(conn: &mut Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
+    atomic(conn, |conn| dict_create_atomic(conn, input, user_id))
+}
+fn dict_create_atomic(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
+    let uid = require_user(conn, user_id)?;
     let kind = s(input, "kind").unwrap_or_else(|| "categories".into());
     let table = dict_table(&kind)?;
     let ws = i64v(input, "workspaceId").unwrap_or_else(|| ws_fallback(conn));
     let name = s(input, "name").ok_or_else(|| ApiError::bad("name"))?;
+    validate_node_text(&name, "Название", 120)?;
+    let guid = Uuid::new_v4().to_string();
     if table == "statuses" {
-        conn.execute("INSERT INTO statuses (name, description, workspace_id, type, slug, color, bg) VALUES (?1,?2,?3,'status',?4,?5,?6)",
-            params![name, s(input,"description"), ws, s(input,"slug").unwrap_or("custom".into()), s(input,"color").unwrap_or("#5E629B".into()), s(input,"bg").unwrap_or("#EDEDF7".into())])?;
+        conn.execute("INSERT INTO statuses(name,description,workspace_id,type,slug,color,bg,guid) VALUES(?1,?2,?3,'status',?4,?5,?6,?7)",params![name,s(input,"description"),ws,s(input,"slug").unwrap_or_else(||format!("custom-{}",Uuid::new_v4())),s(input,"color").unwrap_or("#5E629B".into()),s(input,"bg").unwrap_or("#EDEDF7".into()),guid])?;
     } else {
         let ty = if table == "brands" {
             "brand"
@@ -4678,29 +4940,62 @@ fn dict_create(conn: &Connection, input: &Value) -> ApiResult {
         };
         conn.execute(
             &format!(
-                "INSERT INTO {table} (name, description, workspace_id, type) VALUES (?1,?2,?3,?4)"
+                "INSERT INTO {table}(name,description,workspace_id,type,guid) VALUES(?1,?2,?3,?4,?5)"
             ),
-            params![name, s(input, "description"), ws, ty],
+            params![name,s(input,"description"),ws,ty,guid],
         )?;
     }
-    Ok(json!({"id": conn.last_insert_rowid(), "name": name, "workspaceId": ws}))
+    let id = conn.last_insert_rowid();
+    let proof = record_config_version(conn, dict_kind(&kind)?, id, uid, "create")?;
+    Ok(
+        json!({"id":id,"guid":proof["guid"],"versionHash":proof["versionHash"],"name":name,"workspaceId":ws}),
+    )
 }
-fn dict_update(conn: &Connection, input: &Value) -> ApiResult {
+fn dict_update(conn: &mut Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
+    atomic(conn, |conn| dict_update_atomic(conn, input, user_id))
+}
+fn dict_update_atomic(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
+    let uid = require_user(conn, user_id)?;
     let kind = s(input, "kind").unwrap_or_else(|| "categories".into());
     let table = dict_table(&kind)?;
     let id = i64v(input, "id").ok_or_else(|| ApiError::bad("id"))?;
     conn.execute(
-        &format!("UPDATE {table} SET name=COALESCE(?2,name), description=?3 WHERE id=?1"),
-        params![id, s(input, "name"), s(input, "description")],
+        &format!("UPDATE {table} SET name=COALESCE(?2,name),description=CASE WHEN ?3 THEN ?4 ELSE description END WHERE id=?1 AND archived=0"),
+        params![id,s(input,"name"),input.get("description").is_some(),s(input,"description")],
     )?;
-    Ok(json!({"id": id, "ok": true}))
+    let proof = record_config_version(conn, dict_kind(&kind)?, id, uid, "update")?;
+    Ok(json!({"id":id,"guid":proof["guid"],"versionHash":proof["versionHash"],"ok":true}))
 }
-fn dict_remove(conn: &Connection, input: &Value) -> ApiResult {
+fn dict_remove(conn: &mut Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
+    atomic(conn, |conn| dict_remove_atomic(conn, input, user_id))
+}
+fn dict_remove_atomic(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
+    let uid = require_user(conn, user_id)?;
     let kind = s(input, "kind").unwrap_or_else(|| "categories".into());
     let table = dict_table(&kind)?;
     let id = i64v(input, "id").ok_or_else(|| ApiError::bad("id"))?;
-    conn.execute(&format!("DELETE FROM {table} WHERE id=?1"), params![id])?;
-    Ok(json!({"ok": true}))
+    let column = match table {
+        "categories" => "category_id",
+        "brands" => "brand_id",
+        "statuses" => "status_id",
+        _ => unreachable!(),
+    };
+    let used: i64 = conn.query_row(
+        &format!("SELECT count(*) FROM items WHERE {column}=?1 AND archived=0"),
+        [id],
+        |r| r.get(0),
+    )?;
+    if used > 0 {
+        return Err(ApiError::conflict("Элемент используется в карточках ТМЦ"));
+    }
+    conn.execute(
+        &format!("UPDATE {table} SET archived=1 WHERE id=?1"),
+        params![id],
+    )?;
+    let proof = record_config_version(conn, dict_kind(&kind)?, id, uid, "archive")?;
+    Ok(
+        json!({"ok":true,"archived":true,"id":id,"guid":proof["guid"],"versionHash":proof["versionHash"]}),
+    )
 }
 
 fn notify_admins(conn: &Connection, ws: i64, item_id: i64, title: &str, text: &str) {

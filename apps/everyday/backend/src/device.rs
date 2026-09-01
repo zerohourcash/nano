@@ -63,6 +63,15 @@ pub fn requires_signature(procedure: &str) -> bool {
             | "admin.organizationNodes.create"
             | "admin.organizationNodes.update"
             | "admin.organizationNodes.remove"
+            | "admin.storages.create"
+            | "admin.storages.update"
+            | "admin.storages.remove"
+            | "admin.buildingSites.create"
+            | "admin.buildingSites.update"
+            | "admin.buildingSites.remove"
+            | "admin.dictionaries.create"
+            | "admin.dictionaries.update"
+            | "admin.dictionaries.remove"
     )
 }
 
@@ -313,6 +322,15 @@ mod tests {
             "admin.organizationNodes.create",
             "admin.organizationNodes.update",
             "admin.organizationNodes.remove",
+            "admin.storages.create",
+            "admin.storages.update",
+            "admin.storages.remove",
+            "admin.buildingSites.create",
+            "admin.buildingSites.update",
+            "admin.buildingSites.remove",
+            "admin.dictionaries.create",
+            "admin.dictionaries.update",
+            "admin.dictionaries.remove",
         ] {
             assert!(requires_signature(procedure), "unsigned {procedure}");
         }

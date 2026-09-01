@@ -465,6 +465,26 @@ fn migrate(conn: &Connection) -> Result<()> {
     );
     let _ = conn.execute("ALTER TABLE faults ADD COLUMN guid TEXT", []);
     let _ = conn.execute("ALTER TABLE change_requests ADD COLUMN guid TEXT", []);
+    for table in [
+        "storages",
+        "building_sites",
+        "categories",
+        "brands",
+        "statuses",
+    ] {
+        let _ = conn.execute(&format!("ALTER TABLE {table} ADD COLUMN guid TEXT"), []);
+        let _ = conn.execute(
+            &format!("ALTER TABLE {table} ADD COLUMN archived INTEGER NOT NULL DEFAULT 0"),
+            [],
+        );
+        conn.execute(
+            &format!(
+                "UPDATE {table} SET guid=lower(hex(randomblob(16))) WHERE guid IS NULL OR guid=''"
+            ),
+            [],
+        )?;
+        conn.execute(&format!("CREATE UNIQUE INDEX IF NOT EXISTS {table}_guid_idx ON {table}(guid) WHERE guid IS NOT NULL"),[])?;
+    }
     conn.execute_batch(
         "CREATE UNIQUE INDEX IF NOT EXISTS faults_guid_idx ON faults(guid) WHERE guid IS NOT NULL;
          CREATE TABLE IF NOT EXISTS fault_records(
@@ -510,6 +530,24 @@ fn migrate(conn: &Connection) -> Result<()> {
          );
          CREATE INDEX IF NOT EXISTS change_record_request_idx
            ON change_request_records(request_guid,depth DESC,record_hash DESC);",
+    )?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS config_versions(
+           version_hash TEXT PRIMARY KEY,
+           entity_guid TEXT NOT NULL,
+           kind TEXT NOT NULL CHECK(kind IN ('storage','site','category','brand','status')),
+           parent_hash TEXT,
+           depth INTEGER NOT NULL CHECK(depth >= 0),
+           workspace_guid TEXT NOT NULL,
+           actor_guid TEXT NOT NULL,
+           active INTEGER NOT NULL CHECK(active IN (0,1)),
+           fields_json TEXT NOT NULL,
+           payload_hash TEXT NOT NULL,
+           ledger_hash TEXT NOT NULL UNIQUE,
+           updated_at TEXT NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS config_version_entity_idx
+           ON config_versions(kind,entity_guid,depth DESC,version_hash DESC);",
     )?;
     let _ = conn.execute("ALTER TABLE chat_messages ADD COLUMN guid TEXT", []);
     let _ = conn.execute("ALTER TABLE chat_messages ADD COLUMN ledger_hash TEXT", []);
@@ -588,6 +626,11 @@ pub fn fill_guids(conn: &Connection) -> Result<()> {
         ("history_entries", "guid"),
         ("item_photos", "guid"),
         ("item_documents", "guid"),
+        ("storages", "guid"),
+        ("building_sites", "guid"),
+        ("categories", "guid"),
+        ("brands", "guid"),
+        ("statuses", "guid"),
     ] {
         let sql = format!(
             "UPDATE {table} SET {col}=lower(hex(randomblob(16))) WHERE {col} IS NULL OR {col}=''"
