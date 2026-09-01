@@ -68,3 +68,33 @@ jobs:
           working-directory: apps/everyday/android
           emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim -camera-back none
           script: ./gradlew connectedDebugAndroidTest
+  desktop-release:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: apps/everyday
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: apps/everyday/package-lock.json
+      - run: npm ci
+      - name: Test native Rust node
+        run: cargo test --manifest-path backend/Cargo.toml
+      - name: Build and verify self-contained desktop directory
+        run: npm run desktop:package
+      - name: Upload checksummed node and offline UI
+        uses: actions/upload-artifact@v4
+        with:
+          name: everyday-${{ runner.os }}-${{ runner.arch }}
+          path: apps/everyday/.release/everyday-*
+          if-no-files-found: error

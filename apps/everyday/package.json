@@ -11,6 +11,7 @@
     "build:web": "vite build && node scripts/generate-precache.mjs && node scripts/check-pwa.mjs",
     "build:server": "node scripts/build-server.mjs",
     "build": "npm run build:web && npm run build:server && npm run verify:artifact",
+    "desktop:package": "npm run build && node scripts/package-desktop.mjs && node scripts/verify-desktop-package.mjs && node scripts/smoke-desktop-package.mjs",
     "verify:artifact": "node scripts/verify-artifact.mjs",
     "lint": "eslint .",
     "preview": "vite preview",

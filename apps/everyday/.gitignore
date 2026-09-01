@@ -3,6 +3,7 @@ node_modules
 dist/
 build/
 .build/
+.release/
 backend/target/
 *.tsbuildinfo
 coverage/

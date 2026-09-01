@@ -481,6 +481,7 @@ npm run transport:test # MKST CLI: reorder/loss/retry/corruption через subp
 npm run scale:test   # 100 реальных процессов и отказ 10 узлов
 npm run test:e2e     # production-сборка + Chromium/Playwright
 npm run release:candidate:audit # все gates + 100 нод + свежий Android APK
+npm run desktop:package # нативная desktop-нода + offline UI + SHA-256 manifest
 
 cargo fmt --check --manifest-path backend/Cargo.toml
 cargo clippy --manifest-path backend/Cargo.toml --all-targets -- -D warnings
@@ -495,6 +496,16 @@ SHA-256 до открытия рабочей базы и отказываетс�
 `/downloads/everyday-android-debug.apk`. Debug-сборка предназначена только для
 испытаний; публичный релиз должен быть подписан отдельным release-keystore.
 Проверка этого контура: `npm run android:release:http:test`.
+
+`npm run desktop:package` создаёт самодостаточный каталог для текущей ОС в
+`.release/everyday-<os>-<arch>`: нативный Rust-бинарник, offline PWA,
+`start.sh`/`start.cmd` и manifest с размером и SHA-256 каждого файла. Затем
+верификатор запрещает базы, ключи и мобильные пакеты, пересчитывает manifest и
+реально запускает упакованный узел на временной базе. GitHub Actions повторяет
+Rust tests, сборку, проверку и startup smoke независимо на Linux, Windows и
+macOS и публикует три отдельных CI-артефакта. Непрошедшая ОС не блокирует
+диагностику остальных, но общий release считается зелёным только после всех
+трёх matrix jobs.
 
 Android CI дополнительно запускает `./gradlew connectedDebugAndroidTest` на API 34
 x86_64 emulator. Этот gate исполняет durable BLE spool: восстановление после

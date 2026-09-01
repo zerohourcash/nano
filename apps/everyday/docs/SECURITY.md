@@ -49,6 +49,11 @@ capability, затем применяют только её scope. Неверн�
   блоками и сверяет полный SHA-256 до открытия или миграции SQLite; неверный или
   отсутствующий digest останавливает процесс. Маршрут имеет фиксированное имя,
   поэтому переменная пути не превращает сервер в произвольный файловый браузер.
+- Desktop release-каталог содержит только нативный бинарник, статическую PWA,
+  launchers и `everyday-desktop-release/v1` manifest. Верификатор сверяет точный
+  набор файлов, размер и SHA-256 каждого из них и запрещает DB, приватные ключи,
+  keystore и APK до публикации CI artifact; затем пакет запускается на новой
+  временной базе и обязан отдать настоящий `/health` и offline `index.html`.
 - CSP, запрет iframe/MIME sniffing, строгая referrer-policy и Permissions-Policy.
 - API и sync-ответы получают `Cache-Control: no-store`.
 - Не-loopback bind требует secure-cookie; каждый peer синхронизации требует HTTPS.
