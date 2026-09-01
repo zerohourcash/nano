@@ -522,7 +522,7 @@ fn required_right(procedure: &str) -> Option<&'static str> {
     } else if procedure == "bit.transactions" {
         Some("viewAccounting")
     } else if procedure == "content.ingest" {
-        Some("createItems")
+        None
     } else if procedure == "knowledge.save" {
         Some("editKnowledge")
     } else if procedure.starts_with("knowledge.") {
@@ -979,6 +979,22 @@ fn dispatch_inner(
         }
         "content.status" => Ok(crate::content::status(conn)),
         "content.ingest" => {
+            let uid = require_user(conn, user_id)?;
+            let workspace =
+                i64v(input, "workspaceId").ok_or_else(|| ApiError::bad("workspaceId"))?;
+            match s(input, "purpose").as_deref() {
+                Some("item-document") => {
+                    let item_id = i64v(input, "itemId")
+                        .ok_or_else(|| ApiError::bad("Для документа требуется itemId"))?;
+                    let item_workspace = require_item_access(conn, uid, item_id)?;
+                    if item_workspace != workspace {
+                        return Err(ApiError::bad("Документ относится к другой организации"));
+                    }
+                    require_can_in_workspace(conn, uid, workspace, "manageDocuments")?;
+                }
+                None => require_can_in_workspace(conn, uid, workspace, "createItems")?,
+                Some(_) => return Err(ApiError::bad("Неизвестное назначение вложения")),
+            }
             let source = s(input, "dataUrl").ok_or_else(|| ApiError::bad("dataUrl"))?;
             let url = crate::content::ingest_data_url(conn, &source)
                 .map_err(|error| ApiError::bad(format!("Некорректное вложение: {error}")))?
@@ -2424,7 +2440,12 @@ fn items_add_document_atomic(conn: &Connection, input: &Value, user_id: Option<i
     }
     let document_guid = s(input, "documentGuid").ok_or_else(|| ApiError::bad("documentGuid"))?;
     Uuid::parse_str(&document_guid).map_err(|_| ApiError::bad("Некорректный documentGuid"))?;
-    let name = s(input, "name").ok_or_else(|| ApiError::bad("Название документа обязательно"))?;
+    let raw_name =
+        s(input, "name").ok_or_else(|| ApiError::bad("Название документа обязательно"))?;
+    let name = raw_name.trim();
+    if name.is_empty() || name.chars().any(char::is_control) {
+        return Err(ApiError::bad("Некорректное название документа"));
+    }
     if name.chars().count() > 200 {
         return Err(ApiError::bad("Название документа длиннее 200 символов"));
     }
@@ -9002,11 +9023,31 @@ mod tests {
         let (mut conn, path, users, ws) = test_db();
         let item = insert_item(&conn, ws, None, false, None);
         let item_guid = ledger::guid(&conn, "items", item).unwrap();
-        let uploaded = dispatch(
+        let document_manager = json!({
+            "viewItems":true,
+            "viewDocuments":true,
+            "manageDocuments":true,
+            "createItems":false
+        });
+        conn.execute(
+            "UPDATE user_workspaces SET rights_json=?1 WHERE user_id=?2 AND workspace_id=?3",
+            params![document_manager.to_string(), users[1], ws],
+        )
+        .unwrap();
+        let generic_upload = dispatch(
             &mut conn,
             "content.ingest",
             &json!({"workspaceId":ws,"dataUrl":"data:application/pdf;base64,QUJD"}),
-            Some(users[0]),
+            Some(users[1]),
+        )
+        .unwrap_err();
+        assert_eq!(generic_upload.http, 403);
+        let uploaded = dispatch(
+            &mut conn,
+            "content.ingest",
+            &json!({"workspaceId":ws,"itemId":item,"purpose":"item-document",
+                "dataUrl":"data:application/pdf;base64,QUJD"}),
+            Some(users[1]),
         )
         .unwrap();
         let document_guid = Uuid::new_v4().to_string();
@@ -9016,7 +9057,7 @@ mod tests {
             &json!({"itemId":item,"itemGuid":item_guid,"documentGuid":document_guid,
                 "name":"manual.pdf","url":uploaded["url"],"mime":uploaded["mime"],
                 "accessLevel":"members"}),
-            Some(users[0]),
+            Some(users[1]),
         )
         .unwrap();
         assert_eq!(added["guid"], document_guid);

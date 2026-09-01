@@ -147,9 +147,20 @@ test('browser signs a real custody transaction and ledger retains its proof', as
   await expect(page.getByText('Инструмент теперь у вас')).toBeVisible({
     timeout: 10_000,
   });
+  await page.getByRole('button', { name: /Документы/ }).click();
+  await page.getByLabel('Доступ к документу').selectOption('accounting');
+  await page.getByTestId('tool-document-file').setInputFiles({
+    name: 'invoice-e2e.pdf',
+    mimeType: 'application/pdf',
+    buffer: Buffer.from('E2E accounting invoice'),
+  });
+  await expect(page.getByText('Документ сохранён в CAS и подписан')).toBeVisible({
+    timeout: 10_000,
+  });
+  await expect(page.getByText('invoice-e2e.pdf', { exact: true })).toBeVisible();
 
   const itemAfterTake = await trpc<{
-    documents: Array<{ name: string; url: string; mime?: string }>;
+    documents: Array<{ name: string; url: string; mime?: string; accessLevel?: string }>;
     history: Array<{
       type: string;
       eventVersion?: number;
@@ -175,13 +186,19 @@ test('browser signs a real custody transaction and ledger retains its proof', as
   expect(photoEvent).toMatchObject({ eventVersion: 3 });
   expect(photoEvent?.requestDeviceId).toBeTruthy();
   expect(photoEvent?.requestHash).toMatch(/^[a-f0-9]{64}$/);
-  expect(itemAfterTake.documents).toEqual([
+  expect(itemAfterTake.documents).toEqual(expect.arrayContaining([
     expect.objectContaining({
       name: 'manual.pdf',
       url: expect.stringMatching(/^data:application\/pdf;base64,/),
       mime: 'application/pdf',
     }),
-  ]);
+    expect.objectContaining({
+      name: 'invoice-e2e.pdf',
+      url: expect.stringMatching(/^data:application\/pdf;base64,/),
+      mime: 'application/pdf',
+      accessLevel: 'accounting',
+    }),
+  ]));
   const documentEvent = itemAfterTake.history.find(entry => entry.type === 'document_add');
   expect(documentEvent).toMatchObject({ eventVersion: 3 });
   expect(documentEvent?.requestDeviceId).toBeTruthy();

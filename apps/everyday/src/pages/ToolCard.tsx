@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import type { ReactNode } from 'react'
+import type { ChangeEvent, ReactNode } from 'react'
 import { Link, useNavigate, useParams } from 'react-router'
 import { AnimatePresence, motion } from 'framer-motion'
 import useEmblaCarousel from 'embla-carousel-react'
@@ -1683,6 +1683,56 @@ function CommentsTab({ item, onDone }: { item: ItemFull; onDone: (msg: string) =
 
 function DocumentsTab({ item, onDone }: { item: ItemFull; onDone: (msg: string) => void }) {
   const docs = item.documents ?? []
+  const { currentUser } = useStore()
+  const utils = trpc.useUtils()
+  const fileRef = useRef<HTMLInputElement>(null)
+  const [accessLevel, setAccessLevel] = useState<'members' | 'accounting' | 'managers'>('members')
+  const [uploading, setUploading] = useState(false)
+  const ingestContent = trpc.content.ingest.useMutation()
+  const addDocument = trpc.items.addDocument.useMutation()
+  const canManage = currentUser?.roleRights.manageDocuments === true
+
+  const upload = async (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0]
+    event.target.value = ''
+    if (!file || uploading) return
+    if (file.size === 0 || file.size > 32 * 1024 * 1024) {
+      onDone('Документ должен занимать от 1 байта до 32 МБ')
+      return
+    }
+    setUploading(true)
+    try {
+      if (!item.guid) throw new Error('Карточка ещё не получила переносимый GUID')
+      const dataUrl = await new Promise<string>((resolve, reject) => {
+        const reader = new FileReader()
+        reader.onload = () => resolve(String(reader.result))
+        reader.onerror = () => reject(reader.error ?? new Error('Не удалось прочитать документ'))
+        reader.readAsDataURL(file)
+      })
+      const uploaded = await ingestContent.mutateAsync({
+        workspaceId: item.workspaceId,
+        itemId: item.id,
+        purpose: 'item-document',
+        dataUrl,
+      })
+      await addDocument.mutateAsync({
+        itemId: item.id,
+        itemGuid: item.guid,
+        documentGuid: crypto.randomUUID(),
+        name: file.name.slice(0, 200),
+        url: uploaded.url,
+        mime: uploaded.mime,
+        accessLevel,
+      })
+      await utils.items.byId.invalidate({ id: item.id })
+      onDone('Документ сохранён в CAS и подписан')
+    } catch (error) {
+      onDone(error instanceof Error ? error.message : 'Не удалось загрузить документ')
+    } finally {
+      setUploading(false)
+    }
+  }
+
   return (
     <div className="space-y-4">
       {docs.length > 0 ? (
@@ -1715,13 +1765,39 @@ function DocumentsTab({ item, onDone }: { item: ItemFull; onDone: (msg: string) 
       ) : (
         <p className="text-sm text-ink-500 py-4 text-center">Документов пока нет.</p>
       )}
-      <button
-        onClick={() => onDone('В демо-версии документы добавляются через панель управления')}
-        className="w-full rounded-xl border border-dashed border-brand-100 px-4 py-6 text-sm font-semibold text-ink-500 hover:bg-brand-50 transition-colors flex items-center justify-center gap-2"
-      >
-        <Upload size={16} strokeWidth={1.75} />
-        Загрузить документ
-      </button>
+      {canManage && (
+        <div className="rounded-xl border border-dashed border-brand-100 p-4 space-y-3">
+          <label className="block text-[13px] font-semibold text-ink-500">
+            Кто увидит документ
+            <select
+              aria-label="Доступ к документу"
+              value={accessLevel}
+              onChange={(event) => setAccessLevel(event.target.value as typeof accessLevel)}
+              className="mt-1.5 h-10 w-full rounded-xl border border-brand-100 bg-surface px-3 text-sm text-ink-900"
+            >
+              <option value="members">Все участники с доступом к документам</option>
+              <option value="accounting">Только бухгалтерия</option>
+              <option value="managers">Только управляющие документами</option>
+            </select>
+          </label>
+          <input
+            ref={fileRef}
+            data-testid="tool-document-file"
+            type="file"
+            className="hidden"
+            onChange={upload}
+          />
+          <button
+            type="button"
+            onClick={() => fileRef.current?.click()}
+            disabled={uploading}
+            className="w-full rounded-xl border border-brand-100 px-4 py-3 text-sm font-semibold text-ink-500 hover:bg-brand-50 transition-colors flex items-center justify-center gap-2 disabled:opacity-60"
+          >
+            {uploading ? <Loader2 size={16} className="animate-spin" /> : <Upload size={16} strokeWidth={1.75} />}
+            {uploading ? 'Сохраняем и подписываем…' : 'Загрузить документ (до 32 МБ)'}
+          </button>
+        </div>
+      )}
     </div>
   )
 }
