@@ -176,6 +176,23 @@ def main() -> int:
                              and local_titles(peer_b) == ["Материал Только B", "Только B"], timeout=35)
         check("два peer-loop независимо получили только свои организации", converged,
               f"A={local_titles(peer_a)} B={local_titles(peer_b)}")
+
+        def local_blobs(peer: Node) -> set[str]:
+            with sqlite3.connect(peer.db) as db:
+                return {row[0] for row in db.execute("SELECT hash FROM content_blobs")}
+
+        content_converged = wait_for(
+            lambda: (
+                photos[0] in local_blobs(peer_a)
+                and chat_files[0] in local_blobs(peer_a)
+                and writeoff_files[0] in local_blobs(peer_a)
+                and photos[1] in local_blobs(peer_b)
+                and chat_files[1] in local_blobs(peer_b)
+                and writeoff_files[1] in local_blobs(peer_b)
+            ),
+            timeout=35,
+        )
+        check("scoped full peers догнали все собственные CAS-вложения", content_converged)
         with sqlite3.connect(peer_a.db) as db_a, sqlite3.connect(peer_b.db) as db_b:
             check("на каждом peer ровно один workspace", db_a.execute("SELECT count(*) FROM workspaces").fetchone()[0] == 1
                   and db_b.execute("SELECT count(*) FROM workspaces").fetchone()[0] == 1)

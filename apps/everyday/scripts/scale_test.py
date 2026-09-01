@@ -88,6 +88,23 @@ def has_blob(node: Node, blob_hash: str) -> bool:
         return False
 
 
+def replicated_state(data: dict) -> tuple:
+    """Сравнимое состояние без локальной подписи/sequence конкретной ноды."""
+    history = tuple(sorted(
+        (row.get("opId"), row.get("hash"))
+        for row in data.get("history", [])
+    ))
+    items = tuple(sorted(
+        (
+            row.get("guid"), row.get("title"), row.get("statusSlug"),
+            row.get("responsibleGuid"), row.get("quantity"),
+        )
+        for row in data.get("items", [])
+    ))
+    messages = tuple(sorted(row.get("guid") for row in data.get("messages", [])))
+    return history, items, messages
+
+
 def main() -> int:
     failures.clear()
     count = int(os.environ.get("MESHKEEPER_SCALE_NODES", "100"))
@@ -219,6 +236,59 @@ def main() -> int:
             label="CAS восстановленных узлов",
         ) and all(parallel_map(failed_nodes, lambda node: has_blob(node, scale_photo_hash)))
         check("восстановленные узлы догнали CAS-вложение", recovered_blobs)
+
+        # После partition/reconnect доказываем не только наличие одной записи,
+        # но идентичность полной истории и вычисленного текущего состояния на
+        # всех 100 БД. Повторные фоновые push/pull не должны создать дубли.
+        fully_converged = wait_count(
+            nodes,
+            lambda data: (
+                any(row.get("guid") == message.get("guid") for row in data.get("messages", []))
+                and any(row.get("guid") == second.get("guid") for row in data.get("messages", []))
+                and any(
+                    row.get("title") == "Рация масштабного теста"
+                    and row.get("statusSlug") == "in-work"
+                    for row in data.get("items", [])
+                )
+            ),
+            timeout=120,
+            label="полная сходимость после partition",
+        )
+        snapshots = parallel_map(nodes, journal)
+        reference_state = replicated_state(snapshots[0])
+        check(
+            f"полная история и текущее состояние совпали на {count}/{count} узлах",
+            fully_converged and all(replicated_state(data) == reference_state for data in snapshots),
+        )
+        check(
+            "повторные доставки не размножили opId и messageGuid",
+            all(
+                len(data.get("history", []))
+                == len({row.get("opId") for row in data.get("history", [])})
+                and len(data.get("messages", []))
+                == len({row.get("guid") for row in data.get("messages", [])})
+                for data in snapshots
+            ),
+        )
+
+        def login_and_audit(node: Node) -> dict:
+            logged_in = node.call("auth.login", {"phone": OWNER_PHONE, "password": OWNER_PASSWORD})
+            if not isinstance(logged_in, dict) or not logged_in.get("id"):
+                return {"healthy": False, "login": logged_in}
+            return node.call("sync.audit", None, mutation=False)
+
+        audits = parallel_map(nodes, login_and_audit)
+        check(
+            f"криптографический аудит успешен на {count}/{count} узлах",
+            all(
+                audit.get("healthy") is True
+                and audit.get("ledgerVerified") == audit.get("counts", {}).get("history")
+                and audit.get("orphanHistory") == 0
+                and audit.get("missingGuids") == 0
+                and audit.get("missingBlobs") == 0
+                for audit in audits
+            ),
+        )
 
         memories = parallel_map(nodes, rss_kib)
         total_rss = sum(memories)
