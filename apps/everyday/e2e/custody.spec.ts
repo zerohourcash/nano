@@ -170,6 +170,14 @@ test('browser signs a real custody transaction and ledger retains its proof', as
   await page.getByRole('button', { name: 'Сервис E2E', exact: true }).click();
   await expect(page.getByRole('heading', { name: /Сервис E2E \(1 ед\.\)/ })).toBeVisible();
   await expect(page.getByText('Перфоратор E2E', { exact: true })).toBeVisible();
+  await page.goto('/admin');
+  await page.getByRole('button', { name: 'Структура', exact: true }).first().click();
+  await page.getByRole('button', { name: 'Изменить Сервисное подразделение' }).click();
+  await page.getByLabel('Название вкладки').fill('Ремонт E2E');
+  await page.getByRole('button', { name: 'Сохранить', exact: true }).click();
+  await expect(page.getByText('Изменения раздела подписаны и сохранены')).toBeVisible();
+  await page.goto('/');
+  await expect(page.getByRole('button', { name: 'Ремонт E2E', exact: true })).toBeVisible();
   await page.goto(`/tool/${itemId}`);
   await page
     .getByRole('button', { name: 'Взять', exact: true })

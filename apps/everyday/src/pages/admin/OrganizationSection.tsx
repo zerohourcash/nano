@@ -1,5 +1,5 @@
 import { useMemo, useState } from 'react'
-import { ChevronRight, Network, Plus, Trash2 } from 'lucide-react'
+import { Check, ChevronRight, Network, Pencil, Plus, Trash2, X } from 'lucide-react'
 import { trpc } from '@/providers/trpc'
 import { btnPrimaryCls, btnSecondaryCls, cardCls, inputCls, SectionHeader, useToast } from './ui'
 
@@ -9,6 +9,7 @@ type Node = {
   kind: string
   name: string
   tabLabel: string | null
+  displayOrder: number
 }
 
 const KINDS = [
@@ -26,6 +27,21 @@ function flatten(nodes: Node[], parentId: number | null = null, depth = 0): Arra
     .flatMap((node) => [{ ...node, depth }, ...flatten(nodes, node.id, depth + 1)])
 }
 
+function descendantsOf(nodes: Node[], rootId: number): Set<number> {
+  const result = new Set<number>([rootId])
+  let changed = true
+  while (changed) {
+    changed = false
+    for (const node of nodes) {
+      if (node.parentId && result.has(node.parentId) && !result.has(node.id)) {
+        result.add(node.id)
+        changed = true
+      }
+    }
+  }
+  return result
+}
+
 export default function OrganizationSection() {
   const toast = useToast()
   const utils = trpc.useUtils()
@@ -36,12 +52,27 @@ export default function OrganizationSection() {
   const [kind, setKind] = useState('division')
   const [parentId, setParentId] = useState('')
   const [tabLabel, setTabLabel] = useState('')
+  const [editingId, setEditingId] = useState<number | null>(null)
+  const resetForm = () => {
+    setName('')
+    setKind('division')
+    setParentId('')
+    setTabLabel('')
+    setEditingId(null)
+  }
   const create = trpc.admin.organizationNodes.create.useMutation({
     onSuccess: () => {
       utils.admin.organizationNodes.list.invalidate()
-      setName('')
-      setTabLabel('')
+      resetForm()
       toast('Раздел добавлен в подписанную историю')
+    },
+    onError: (error) => toast(error.message, 'error'),
+  })
+  const update = trpc.admin.organizationNodes.update.useMutation({
+    onSuccess: () => {
+      utils.admin.organizationNodes.list.invalidate()
+      resetForm()
+      toast('Изменения раздела подписаны и сохранены')
     },
     onError: (error) => toast(error.message, 'error'),
   })
@@ -49,6 +80,16 @@ export default function OrganizationSection() {
     onSuccess: () => utils.admin.organizationNodes.list.invalidate(),
     onError: (error) => toast(error.message, 'error'),
   })
+  const forbiddenParents = editingId === null ? new Set<number>() : descendantsOf(nodes, editingId)
+
+  const edit = (node: Node) => {
+    setEditingId(node.id)
+    setName(node.name)
+    setKind(node.kind)
+    setParentId(node.parentId ? String(node.parentId) : '')
+    setTabLabel(node.tabLabel ?? '')
+    window.scrollTo({ top: 0, behavior: 'smooth' })
+  }
 
   return (
     <section className="space-y-4">
@@ -64,12 +105,14 @@ export default function OrganizationSection() {
         onSubmit={(event) => {
           event.preventDefault()
           if (!name.trim()) return
-          create.mutate({
+          const fields = {
             name: name.trim(),
             kind,
             parentId: parentId ? Number(parentId) : null,
             tabLabel: tabLabel.trim() || null,
-          })
+          }
+          if (editingId === null) create.mutate(fields)
+          else update.mutate({ id: editingId, ...fields })
         }}
       >
         <input className={inputCls} aria-label="Название раздела" placeholder="Например, кабинет 204" value={name} onChange={(e) => setName(e.target.value)} />
@@ -78,12 +121,19 @@ export default function OrganizationSection() {
         </select>
         <select className={inputCls} aria-label="Родительский раздел" value={parentId} onChange={(e) => setParentId(e.target.value)}>
           <option value="">Верхний уровень</option>
-          {rows.map((node) => <option key={node.id} value={node.id}>{'— '.repeat(node.depth)}{node.name}</option>)}
+          {rows.filter((node) => !forbiddenParents.has(node.id)).map((node) => <option key={node.id} value={node.id}>{'— '.repeat(node.depth)}{node.name}</option>)}
         </select>
         <input className={inputCls} aria-label="Название вкладки" placeholder="Название вкладки (необязательно)" value={tabLabel} onChange={(e) => setTabLabel(e.target.value)} />
-        <button className={btnPrimaryCls} type="submit" disabled={!name.trim() || create.isPending}>
-          <Plus size={17} /> Добавить
-        </button>
+        <div className="flex gap-2">
+          <button className={`${btnPrimaryCls} flex-1`} type="submit" disabled={!name.trim() || create.isPending || update.isPending}>
+            {editingId === null ? <><Plus size={17} /> Добавить</> : <><Check size={17} /> Сохранить</>}
+          </button>
+          {editingId !== null && (
+            <button className={btnSecondaryCls} type="button" aria-label="Отменить редактирование" onClick={resetForm}>
+              <X size={17} />
+            </button>
+          )}
+        </div>
       </form>
 
       <div className={cardCls}>
@@ -104,14 +154,24 @@ export default function OrganizationSection() {
                   <p className="truncate font-semibold text-ink-900">{node.name}</p>
                   <p className="text-xs text-ink-500">{node.kind}{node.tabLabel ? ' · вкладка «' + node.tabLabel + '»' : ''}</p>
                 </div>
-                <button
-                  type="button"
-                  className={btnSecondaryCls}
-                  aria-label={'Архивировать ' + node.name}
-                  onClick={() => remove.mutate({ id: node.id })}
-                >
-                  <Trash2 size={16} />
-                </button>
+                <div className="flex gap-2">
+                  <button
+                    type="button"
+                    className={btnSecondaryCls}
+                    aria-label={'Изменить ' + node.name}
+                    onClick={() => edit(node)}
+                  >
+                    <Pencil size={16} />
+                  </button>
+                  <button
+                    type="button"
+                    className={btnSecondaryCls}
+                    aria-label={'Архивировать ' + node.name}
+                    onClick={() => remove.mutate({ id: node.id })}
+                  >
+                    <Trash2 size={16} />
+                  </button>
+                </div>
               </li>
             ))}
           </ul>
