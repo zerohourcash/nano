@@ -23,7 +23,7 @@
 | Административная летопись | участники, роли, приглашения и дерево требуют device-proof и пишутся атомарно в Ledger V2; importer проверяет тип события, actor, target GUID и полноту proof | `npm run smoke`, `npm run sync:test`, Rust membership/device/wrong-target tests | Проверено |
 | Структура организации после offline-разрыва | разделы любой глубины — device-signed portable branches; parent/responsible передаются по GUID, конфликт сходится по `(depth, versionHash)`, циклы и node-signed подмена снимка запрещены | Rust `signed_organization_tree_replication_rejects_snapshot_rewrite`, API cycle test, integrity audit | Проверено |
 | Справочники после offline-разрыва | склады, площадки, категории, бренды и статусы — device-signed portable branches с GUID/tombstone; карточки переносят ссылки по GUID | Rust `signed_config_survives_offline_sync_and_rejects_falsification`, integrity audit | Проверено |
-| 100 узлов | разреженная топология, 100 процессов/БД, отказ 10 процессов | `npm run scale:test` | Проверено 2026-09-01 |
+| 100 узлов | разреженная топология, 100 процессов/БД, отказ и cold restart 10 процессов; журнал и CAS догоняются после восстановления | `npm run scale:test`: 100/100 за 21,3 с, leaf→root за 2,1 с, peer limit 4, RSS p95 11,9 MiB | Проверено 2026-09-01 |
 | Фото и документы | двухфазный CAS ingest → маленькие signed `photo_add`/`document_add`; V3 intent связывает GUID карточки и вложения, CAS-хэш, MIME, ACL и семантические поля; chunks, resume, metadata/smart/full | Playwright реальная загрузка из браузера; `npm run sync:test` физически останавливает upstream, создаёт PDF локально, восстанавливает full-node, проверяет bytes/ACL/rollback; Rust atomic rollback и trusted-node rewrite tests | Проверено для новых вложений; старые записи явно legacy |
 | Любой узел → full | смена content mode и фоновая догрузка | `npm run sync:test` | Проверено |
 | Чат и wiki | V3 user intent для текста/ACL/parent/CAS attachments; chat-файлы и wiki-файлы загружаются двухфазно, старые записи explicit legacy | Playwright browser uploads, `npm run mesh:test`, `npm run sync:test` с offline chat attachment, Rust trusted-node rewrite tests | Проверено для новых сообщений и ревизий |
@@ -46,6 +46,11 @@ npm run production:audit
 Перед крупным релизом дополнительно запускается тяжёлый `npm run scale:test` и
 собирается подписанный Android release APK. Debug APK доказывает сборку и
 содержимое, но не заменяет секретный keystore владельца приложения.
+
+Последний полный локальный gate 2026-09-01: `production:audit` и
+`scale:test` завершились без ошибок. Масштабный прогон поднял 100 отдельных
+процессов с отдельными БД, распространил подписанные чат/выдачу и CAS-вложение,
+остановил и перезапустил 10 узлов, после чего все 10 догнали журнал и файл.
 
 ## Не закрыто и поэтому не заявляется production-ready
 
