@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import base64
 import sqlite3
+import uuid
 
 from sync_test import Node, free_port
 
@@ -26,6 +28,32 @@ def main() -> int:
         })
         workspace = node.call("meta.workspaces", None, mutation=False)[0]
         check("владелец зарегистрирован", isinstance(owner, dict) and owner.get("id") == 1)
+
+        for index in range(10):
+            uploaded = node.call("content.ingest", {
+                "workspaceId": workspace["id"],
+                "purpose": "chat-attachment",
+                "messageGuid": str(uuid.uuid4()),
+                "dataUrl": "data:text/plain;base64," + base64.b64encode(
+                    f"spam-attachment-{index}".encode()
+                ).decode(),
+            })
+            if not uploaded.get("url", "").startswith("cas:"):
+                failures.append(f"чат-вложение {index} не принято")
+                break
+        flooded_attachment = node.call("content.ingest", {
+            "workspaceId": workspace["id"],
+            "purpose": "chat-attachment",
+            "messageGuid": str(uuid.uuid4()),
+            "dataUrl": "data:text/plain;base64," + base64.b64encode(b"must-not-persist").decode(),
+        })
+        with sqlite3.connect(node.db) as database:
+            blobs_after_flood = database.execute("SELECT COUNT(*) FROM content_blobs").fetchone()[0]
+            grants_after_flood = database.execute("SELECT COUNT(*) FROM content_upload_grants").fetchone()[0]
+        check("одиннадцатое чат-вложение отклонено до записи в CAS",
+              flooded_attachment.get("__err") == "Слишком много чат-вложений: подождите минуту"
+              and (blobs_after_flood, grants_after_flood) == (10, 10),
+              f"response={flooded_attachment} blobs={blobs_after_flood} grants={grants_after_flood}")
 
         first = node.call("chat.send", {"workspaceId": workspace["id"], "text": "Сообщение 0"})
         duplicate = node.call("chat.send", {"workspaceId": workspace["id"], "text": "Сообщение 0"})
@@ -72,6 +100,13 @@ def main() -> int:
         check("restart процесса не сбрасывает persisted rate-limit",
               persisted.get("__err") == "Слишком много сообщений: подождите минуту",
               str(persisted))
+        persisted_upload = node.call("content.ingest", {
+            "workspaceId": workspace["id"], "purpose": "chat-attachment",
+            "messageGuid": str(uuid.uuid4()), "dataUrl": "data:text/plain;base64,UkVTVEFSVA==",
+        })
+        check("restart процесса не сбрасывает лимит чат-вложений",
+              persisted_upload.get("__err") == "Слишком много чат-вложений: подождите минуту",
+              str(persisted_upload))
     finally:
         node.stop()
 

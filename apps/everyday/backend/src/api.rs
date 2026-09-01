@@ -982,7 +982,8 @@ fn dispatch_inner(
             let uid = require_user(conn, user_id)?;
             let workspace =
                 i64v(input, "workspaceId").ok_or_else(|| ApiError::bad("workspaceId"))?;
-            match s(input, "purpose").as_deref() {
+            let purpose = s(input, "purpose");
+            match purpose.as_deref() {
                 Some("item-document") => {
                     let item_id = i64v(input, "itemId")
                         .ok_or_else(|| ApiError::bad("Для документа требуется itemId"))?;
@@ -991,6 +992,96 @@ fn dispatch_inner(
                         return Err(ApiError::bad("Документ относится к другой организации"));
                     }
                     require_can_in_workspace(conn, uid, workspace, "manageDocuments")?;
+                }
+                Some("chat-attachment") => {
+                    require_member(conn, uid, workspace)?;
+                    let message_guid = s(input, "messageGuid")
+                        .ok_or_else(|| ApiError::bad("Для чат-вложения требуется messageGuid"))?;
+                    Uuid::parse_str(&message_guid)
+                        .map_err(|_| ApiError::bad("Некорректный messageGuid"))?;
+                    let minute_ago =
+                        (chrono::Utc::now() - chrono::Duration::minutes(1)).to_rfc3339();
+                    let day_ago = (chrono::Utc::now() - chrono::Duration::hours(24)).to_rfc3339();
+                    let recent_messages: i64 = conn.query_row(
+                        "SELECT COUNT(*) FROM chat_messages WHERE workspace_id=?1 AND user_id=?2 AND created_at>=?3",
+                        params![workspace, uid, minute_ago],
+                        |row| row.get(0),
+                    )?;
+                    let recent_uploads: i64 = conn.query_row(
+                        "SELECT COUNT(*) FROM content_upload_grants WHERE workspace_id=?1 AND user_id=?2 AND purpose='chat-attachment' AND created_at>=?3",
+                        params![workspace, uid, minute_ago],
+                        |row| row.get(0),
+                    )?;
+                    let daily_uploads: i64 = conn.query_row(
+                        "SELECT COUNT(*) FROM content_upload_grants WHERE workspace_id=?1 AND user_id=?2 AND purpose='chat-attachment' AND created_at>=?3",
+                        params![workspace, uid, day_ago],
+                        |row| row.get(0),
+                    )?;
+                    if recent_messages >= 20 || recent_uploads >= 10 {
+                        return Err(ApiError::new(
+                            "TOO_MANY_REQUESTS",
+                            429,
+                            "Слишком много чат-вложений: подождите минуту",
+                        ));
+                    }
+                    if daily_uploads >= 1000 {
+                        return Err(ApiError::new(
+                            "TOO_MANY_REQUESTS",
+                            429,
+                            "Суточный лимит чат-вложений исчерпан",
+                        ));
+                    }
+                    let source = s(input, "dataUrl").ok_or_else(|| ApiError::bad("dataUrl"))?;
+                    return atomic(conn, |conn| {
+                        let url = crate::content::ingest_data_url(conn, &source)
+                            .map_err(|error| {
+                                ApiError::bad(format!("Некорректное вложение: {error}"))
+                            })?
+                            .ok_or_else(|| ApiError::bad("Ожидается base64 data URL"))?;
+                        let hash = url.trim_start_matches("cas:");
+                        let (mime, size): (String, i64) = conn.query_row(
+                            "SELECT mime,size FROM content_catalog WHERE hash=?1",
+                            [hash],
+                            |row| Ok((row.get(0)?, row.get(1)?)),
+                        )?;
+                        let recent_bytes: i64 = conn.query_row(
+                            "SELECT COALESCE(SUM(size),0) FROM content_upload_grants WHERE workspace_id=?1 AND user_id=?2 AND purpose='chat-attachment' AND created_at>=?3",
+                            params![workspace, uid, minute_ago],
+                            |row| row.get(0),
+                        )?;
+                        if recent_bytes.saturating_add(size) > 64 * 1024 * 1024 {
+                            return Err(ApiError::new(
+                                "TOO_MANY_REQUESTS",
+                                429,
+                                "Лимит чат-вложений 64 МБ в минуту",
+                            ));
+                        }
+                        let daily_bytes: i64 = conn.query_row(
+                            "SELECT COALESCE(SUM(size),0) FROM content_upload_grants WHERE workspace_id=?1 AND user_id=?2 AND purpose='chat-attachment' AND created_at>=?3",
+                            params![workspace, uid, day_ago],
+                            |row| row.get(0),
+                        )?;
+                        let workspace_daily_bytes: i64 = conn.query_row(
+                            "SELECT COALESCE(SUM(size),0) FROM content_upload_grants WHERE workspace_id=?1 AND purpose='chat-attachment' AND created_at>=?2",
+                            params![workspace, day_ago],
+                            |row| row.get(0),
+                        )?;
+                        if daily_bytes.saturating_add(size) > 512_i64 * 1024 * 1024
+                            || workspace_daily_bytes.saturating_add(size)
+                                > 2_i64 * 1024 * 1024 * 1024
+                        {
+                            return Err(ApiError::new(
+                                "TOO_MANY_REQUESTS",
+                                429,
+                                "Суточный лимит чат-вложений исчерпан",
+                            ));
+                        }
+                        conn.execute(
+                            "INSERT OR IGNORE INTO content_upload_grants(workspace_id,user_id,purpose,binding_guid,hash,size,created_at) VALUES(?1,?2,'chat-attachment',?3,?4,?5,?6)",
+                            params![workspace, uid, message_guid, hash, size, chrono::Utc::now().to_rfc3339()],
+                        )?;
+                        Ok(json!({"url":url,"hash":hash,"mime":mime,"size":size}))
+                    });
                 }
                 None => require_can_in_workspace(conn, uid, workspace, "createItems")?,
                 Some(_) => return Err(ApiError::bad("Неизвестное назначение вложения")),
@@ -6965,22 +7056,58 @@ fn chat_send(conn: &mut Connection, input: &Value, user_id: Option<i64>) -> ApiR
         return Err(ApiError::bad("Не более 10 вложений в сообщении"));
     }
     let mut attachments = Vec::new();
+    let mut attachment_hashes = Vec::new();
+    let grant_since = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
     for attachment in attachment_inputs {
         let name = attachment
             .get("name")
             .and_then(Value::as_str)
-            .filter(|name| !name.is_empty() && name.chars().count() <= 200)
+            .map(str::trim)
+            .filter(|name| {
+                !name.is_empty()
+                    && name.chars().count() <= 200
+                    && !name.chars().any(char::is_control)
+            })
             .ok_or_else(|| ApiError::bad("Некорректное имя вложения"))?;
         let url = attachment
             .get("url")
             .and_then(Value::as_str)
             .ok_or_else(|| ApiError::bad("Нет CAS-ссылки вложения"))?;
         let sha256 = validate_known_cas(conn, url)?;
+        if attachment_hashes.contains(&sha256) {
+            return Err(ApiError::bad("Одинаковое вложение указано дважды"));
+        }
+        let granted = conn
+            .query_row(
+                "SELECT 1 FROM content_upload_grants
+                 WHERE workspace_id=?1 AND user_id=?2 AND purpose='chat-attachment'
+                   AND binding_guid=?3 AND hash=?4 AND consumed_at IS NULL AND created_at>=?5",
+                params![ws, uid, guid, sha256, grant_since],
+                |_| Ok(true),
+            )
+            .optional()?
+            .unwrap_or(false);
+        if !granted {
+            return Err(ApiError::bad(
+                "Чат-вложение не загружено для этого сообщения или grant истёк",
+            ));
+        }
         let mime = attachment
             .get("mime")
             .and_then(Value::as_str)
             .unwrap_or("application/octet-stream");
-        attachments.push(json!({"name":name,"url":url,"mime":mime,"sha256":sha256}));
+        let catalog_mime: String = conn.query_row(
+            "SELECT mime FROM content_catalog WHERE hash=?1",
+            [&sha256],
+            |row| row.get(0),
+        )?;
+        if mime != catalog_mime {
+            return Err(ApiError::bad(
+                "MIME чат-вложения не совпадает с CAS-каталогом",
+            ));
+        }
+        attachments.push(json!({"name":name,"url":url,"mime":mime,"sha256":sha256.clone()}));
+        attachment_hashes.push(sha256);
     }
     if text.is_empty() && attachments.is_empty() {
         return Err(ApiError::bad("Пустое сообщение"));
@@ -7038,6 +7165,17 @@ fn chat_send(conn: &mut Connection, input: &Value, user_id: Option<i64>) -> ApiR
             "INSERT INTO chat_messages (guid,workspace_id,user_id,text,attachments_json,ledger_hash,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7)",
             params![guid, ws, uid, text, attachments.to_string(), hash, created_at],
         )?;
+        for attachment_hash in &attachment_hashes {
+            let consumed = conn.execute(
+                "UPDATE content_upload_grants SET consumed_at=?1
+                 WHERE workspace_id=?2 AND user_id=?3 AND purpose='chat-attachment'
+                   AND binding_guid=?4 AND hash=?5 AND consumed_at IS NULL",
+                params![created_at, ws, uid, guid, attachment_hash],
+            )?;
+            if consumed != 1 {
+                return Err(ApiError::conflict("Чат-вложение уже использовано"));
+            }
+        }
         Ok(json!({
             "id": conn.last_insert_rowid(), "guid": guid,
             "workspaceId": ws, "userId": uid, "text": text,
@@ -10036,6 +10174,109 @@ mod tests {
         conn.execute("UPDATE chat_messages SET text='подмена'", [])
             .unwrap();
         assert!(ledger::verify_chat_links(&conn).is_err());
+        cleanup(conn, path);
+    }
+
+    #[test]
+    fn chat_attachments_require_scoped_unconsumed_grants_and_are_rate_limited() {
+        let (mut conn, path, users, ws) = test_db();
+        conn.execute(
+            "UPDATE user_workspaces SET rights_json=?1 WHERE user_id=?2 AND workspace_id=?3",
+            params![
+                json!({"viewItems":true,"createItems":false}).to_string(),
+                users[1],
+                ws
+            ],
+        )
+        .unwrap();
+        let generic = dispatch(
+            &mut conn,
+            "content.ingest",
+            &json!({"workspaceId":ws,"dataUrl":"data:text/plain;base64,QUJD"}),
+            Some(users[1]),
+        )
+        .unwrap_err();
+        assert_eq!(generic.http, 403);
+
+        let message_guid = Uuid::new_v4().to_string();
+        let uploaded = dispatch(
+            &mut conn,
+            "content.ingest",
+            &json!({"workspaceId":ws,"purpose":"chat-attachment","messageGuid":message_guid,
+                "dataUrl":"data:text/plain;base64,QUJD"}),
+            Some(users[1]),
+        )
+        .unwrap();
+        let forged = dispatch(
+            &mut conn,
+            "chat.send",
+            &json!({"workspaceId":ws,"messageGuid":Uuid::new_v4().to_string(),"text":"Чужой grant",
+                "attachments":[{"name":"proof.txt","url":uploaded["url"],"mime":"text/plain"}]}),
+            Some(users[1]),
+        )
+        .unwrap_err();
+        assert_eq!(forged.http, 400);
+        let wrong_mime = dispatch(
+            &mut conn,
+            "chat.send",
+            &json!({"workspaceId":ws,"messageGuid":message_guid,"text":"Ложный MIME",
+                "attachments":[{"name":"proof.txt","url":uploaded["url"],"mime":"text/html"}]}),
+            Some(users[1]),
+        )
+        .unwrap_err();
+        assert_eq!(
+            wrong_mime.message,
+            "MIME чат-вложения не совпадает с CAS-каталогом"
+        );
+
+        let sent = dispatch(
+            &mut conn,
+            "chat.send",
+            &json!({"workspaceId":ws,"messageGuid":message_guid,"text":"Файл со смены",
+                "attachments":[{"name":"proof.txt","url":uploaded["url"],"mime":"text/plain"}]}),
+            Some(users[1]),
+        )
+        .unwrap();
+        assert_eq!(sent["attachments"][0]["sha256"], uploaded["hash"]);
+        let consumed: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM content_upload_grants WHERE consumed_at IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(consumed, 1);
+        let replay = dispatch(
+            &mut conn,
+            "chat.send",
+            &json!({"workspaceId":ws,"messageGuid":message_guid,"text":"Повтор grant",
+                "attachments":[{"name":"proof.txt","url":uploaded["url"],"mime":"text/plain"}]}),
+            Some(users[1]),
+        )
+        .unwrap_err();
+        assert_eq!(replay.http, 400);
+
+        for index in 1..10 {
+            let data = B64.encode(format!("attachment-{index}"));
+            dispatch(
+                &mut conn,
+                "content.ingest",
+                &json!({"workspaceId":ws,"purpose":"chat-attachment",
+                    "messageGuid":Uuid::new_v4().to_string(),
+                    "dataUrl":format!("data:text/plain;base64,{data}")}),
+                Some(users[1]),
+            )
+            .unwrap();
+        }
+        let flooded = dispatch(
+            &mut conn,
+            "content.ingest",
+            &json!({"workspaceId":ws,"purpose":"chat-attachment",
+                "messageGuid":Uuid::new_v4().to_string(),"dataUrl":"data:text/plain;base64,REVG"}),
+            Some(users[1]),
+        )
+        .unwrap_err();
+        assert_eq!((flooded.http, flooded.code), (429, "TOO_MANY_REQUESTS"));
         cleanup(conn, path);
     }
 

@@ -12,6 +12,7 @@ export default function Chat() {
   const utils = trpc.useUtils()
   const [text, setText] = useState('')
   const [files, setFiles] = useState<File[]>([])
+  const [draftGuid, setDraftGuid] = useState(() => crypto.randomUUID())
   const listRef = useRef<HTMLDivElement>(null)
   const fileRef = useRef<HTMLInputElement>(null)
   const listQ = trpc.chat.list.useQuery(
@@ -22,6 +23,7 @@ export default function Chat() {
     onSuccess: () => {
       setText('')
       setFiles([])
+      setDraftGuid(crypto.randomUUID())
       utils.chat.list.invalidate()
     },
   })
@@ -36,8 +38,9 @@ export default function Chat() {
   const onSubmit = async (e: FormEvent) => {
     e.preventDefault()
     const value = text.trim()
-    if (!value || !workspace?.guid || send.isPending || ingestContent.isPending) return
+    if ((!value && files.length === 0) || !workspace?.guid || send.isPending || ingestContent.isPending) return
     try {
+      const messageGuid = draftGuid
       const attachments = await Promise.all(files.map(async (file) => {
         const dataUrl = await new Promise<string>((resolve, reject) => {
           const reader = new FileReader()
@@ -45,14 +48,19 @@ export default function Chat() {
           reader.onerror = () => reject(reader.error ?? new Error('Не удалось прочитать файл'))
           reader.readAsDataURL(file)
         })
-        const uploaded = await ingestContent.mutateAsync({ workspaceId: workspace.id, dataUrl })
+        const uploaded = await ingestContent.mutateAsync({
+          workspaceId: workspace.id,
+          purpose: 'chat-attachment',
+          messageGuid,
+          dataUrl,
+        })
         return { name: file.name, url: uploaded.url, mime: uploaded.mime }
       }))
       send.mutate({
         text: value,
         workspaceId: workspace.id,
         workspaceGuid: workspace.guid,
-        messageGuid: crypto.randomUUID(),
+        messageGuid,
         attachments,
       })
     } catch {
@@ -165,7 +173,7 @@ export default function Chat() {
           />
           <button
             type="submit"
-            disabled={!text.trim() || send.isPending || ingestContent.isPending}
+            disabled={(!text.trim() && files.length === 0) || send.isPending || ingestContent.isPending}
             className="h-11 px-4 rounded-xl bg-accent text-white text-sm font-semibold inline-flex items-center gap-2 hover:bg-accent-hover disabled:opacity-50"
           >
             {send.isPending || ingestContent.isPending ? <Loader2 size={16} className="animate-spin" /> : <Send size={16} />}

@@ -727,11 +727,12 @@ def main() -> int:
             and KNOWLEDGE_DATA_URL not in json.dumps(knowledge_snapshot),
             str(exported_attachment),
         )
+        chat_guid = str(uuid.uuid4())
         chat_blob = node.call(
             "content.ingest",
-            {"workspaceId": node_ws_id, "dataUrl": CHAT_DATA_URL},
+            {"workspaceId": node_ws_id, "purpose": "chat-attachment",
+             "messageGuid": chat_guid, "dataUrl": CHAT_DATA_URL},
         )
-        chat_guid = str(uuid.uuid4())
         offline_chat = node.call(
             "chat.send",
             {

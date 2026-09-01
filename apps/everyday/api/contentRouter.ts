@@ -20,8 +20,9 @@ export const contentRouter = createRouter({
     .input(z.object({
       workspaceId: z.number().int().positive(),
       dataUrl: z.string().min(1),
-      purpose: z.enum(['item-document']).optional(),
+      purpose: z.enum(['item-document', 'chat-attachment']).optional(),
       itemId: z.number().int().positive().optional(),
+      messageGuid: z.string().uuid().optional(),
     }))
     .mutation(async () => ({ url: 'cas:' + '0'.repeat(64), hash: '0'.repeat(64), mime: 'application/octet-stream', size: 0 })),
   setMode: publicQuery

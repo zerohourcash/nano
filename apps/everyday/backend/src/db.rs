@@ -638,7 +638,15 @@ fn migrate(conn: &Connection) -> Result<()> {
     );
     conn.execute_batch(
         "CREATE UNIQUE INDEX IF NOT EXISTS chat_messages_guid_idx ON chat_messages(guid) WHERE guid IS NOT NULL;
-         CREATE UNIQUE INDEX IF NOT EXISTS chat_messages_ledger_idx ON chat_messages(ledger_hash) WHERE ledger_hash IS NOT NULL;",
+         CREATE UNIQUE INDEX IF NOT EXISTS chat_messages_ledger_idx ON chat_messages(ledger_hash) WHERE ledger_hash IS NOT NULL;
+         CREATE TABLE IF NOT EXISTS content_upload_grants(
+           workspace_id INTEGER NOT NULL,user_id INTEGER NOT NULL,purpose TEXT NOT NULL,
+           binding_guid TEXT NOT NULL,hash TEXT NOT NULL,size INTEGER NOT NULL,
+           created_at TEXT NOT NULL,consumed_at TEXT,
+           PRIMARY KEY(workspace_id,user_id,purpose,binding_guid,hash)
+         );
+         CREATE INDEX IF NOT EXISTS content_upload_grants_rate_idx
+           ON content_upload_grants(workspace_id,user_id,purpose,created_at);",
     )?;
     let _ = conn.execute(
         "UPDATE item_photos SET guid=lower(hex(randomblob(16))) WHERE guid IS NULL OR guid=''",

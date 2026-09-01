@@ -28,7 +28,7 @@ export const chatRouter = createRouter({
   send: publicQuery
     .input(
       z.object({
-        text: z.string().min(1),
+        text: z.string().max(4000),
         workspaceId: z.number().int().positive().optional(),
         workspaceGuid: z.string().uuid().optional(),
         messageGuid: z.string().uuid().optional(),
