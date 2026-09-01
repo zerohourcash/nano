@@ -24,7 +24,7 @@
 | Структура организации после offline-разрыва | разделы любой глубины — device-signed portable branches; parent/responsible передаются по GUID, конфликт сходится по `(depth, versionHash)`, циклы и node-signed подмена снимка запрещены | Rust `signed_organization_tree_replication_rejects_snapshot_rewrite`, API cycle test, integrity audit | Проверено |
 | Справочники после offline-разрыва | склады, площадки, категории, бренды и статусы — device-signed portable branches с GUID/tombstone; карточки переносят ссылки по GUID | Rust `signed_config_survives_offline_sync_and_rejects_falsification`, integrity audit | Проверено |
 | 100 узлов | разреженная топология, 100 процессов/БД, отказ 10 процессов | `npm run scale:test` | Проверено 2026-09-01 |
-| Фото и документы | SHA-256 CAS, chunks, resume, metadata/smart/full | `npm run sync:test`, `npm run scale:test` | Проверено |
+| Фото и документы | SHA-256 CAS, chunks, resume, metadata/smart/full; addPhoto требует device-proof и атомарно создаёт `photo_add` commitment | `npm run sync:test`, `npm run scale:test`, Rust `adding_a_photo_is_atomic_and_ledger_bound` | Проверено |
 | Любой узел → full | смена content mode и фоновая догрузка | `npm run sync:test` | Проверено |
 | Чат и wiki | ledger-bound chat; revision DAG и CAS ACL | `npm run mesh:test`, `npm run adversarial:test`, Rust tests | Проверено |
 | Bit и бухгалтерия | двойная запись, deterministic conflict reconciliation, pre-trust binding проводки к device-signed Ledger | `npm run adversarial:test`, Rust recipient/amount tamper tests | Проверено |

@@ -27,6 +27,7 @@ pub fn requires_signature(procedure: &str) -> bool {
         "items.create"
             | "items.update"
             | "items.remove"
+            | "items.addPhoto"
             | "items.addComment"
             | "items.reportFault"
             | "items.resolveFault"
@@ -38,6 +39,7 @@ pub fn requires_signature(procedure: &str) -> bool {
             | "transfers.prepare"
             | "transfers.accept"
             | "transfers.reject"
+            | "transfers.acceptAll"
             | "history.writeOff"
             | "history.replenish"
             | "history.move"
@@ -51,9 +53,22 @@ pub fn requires_signature(procedure: &str) -> bool {
             | "bit.mint"
             | "knowledge.save"
             | "sync.importBundle"
+            | "sync.approveNodeKey"
+            | "sync.revokeNodeKey"
+            | "sync.addPeer"
+            | "sync.removePeer"
+            | "sync.pullNow"
+            | "sync.resolveConflict"
             | "sync.clearDiagnostics"
             | "sync.reportTransportStatus"
             | "content.setMode"
+            | "content.pin"
+            | "content.unpin"
+            | "backup.export"
+            | "backup.import"
+            | "profile.update"
+            | "profile.changePassword"
+            | "auth.revokeDevice"
             | "admin.users.create"
             | "admin.users.update"
             | "admin.users.remove"
@@ -291,7 +306,29 @@ mod tests {
 
     #[test]
     fn verifies_exact_request_and_rejects_replay_or_tampering() {
-        assert!(requires_signature("sync.reportTransportStatus"));
+        for operation in [
+            "items.addPhoto",
+            "transfers.acceptAll",
+            "sync.approveNodeKey",
+            "sync.revokeNodeKey",
+            "sync.addPeer",
+            "sync.removePeer",
+            "sync.pullNow",
+            "sync.resolveConflict",
+            "content.pin",
+            "content.unpin",
+            "backup.export",
+            "backup.import",
+            "profile.update",
+            "profile.changePassword",
+            "auth.revokeDevice",
+            "sync.reportTransportStatus",
+        ] {
+            assert!(
+                requires_signature(operation),
+                "unsigned mutation: {operation}"
+            );
+        }
         let db = database();
         let key = SigningKey::generate(&mut OsRng);
         register(

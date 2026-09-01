@@ -10,13 +10,15 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 DOMAIN = "everyday/device-request/v1"
 CRITICAL = {
-    "items.create", "items.update", "items.remove", "items.addComment", "items.reportFault", "items.resolveFault", "items.requestChange", "items.decideChange",
+    "items.create", "items.update", "items.remove", "items.addPhoto", "items.addComment", "items.reportFault", "items.resolveFault", "items.requestChange", "items.decideChange",
     "transfers.take", "transfers.takeMany", "transfers.returnItem",
-    "transfers.prepare", "transfers.accept", "transfers.reject",
+    "transfers.prepare", "transfers.accept", "transfers.reject", "transfers.acceptAll",
     "history.writeOff", "history.replenish", "history.move",
     "inventory.create", "inventory.checkItem", "inventory.complete",
     "chat.send", "items.addDocument", "bit.transfer", "bit.sale", "bit.mint", "knowledge.save", "sync.importBundle",
-    "sync.clearDiagnostics", "sync.reportTransportStatus", "content.setMode",
+    "sync.approveNodeKey", "sync.revokeNodeKey", "sync.addPeer", "sync.removePeer", "sync.pullNow", "sync.resolveConflict",
+    "sync.clearDiagnostics", "sync.reportTransportStatus", "content.setMode", "content.pin", "content.unpin",
+    "backup.export", "backup.import", "profile.update", "profile.changePassword", "auth.revokeDevice",
     "admin.users.create", "admin.users.update", "admin.users.remove", "admin.users.invite",
     "admin.workspaces.create", "admin.workspaces.update", "admin.workspaces.remove",
     "admin.workspaces.createInvite", "admin.organizationNodes.create",

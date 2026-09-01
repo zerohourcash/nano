@@ -95,6 +95,19 @@ check(
     and "DEVICE_SIGNATURE_REQUIRED" in unsigned_ble_status.get("__body", ""),
     str(unsigned_ble_status)[:160],
 )
+for procedure, payload in [
+    ("profile.update", {"fullName": "Подмена профиля"}),
+    ("sync.pullNow", {}),
+    ("content.pin", {"hash": "0" * 64}),
+    ("auth.revokeDevice", {"deviceId": owner.signer.device_id}),
+]:
+    unsigned = owner.call(procedure, payload, signed=False)
+    check(
+        f"unsigned {procedure} rejected",
+        unsigned.get("__http") == 403
+        and "DEVICE_SIGNATURE_REQUIRED" in unsigned.get("__body", ""),
+        str(unsigned)[:160],
+    )
 ble_failure = owner.call(
     "sync.reportTransportStatus",
     {"transport": "ble", "message": "Тестовый разрыв BLE", "error": True},

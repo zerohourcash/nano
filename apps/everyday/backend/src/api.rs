@@ -2193,21 +2193,53 @@ fn insert_photo(
     Ok(conn.last_insert_rowid())
 }
 
-fn items_add_photo(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
+fn items_add_photo(conn: &mut Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
+    atomic(conn, |conn| items_add_photo_atomic(conn, input, user_id))
+}
+
+fn items_add_photo_atomic(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
     let uid = require_user(conn, user_id)?;
-    require_can(conn, uid, "editItems")?;
     let item_id = i64v(input, "itemId").ok_or_else(|| ApiError::bad("itemId"))?;
-    require_item_access(conn, uid, item_id)?;
+    let ws = require_item_access(conn, uid, item_id)?;
+    require_can_in_workspace(conn, uid, ws, "editItems")?;
     let url = s(input, "url").ok_or_else(|| ApiError::bad("url"))?;
     let is_title = b(input, "isTitle").unwrap_or(false);
     let thumb = s(input, "thumbUrl");
     let id = insert_photo(conn, item_id, &url, thumb.as_deref(), is_title)?;
+    let (guid, stored_url, stored_thumb, checksum): (String, String, Option<String>, String) = conn
+        .query_row(
+            "SELECT guid,url,thumb_url,sha256 FROM item_photos WHERE id=?1",
+            [id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+    let item_guid = ledger::guid(conn, "items", item_id)
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    let commitment = json!({
+        "domain":"everyday/item-photo/v1","guid":guid,"itemGuid":item_guid,
+        "url":stored_url,"thumbUrl":stored_thumb,"sha256":checksum,"isTitle":is_title,
+    });
+    let payload_hash = format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&commitment).expect("JSON serialization"))
+    );
+    ledger::append(
+        conn,
+        ws,
+        uid,
+        Some(item_id),
+        "photo_add",
+        Some(&guid),
+        Some(&payload_hash),
+        None,
+        Some("Фото добавлено"),
+    )
+    .map_err(|error| ApiError::internal(format!("Ошибка журнала: {error}")))?;
     Ok(json!({
-        "id": id,
+        "id": id, "guid": guid,
         "itemId": item_id,
         "url": url,
         "thumbUrl": thumb.unwrap_or(url.clone()),
-        "sha256": photo_checksum(&url),
+        "sha256": checksum,
         "isTitle": is_title
     }))
 }
@@ -7481,6 +7513,47 @@ mod tests {
         )
         .unwrap();
         assert!(list[0]["changes"].as_array().unwrap().is_empty());
+        cleanup(conn, path);
+    }
+
+    #[test]
+    fn adding_a_photo_is_atomic_and_ledger_bound() {
+        let (mut conn, path, users, ws) = test_db();
+        let item = insert_item(&conn, ws, None, false, None);
+        let added = dispatch(
+            &mut conn,
+            "items.addPhoto",
+            &json!({"itemId":item,"url":"data:image/png;base64,QUJD","isTitle":true}),
+            Some(users[0]),
+        )
+        .unwrap();
+        let guid = added["guid"].as_str().unwrap();
+        let event: (String, String) = conn
+            .query_row(
+                "SELECT from_label,to_label FROM history_entries WHERE type='photo_add' AND item_id=?1",
+                [item],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(event.0, guid);
+        assert_eq!(event.1.len(), 64);
+
+        break_ledger(&conn);
+        let failed = dispatch(
+            &mut conn,
+            "items.addPhoto",
+            &json!({"itemId":item,"url":"data:image/png;base64,REVG"}),
+            Some(users[0]),
+        );
+        assert!(failed.is_err());
+        let photos: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM item_photos WHERE item_id=?1",
+                [item],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(photos, 1, "фото без Ledger не должно сохраняться");
         cleanup(conn, path);
     }
 
