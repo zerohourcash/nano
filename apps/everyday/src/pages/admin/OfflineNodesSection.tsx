@@ -32,7 +32,7 @@ export default function OfflineNodesSection() {
   const utils = trpc.useUtils()
   const statusQ = trpc.sync.status.useQuery(undefined, { refetchInterval: 8000 })
   const auditQ = trpc.sync.audit.useQuery(undefined, { refetchInterval: 30000 })
-  const conflictsQ = trpc.sync.conflicts.useQuery(undefined, { refetchInterval: 8000 })
+  const conflictsQ = trpc.sync.conflicts.useQuery(workspace?.id ? { workspaceId: workspace.id } : undefined, { enabled: Boolean(workspace?.id), refetchInterval: 8000 })
   const keysQ = trpc.sync.nodeKeys.useQuery(undefined, { refetchInterval: 8000 })
   const diagnosticsQ = trpc.sync.diagnostics.useQuery(undefined, { refetchInterval: 8000 })
   const contentQ = trpc.content.status.useQuery(undefined, { refetchInterval: 8000 })

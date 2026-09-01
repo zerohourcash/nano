@@ -3149,10 +3149,10 @@ pub fn add_peer(conn: &Connection, url: &str, name: Option<&str>, node_id: Optio
     json!({"ok": true, "url": url, "added": !exists})
 }
 
-pub fn list_conflicts(conn: &Connection) -> Value {
+pub fn list_conflicts(conn: &Connection, workspace_id: i64) -> Value {
     let mut out = Vec::new();
-    if let Ok(mut stmt) = conn.prepare("SELECT id, workspace_id, item_id, item_guid, status, description, left_label, right_label, created_at FROM conflicts ORDER BY id DESC LIMIT 200") {
-        for row in stmt.query_map([], |r| {
+    if let Ok(mut stmt) = conn.prepare("SELECT id, workspace_id, item_id, item_guid, status, description, left_label, right_label, created_at FROM conflicts WHERE workspace_id=?1 ORDER BY id DESC LIMIT 200") {
+        for row in stmt.query_map([workspace_id], |r| {
             let item_id: Option<i64> = r.get(2)?;
             Ok(json!({
                 "id": r.get::<_, i64>(0)?,

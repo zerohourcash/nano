@@ -552,6 +552,8 @@ fn target_workspace(
         Some("transfers")
     } else if procedure.starts_with("inventory.") {
         Some("inventory_sessions")
+    } else if procedure == "sync.resolveConflict" {
+        Some("conflicts")
     } else if matches!(
         procedure,
         "admin.workspaces.update" | "admin.workspaces.remove"
@@ -1019,17 +1021,18 @@ fn dispatch_inner(
             }
             Ok(crate::sync::remove_peer(conn, &url))
         }
-        "sync.conflicts" => Ok(crate::sync::list_conflicts(conn)),
+        "sync.conflicts" => {
+            let workspace = i64v(input, "workspaceId").unwrap_or_else(|| ws_fallback(conn));
+            Ok(crate::sync::list_conflicts(conn, workspace))
+        }
         "sync.resolveConflict" => {
             let uid = require_user(conn, user_id)?;
-            require_can(conn, uid, "editItems")?;
-            crate::sync::resolve_conflict(
-                conn,
-                i64v(input, "id").ok_or_else(|| ApiError::bad("id"))?,
-                i64v(input, "responsibleUserId"),
-                uid,
-            )
-            .map_err(|e| ApiError::bad(e.to_string()))
+            let id = i64v(input, "id").ok_or_else(|| ApiError::bad("id"))?;
+            let workspace = target_workspace(conn, procedure, input)?
+                .ok_or_else(|| ApiError::not_found("Конфликт не найден"))?;
+            require_can_in_workspace(conn, uid, workspace, "editItems")?;
+            crate::sync::resolve_conflict(conn, id, i64v(input, "responsibleUserId"), uid)
+                .map_err(|e| ApiError::bad(e.to_string()))
         }
         "sync.pullNow" => {
             let no_upstream = std::env::var("MESHKEEPER_UPSTREAM")
@@ -6503,6 +6506,68 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error.http, 403);
+        cleanup(conn, path);
+    }
+
+    #[test]
+    fn conflict_routes_are_scoped_to_the_callers_workspace() {
+        let (mut conn, path, users, own_ws) = test_db();
+        conn.execute(
+            "INSERT INTO workspaces (name, timezone, internal_id_prefix, created_at) VALUES ('Foreign conflicts','UTC','FC-',?1)",
+            params![now()],
+        )
+        .unwrap();
+        let foreign_ws = conn.last_insert_rowid();
+        let own_item = insert_item(&conn, own_ws, None, false, None);
+        let foreign_item = insert_item(&conn, foreign_ws, None, false, None);
+        for (workspace, item, description) in [
+            (own_ws, own_item, "own conflict"),
+            (foreign_ws, foreign_item, "foreign conflict"),
+        ] {
+            conn.execute(
+                "INSERT INTO conflicts (workspace_id,item_id,item_guid,status,description,created_at)
+                 VALUES (?1,?2,?3,'open',?4,?5)",
+                params![workspace, item, Uuid::new_v4().to_string(), description, now()],
+            )
+            .unwrap();
+        }
+        let foreign_conflict = conn.last_insert_rowid();
+
+        let visible = dispatch(
+            &mut conn,
+            "sync.conflicts",
+            &json!({"workspaceId": own_ws}),
+            Some(users[0]),
+        )
+        .unwrap();
+        let rows = visible.as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["description"], "own conflict");
+
+        let list_error = dispatch(
+            &mut conn,
+            "sync.conflicts",
+            &json!({"workspaceId": foreign_ws}),
+            Some(users[0]),
+        )
+        .unwrap_err();
+        assert_eq!(list_error.http, 403);
+        let resolve_error = dispatch(
+            &mut conn,
+            "sync.resolveConflict",
+            &json!({"id": foreign_conflict}),
+            Some(users[0]),
+        )
+        .unwrap_err();
+        assert_eq!(resolve_error.http, 403);
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM conflicts WHERE id=?1",
+                [foreign_conflict],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "open");
         cleanup(conn, path);
     }
 

@@ -133,7 +133,7 @@ export const syncRouter = createRouter({
   pullNow: publicQuery
     .input(z.object({ url: z.string().min(4).optional() }).optional())
     .mutation(async () => ({ ok: true, queued: true })),
-  conflicts: publicQuery.query(async () => [] as Array<{
+  conflicts: publicQuery.input(z.object({ workspaceId: z.number().int().positive() }).optional()).query(async () => [] as Array<{
     id: number;
     workspaceId: number | null;
     itemId: number | null;

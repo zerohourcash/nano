@@ -17,7 +17,7 @@
 | Прямая передача | двухфазные sender prepare / recipient accept; custody debit+credit только после подтверждения, без повторного списания склада | Rust direct-transfer/forged-recipient tests, `npm run adversarial:test` | Проверено |
 | Работа без интернета | локальные Rust/SQLite/PWA, операции не требуют peer | `npm run mesh:test`, `npm run mobile:node:test` | Проверено |
 | Догон после разрыва | account-chain frontier, идемпотентный store-and-forward | `npm run mesh:test`, `npm run sync:test` | Проверено |
-| Конфликты/двойная выдача | обе ветви сохраняются, предмет → `needs-check` | `npm run adversarial:test` | Проверено |
+| Конфликты/двойная выдача | обе ветви сохраняются, предмет → `needs-check`; API списка и решения ограничен активной организацией, ID чужого конфликта не обходит ACL | `npm run adversarial:test`, Rust `conflict_routes_are_scoped_to_the_callers_workspace` | Проверено |
 | Подделка/replay | snapshot hash, Ed25519, nonce, portable device registry/revoke tombstone, node trust, signed monotonic sequence/scope, atomic receipt, rollback savepoint | `npm run adversarial:test`, Rust device-binding/rollback/equivocation tests, `npm run verify` | Проверено |
 | Несколько организаций | scoped capability journal/CAS; versioned membership ACL и revoke tombstones | `npm run capability:test`, concurrent role/revoke в `npm run adversarial:test`, Rust merge/tamper tests | Проверено |
 | Административная летопись | участники, роли, приглашения и дерево требуют device-proof и пишутся атомарно в Ledger V2; importer проверяет тип события, actor, target GUID и полноту proof | `npm run smoke`, `npm run sync:test`, Rust membership/device/wrong-target tests | Проверено |
