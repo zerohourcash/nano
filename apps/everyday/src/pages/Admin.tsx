@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { AnimatePresence, motion } from 'framer-motion'
-import { Building2, Layers, ListTree, Network, Radio, ShieldAlert, Users, Warehouse } from 'lucide-react'
+import { Building2, Globe2, Layers, ListTree, Network, Radio, ShieldAlert, Users, Warehouse } from 'lucide-react'
 import type { LucideIcon } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { ToastProvider } from './admin/ui'
@@ -12,8 +12,9 @@ import DictionariesSection from './admin/DictionariesSection'
 import OfflineNodesSection from './admin/OfflineNodesSection'
 import RequestsSection from './admin/RequestsSection'
 import OrganizationSection from './admin/OrganizationSection'
+import InterorgSection from './admin/InterorgSection'
 
-type SectionId = 'users' | 'workspaces' | 'organization' | 'storages' | 'sites' | 'dictionaries' | 'requests' | 'offline'
+type SectionId = 'users' | 'workspaces' | 'organization' | 'storages' | 'sites' | 'dictionaries' | 'requests' | 'offline' | 'network'
 
 const SECTIONS: { id: SectionId; label: string; icon: LucideIcon; soon?: boolean }[] = [
   { id: 'users', label: 'Пользователи', icon: Users },
@@ -24,6 +25,7 @@ const SECTIONS: { id: SectionId; label: string; icon: LucideIcon; soon?: boolean
   { id: 'dictionaries', label: 'Справочники', icon: ListTree },
   { id: 'requests', label: 'Заявки и неисправности', icon: ShieldAlert },
   { id: 'offline', label: 'Офлайн-узлы', icon: Radio },
+  { id: 'network', label: 'Сеть организаций', icon: Globe2 },
 ]
 
 function SectionNav({
@@ -112,6 +114,7 @@ export default function Admin() {
                 {section === 'dictionaries' && <DictionariesSection />}
                 {section === 'requests' && <RequestsSection />}
                 {section === 'offline' && <OfflineNodesSection />}
+                {section === 'network' && <InterorgSection />}
               </motion.div>
             </AnimatePresence>
           </div>

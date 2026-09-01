@@ -305,6 +305,32 @@ test('browser signs a real custody transaction and ledger retains its proof', as
   expect(integrity.chatIntentVerified).toBe(true);
 
   await page.goto('/admin');
+  await page.getByRole('button', { name: 'Сеть организаций' }).first().click();
+  await expect(page.getByTestId('interorg-network')).toBeVisible();
+  await page.getByRole('button', { name: 'Создать адрес' }).click();
+  await expect(page.getByTestId('organization-card')).toContainText(
+    'everyday:org:',
+    { timeout: 10_000 }
+  );
+  const organizationIdentity = await trpc<{
+    destination: string;
+    publicKey: string;
+    signingKey: string;
+  }>(page, 'interorg.identity', { workspaceId: workspaces[0].id }, false);
+  expect(organizationIdentity.destination).toMatch(/^[a-f0-9]{64}$/);
+  expect(organizationIdentity.publicKey.length).toBeGreaterThan(40);
+  expect(organizationIdentity.signingKey.length).toBeGreaterThan(40);
+  const interorgHistory = await trpc<Array<{
+    type: string;
+    eventVersion: number;
+    requestDeviceId?: string;
+    requestHash?: string;
+  }>>(page, 'history.all', { workspaceId: workspaces[0].id, limit: 500 }, false);
+  expect(interorgHistory.find(entry => entry.type === 'interorg_identity_create')).toMatchObject({
+    eventVersion: 3,
+    requestDeviceId: expect.any(String),
+    requestHash: expect.stringMatching(/^[a-f0-9]{64}$/),
+  });
   await page.getByRole('button', { name: 'Пространства', exact: true }).click();
   await expect(
     page.getByTitle('Скопировать GUID для organization scope ноды').first()

@@ -77,6 +77,17 @@ fn is_compact_chat_intent(body: &[u8]) -> bool {
         })
 }
 
+fn should_retain_request_body(path: &str, body: &[u8]) -> bool {
+    path.starts_with("/api/trpc/inventory.")
+        || matches!(
+            path,
+            "/api/trpc/items.addPhoto" | "/api/trpc/items.addDocument"
+        )
+        || (path.starts_with("/api/trpc/interorg.") && body.len() <= 64 * 1024)
+        || (path == "/api/trpc/knowledge.save" && is_compact_knowledge_intent(body))
+        || (path == "/api/trpc/chat.send" && is_compact_chat_intent(body))
+}
+
 pub fn requires_signature(procedure: &str) -> bool {
     matches!(
         procedure,
@@ -300,16 +311,9 @@ pub fn verify_request(
         request_hash: body_hash,
         timestamp: timestamp.to_owned(),
         path: path.to_owned(),
-        request_body: (path.starts_with("/api/trpc/inventory.")
-            || matches!(
-                path,
-                "/api/trpc/items.addPhoto" | "/api/trpc/items.addDocument"
-            )
-            || (path.starts_with("/api/trpc/interorg.") && body.len() <= 64 * 1024)
-            || (path == "/api/trpc/knowledge.save" && is_compact_knowledge_intent(body))
-            || (path == "/api/trpc/chat.send" && is_compact_chat_intent(body)))
-        .then(|| String::from_utf8(body.to_vec()))
-        .transpose()?,
+        request_body: should_retain_request_body(path, body)
+            .then(|| String::from_utf8(body.to_vec()))
+            .transpose()?,
     })
 }
 
@@ -520,6 +524,17 @@ mod tests {
             "attachments":[{"name":"Note","url":"data:text/plain;base64,QUJD"}]
         }}});
         assert!(!is_compact_chat_intent(inline_chat.to_string().as_bytes()));
+    }
+
+    #[test]
+    fn compact_interorg_intent_is_retained_for_v3_audit() {
+        let body = r#"{"0":{"json":{"workspaceId":1,"contactGuid":"5c859a48-ec72-4c86-bf96-8f0fc60d7a4c","transactionId":"be333a8c-2452-438d-8e28-a4221bed51ce","kind":"message.notice","body":{"text":"Смена принята"}}}}"#.as_bytes();
+        assert!(should_retain_request_body("/api/trpc/interorg.send", body));
+        assert!(!should_retain_request_body(
+            "/api/trpc/interorg.send",
+            &vec![0; 64 * 1024 + 1]
+        ));
+        assert!(requires_signature("interorg.send"));
     }
 
     #[test]
