@@ -40,7 +40,7 @@
     "backup:restore:test": "python3 scripts/backup_restore_test.py",
     "production:audit": "npm run verify && npm run smoke && npm run test:e2e && npm run sync:test && npm run mesh:test && npm run discovery:test && npm run adversarial:test && npm run capability:test && npm run interorg:test && npm run spam:test && npm run transport:test && npm run mobile:node:test && npm run encrypted-db:test && npm run backup:restore:test",
     "android:check": "python3 scripts/check_android_node.py",
-    "android:debug:build": "npm run build:web && gradle -p android assembleDebug",
+    "android:debug:build": "npm run build:web && node scripts/run-gradle.mjs assembleDebug",
     "android:debug:audit": "npm run android:debug:build && npm run android:apk:verify",
     "android:apk:verify": "python3 scripts/verify_android_apk.py",
     "release:candidate:audit": "npm run production:audit && npm run scale:test && npm run android:debug:audit",

@@ -9,6 +9,9 @@ service = (android / "src/main/java/ru/meshkeeper/app/NodeService.java").read_te
 activity = (android / "src/main/java/ru/meshkeeper/app/MainActivity.java").read_text(encoding="utf-8")
 secrets = (android / "src/main/java/ru/meshkeeper/app/SecretStore.java").read_text(encoding="utf-8")
 gradle = (android / "build.gradle").read_text(encoding="utf-8")
+wrapper_properties = (ROOT / "android/gradle/wrapper/gradle-wrapper.properties").read_text(encoding="utf-8")
+gradle_runner = (ROOT / "scripts/run-gradle.mjs").read_text(encoding="utf-8")
+package = (ROOT / "package.json").read_text(encoding="utf-8")
 manifest = (android / "src/main/AndroidManifest.xml").read_text(encoding="utf-8")
 layout = (android / "src/main/res/layout/activity_main.xml").read_text(encoding="utf-8")
 stream_inbox = (android / "src/main/java/ru/meshkeeper/app/StreamTransportInbox.java").read_text(encoding="utf-8")
@@ -71,6 +74,13 @@ required = {
     "foreground Rust launch": "RustNode.startNode" in service,
     "localhost WebView": "RustNode.localOrigin()" in activity,
     "cargo-ndk build": "buildRustNode" in gradle and "--lib" in gradle,
+    "pinned cross-platform Gradle wrapper": (ROOT / "android/gradlew").is_file()
+        and (ROOT / "android/gradlew.bat").is_file()
+        and (ROOT / "android/gradle/wrapper/gradle-wrapper.jar").is_file()
+        and "gradle-8.7-bin.zip" in wrapper_properties
+        and "distributionSha256Sum=544c35d6bd849ae8a5ed0bcea39ba677dc40f49df7d1835561582da2009b961d" in wrapper_properties
+        and "gradlew.bat" in gradle_runner
+        and "node scripts/run-gradle.mjs assembleDebug" in package,
     "two supported ABIs": "arm64-v8a" in gradle and "x86_64" in gradle,
     "Android Keystore": 'KEYSTORE = "AndroidKeyStore"' in secrets,
     "authenticated token encryption": 'AES/GCM/NoPadding' in secrets and "updateAAD" in secrets,
