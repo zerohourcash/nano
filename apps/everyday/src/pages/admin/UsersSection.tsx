@@ -7,8 +7,6 @@ import {
   ShieldCheck,
   Trash2,
   UserPlus,
-  UserX,
-  UserCheck,
 } from 'lucide-react'
 import {
   DropdownMenu,
@@ -21,6 +19,7 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/comp
 import type { RoleRights } from '@db/schema'
 import { trpc } from '@/providers/trpc'
 import { cn } from '@/lib/utils'
+import { useStore } from '@/lib/store'
 import type { AdminUser } from './types'
 import {
   Modal,
@@ -98,7 +97,7 @@ const STATUS_META: Record<string, { label: string; cls: string }> = {
 
 /* ─── Модалка приглашения ─────────────────────────────────────────────────── */
 
-function InviteModal({ open, onClose }: { open: boolean; onClose: () => void }) {
+function InviteModal({ open, onClose, workspaceId }: { open: boolean; onClose: () => void; workspaceId: number }) {
   const toast = useToast()
   const utils = trpc.useUtils()
   const [fullName, setFullName] = useState('')
@@ -130,6 +129,7 @@ function InviteModal({ open, onClose }: { open: boolean; onClose: () => void }) 
             fullName: fullName.trim(),
             phone,
             position: position.trim() || undefined,
+            workspaceId,
           })
         }}
       >
@@ -179,30 +179,50 @@ function InviteModal({ open, onClose }: { open: boolean; onClose: () => void }) 
 function RightsModal({
   user,
   onClose,
+  workspaceId,
 }: {
   user: AdminUser | null
   onClose: () => void
+  workspaceId: number
 }) {
   const toast = useToast()
   const utils = trpc.useUtils()
   const { data: defaultRights } = trpc.admin.users.defaultRights.useQuery()
   const [rights, setRights] = useState<RoleRights | null>(null)
+  const [position, setPosition] = useState<string | null>(null)
+  const [organizationRole, setOrganizationRole] = useState<string | null>(null)
+  const [personnelNumber, setPersonnelNumber] = useState<string | null>(null)
   const [requireApproval, setRequireApproval] = useState<boolean | null>(null)
   const [allowNoDue, setAllowNoDue] = useState<boolean | null>(null)
   const [maxHours, setMaxHours] = useState<string | null>(null)
 
   const current: RoleRights =
     rights ?? user?.roleRights ?? defaultRights ?? FALLBACK_DEFAULT_RIGHTS
-  const policy = user && 'checkoutPolicy' in (user as object) ? (user as { checkoutPolicy?: { requireApproval?: boolean; allowNoDueDate?: boolean; maxHours?: number | null } }).checkoutPolicy : undefined
+  const membership = (user ?? {}) as AdminUser & { organizationRole?: string | null; personnelNumber?: string | null }
+  const currentPosition = position ?? user?.position ?? ''
+  const currentOrganizationRole = organizationRole ?? membership.organizationRole ?? ''
+  const currentPersonnelNumber = personnelNumber ?? membership.personnelNumber ?? ''
+  const policy = user && 'checkoutPolicy' in (user as object)
+    ? (user as { checkoutPolicy?: { requireApproval?: boolean; allowNoDueDate?: boolean; maxHours?: number | null } }).checkoutPolicy
+    : undefined
   const reqAppr = requireApproval ?? policy?.requireApproval ?? false
   const noDue = allowNoDue ?? policy?.allowNoDueDate ?? true
   const hours = maxHours ?? (policy?.maxHours != null ? String(policy.maxHours) : '')
+  const resetMembershipFields = () => {
+    setPosition(null)
+    setOrganizationRole(null)
+    setPersonnelNumber(null)
+    setRequireApproval(null)
+    setAllowNoDue(null)
+    setMaxHours(null)
+  }
 
   const update = trpc.admin.users.update.useMutation({
     onSuccess: () => {
       utils.admin.users.list.invalidate()
       toast('Права доступа обновлены')
       setRights(null)
+      resetMembershipFields()
       onClose()
     },
     onError: (e) => toast(e.message, 'error'),
@@ -236,6 +256,7 @@ function RightsModal({
       open={!!user}
       onClose={() => {
         setRights(null)
+        resetMembershipFields()
         onClose()
       }}
       title="Права доступа"
@@ -305,26 +326,26 @@ function RightsModal({
             </div>
           </TooltipProvider>
 
-          <div className="mt-5 rounded-xl border border-brand-100 p-4 space-y-3">
-            <div className="text-sm font-semibold text-ink-900">Правила выдачи</div>
+          <div className="mt-5 grid gap-3 rounded-xl border border-brand-100 p-4 sm:grid-cols-3">
+            <div className="sm:col-span-3 text-sm font-semibold text-ink-900">Роль в выбранной организации</div>
+            <input className={inputCls} aria-label="Должность в организации" value={currentPosition} onChange={(event) => setPosition(event.target.value)} placeholder="Монтажник" />
+            <input className={inputCls} aria-label="Название роли" value={currentOrganizationRole} onChange={(event) => setOrganizationRole(event.target.value)} placeholder="Старший кладовщик" />
+            <input className={inputCls} aria-label="Табельный номер" value={currentPersonnelNumber} onChange={(event) => setPersonnelNumber(event.target.value)} placeholder="EMP-0042" />
+          </div>
+
+          <div className="mt-5 space-y-3 rounded-xl border border-brand-100 p-4">
+            <div className="text-sm font-semibold text-ink-900">Правила выдачи в выбранной организации</div>
             <label className="flex items-center gap-2 text-sm">
-              <input type="checkbox" checked={reqAppr} onChange={(e) => setRequireApproval(e.target.checked)} />
+              <input type="checkbox" checked={reqAppr} onChange={(event) => setRequireApproval(event.target.checked)} />
               Выдача только после одобрения администратора
             </label>
             <label className="flex items-center gap-2 text-sm">
-              <input type="checkbox" checked={noDue} onChange={(e) => setAllowNoDue(e.target.checked)} />
+              <input type="checkbox" checked={noDue} onChange={(event) => setAllowNoDue(event.target.checked)} />
               Разрешить выдачу без срока возврата
             </label>
             <div>
-              <div className="text-[13px] text-ink-500 mb-1">Максимальный срок, часов (пусто = без лимита)</div>
-              <input
-                className={inputCls}
-                type="number"
-                min={1}
-                value={hours}
-                onChange={(e) => setMaxHours(e.target.value)}
-                placeholder="например 24"
-              />
+              <div className="mb-1 text-[13px] text-ink-500">Максимальный срок, часов (пусто = без лимита)</div>
+              <input className={inputCls} aria-label="Максимальный срок выдачи" type="number" min={1} value={hours} onChange={(event) => setMaxHours(event.target.value)} placeholder="например 24" />
             </div>
           </div>
 
@@ -334,6 +355,7 @@ function RightsModal({
               className={btnSecondaryCls}
               onClick={() => {
                 setRights(null)
+                resetMembershipFields()
                 onClose()
               }}
             >
@@ -346,6 +368,10 @@ function RightsModal({
               onClick={() =>
                 update.mutate({
                   id: user.id,
+                  workspaceId,
+                  position: currentPosition.trim() || null,
+                  organizationRole: currentOrganizationRole.trim() || null,
+                  personnelNumber: currentPersonnelNumber.trim() || null,
                   roleRights: current,
                   checkoutPolicy: {
                     requireApproval: reqAppr,
@@ -370,21 +396,18 @@ function RightsModal({
 export default function UsersSection() {
   const toast = useToast()
   const utils = trpc.useUtils()
-  const { data: users, isLoading } = trpc.admin.users.list.useQuery({})
-  const { data: workspaces } = trpc.admin.workspaces.list.useQuery()
+  const { workspace } = useStore()
+  const workspaceId = workspace?.id ?? 0
+  const { data: users, isLoading } = trpc.admin.users.list.useQuery(
+    { workspaceId },
+    { enabled: workspaceId > 0 },
+  )
 
   const [search, setSearch] = useState('')
   const [inviteOpen, setInviteOpen] = useState(false)
   const [rightsUser, setRightsUser] = useState<AdminUser | null>(null)
   const [removeUser, setRemoveUser] = useState<AdminUser | null>(null)
 
-  const update = trpc.admin.users.update.useMutation({
-    onSuccess: (_d, vars) => {
-      utils.admin.users.list.invalidate()
-      toast(vars.status === 'disabled' ? 'Пользователь заблокирован' : 'Пользователь разблокирован')
-    },
-    onError: (e) => toast(e.message, 'error'),
-  })
   const remove = trpc.admin.users.remove.useMutation({
     onSuccess: (res) => {
       utils.admin.users.list.invalidate()
@@ -408,7 +431,7 @@ export default function UsersSection() {
     })
   }, [users, search])
 
-  const currentWsName = workspaces?.[0]?.name ?? '—'
+  const currentWsName = workspace?.name ?? '—'
 
   return (
     <section>
@@ -416,7 +439,7 @@ export default function UsersSection() {
         title="Пользователи"
         count={users?.length}
         action={
-          <button type="button" className={btnPrimaryCls} onClick={() => setInviteOpen(true)}>
+          <button type="button" className={btnPrimaryCls} onClick={() => setInviteOpen(true)} disabled={!workspaceId}>
             <UserPlus size={16} />
             Пригласить
           </button>
@@ -520,26 +543,6 @@ export default function UsersSection() {
                             <ShieldCheck size={16} className="mr-2" />
                             Права доступа
                           </DropdownMenuItem>
-                          <DropdownMenuItem
-                            onClick={() =>
-                              update.mutate({
-                                id: u.id,
-                                status: u.status === 'disabled' ? 'active' : 'disabled',
-                              })
-                            }
-                          >
-                            {u.status === 'disabled' ? (
-                              <>
-                                <UserCheck size={16} className="mr-2" />
-                                Разблокировать
-                              </>
-                            ) : (
-                              <>
-                                <UserX size={16} className="mr-2" />
-                                Заблокировать
-                              </>
-                            )}
-                          </DropdownMenuItem>
                           <DropdownMenuSeparator />
                           <DropdownMenuItem
                             className="text-danger focus:text-danger"
@@ -559,13 +562,13 @@ export default function UsersSection() {
         </div>
       </div>
 
-      <InviteModal open={inviteOpen} onClose={() => setInviteOpen(false)} />
-      <RightsModal user={rightsUser} onClose={() => setRightsUser(null)} />
+      <InviteModal open={inviteOpen} onClose={() => setInviteOpen(false)} workspaceId={workspaceId} />
+      <RightsModal user={rightsUser} onClose={() => setRightsUser(null)} workspaceId={workspaceId} />
       <ConfirmModal
         open={!!removeUser}
         onClose={() => setRemoveUser(null)}
         onConfirm={() =>
-          removeUser && remove.mutate({ id: removeUser.id, workspaceId: workspaces?.[0]?.id })
+          removeUser && remove.mutate({ id: removeUser.id, workspaceId })
         }
         title="Исключить участника?"
         text={`${removeUser?.fullName ?? ''} будет удалён из рабочего пространства. История операций сохранится.`}

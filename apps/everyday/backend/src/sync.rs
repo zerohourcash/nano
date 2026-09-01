@@ -225,6 +225,7 @@ struct MembershipFields {
     position: Option<String>,
     role_name: Option<String>,
     personnel_number: Option<String>,
+    checkout_policy: Option<String>,
 }
 
 impl MembershipFields {
@@ -244,6 +245,10 @@ impl MembershipFields {
                 .map(str::to_owned),
             personnel_number: value
                 .get("personnelNumber")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            checkout_policy: value
+                .get("checkoutPolicy")
                 .and_then(Value::as_str)
                 .map(str::to_owned),
         }
@@ -404,18 +409,34 @@ fn membership_version_hash(
     fields: &MembershipFields,
     ledger_hash: Option<&str>,
 ) -> String {
-    let canonical = json!([
-        "everyday/membership/v1",
-        workspace_guid,
-        user_guid,
-        revision,
-        active,
-        fields.rights,
-        fields.position,
-        fields.role_name,
-        fields.personnel_number,
-        ledger_hash
-    ]);
+    let canonical = if fields.checkout_policy.is_some() {
+        json!([
+            "everyday/membership/v2",
+            workspace_guid,
+            user_guid,
+            revision,
+            active,
+            fields.rights,
+            fields.position,
+            fields.role_name,
+            fields.personnel_number,
+            fields.checkout_policy,
+            ledger_hash
+        ])
+    } else {
+        json!([
+            "everyday/membership/v1",
+            workspace_guid,
+            user_guid,
+            revision,
+            active,
+            fields.rights,
+            fields.position,
+            fields.role_name,
+            fields.personnel_number,
+            ledger_hash
+        ])
+    };
     hex::encode(Sha256::digest(
         serde_json::to_vec(&canonical).unwrap_or_default(),
     ))
@@ -443,7 +464,7 @@ pub fn record_membership_version(
         .saturating_add(1);
     let membership: Option<MembershipFields> = if active {
         conn.query_row(
-            "SELECT rights_json,position,role_name,personnel_number FROM user_workspaces
+            "SELECT rights_json,position,role_name,personnel_number,checkout_policy FROM user_workspaces
              WHERE workspace_id=?1 AND user_id=?2",
             params![workspace_id, user_id],
             |row| {
@@ -452,6 +473,7 @@ pub fn record_membership_version(
                     position: row.get(1)?,
                     role_name: row.get(2)?,
                     personnel_number: row.get(3)?,
+                    checkout_policy: row.get(4)?,
                 })
             },
         )
@@ -473,19 +495,20 @@ pub fn record_membership_version(
     );
     let updated_at = chrono::Utc::now().to_rfc3339();
     conn.execute(
-        "INSERT INTO membership_versions(workspace_guid,user_guid,revision,active,rights_json,position,role_name,personnel_number,ledger_hash,version_hash,updated_at)
-         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)
+        "INSERT INTO membership_versions(workspace_guid,user_guid,revision,active,rights_json,position,role_name,personnel_number,checkout_policy,ledger_hash,version_hash,updated_at)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)
          ON CONFLICT(workspace_guid,user_guid) DO UPDATE SET revision=excluded.revision,
            active=excluded.active,rights_json=excluded.rights_json,position=excluded.position,
            role_name=excluded.role_name,personnel_number=excluded.personnel_number,
+           checkout_policy=excluded.checkout_policy,
            ledger_hash=excluded.ledger_hash,version_hash=excluded.version_hash,updated_at=excluded.updated_at",
         params![workspace_guid,user_guid,revision,i64::from(active),fields.rights,fields.position,fields.role_name,
-            fields.personnel_number,ledger_hash,version_hash,updated_at],
+            fields.personnel_number,fields.checkout_policy,ledger_hash,version_hash,updated_at],
     )?;
     Ok(json!({
         "workspaceGuid":workspace_guid,"userGuid":user_guid,"revision":revision,
         "active":active,"rights":fields.rights,"position":fields.position,"roleName":fields.role_name,
-        "personnelNumber":fields.personnel_number,"ledgerHash":ledger_hash,
+        "personnelNumber":fields.personnel_number,"checkoutPolicy":fields.checkout_policy,"ledgerHash":ledger_hash,
         "versionHash":version_hash,"updatedAt":updated_at
     }))
 }
@@ -912,7 +935,7 @@ pub fn export_journal_since(conn: &Connection, recipient_frontier: Option<&Value
     }
     let mut memberships = Vec::new();
     if let Ok(mut stmt) =
-        conn.prepare("SELECT user_id,workspace_id,rights_json,position,role_name,personnel_number FROM user_workspaces")
+        conn.prepare("SELECT user_id,workspace_id,rights_json,position,role_name,personnel_number,checkout_policy FROM user_workspaces")
     {
         let rows: Vec<_> = stmt
             .query_map([], |row| {
@@ -923,18 +946,19 @@ pub fn export_journal_since(conn: &Connection, recipient_frontier: Option<&Value
                     row.get::<_, Option<String>>(3)?,
                     row.get::<_, Option<String>>(4)?,
                     row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
                 ))
             })
             .into_iter()
             .flatten()
             .flatten()
             .collect();
-        for (user, workspace, rights, position, role_name, personnel_number) in rows {
+        for (user, workspace, rights, position, role_name, personnel_number, checkout_policy) in rows {
             let user_guid = guid_of(conn, "users", user);
             let workspace_guid = guid_of(conn, "workspaces", workspace);
             let version: Option<StoredMembershipVersion> = conn
                 .query_row(
-                    "SELECT revision,version_hash,ledger_hash,updated_at,rights_json,position,role_name,personnel_number FROM membership_versions
+                    "SELECT revision,version_hash,ledger_hash,updated_at,rights_json,position,role_name,personnel_number,checkout_policy FROM membership_versions
                      WHERE workspace_guid=?1 AND user_guid=?2 AND active=1",
                     params![workspace_guid, user_guid],
                     |row| Ok(StoredMembershipVersion {
@@ -944,7 +968,7 @@ pub fn export_journal_since(conn: &Connection, recipient_frontier: Option<&Value
                         updated_at: row.get(3)?,
                         fields: MembershipFields {
                             rights: row.get(4)?, position: row.get(5)?,
-                            role_name: row.get(6)?, personnel_number: row.get(7)?,
+                            role_name: row.get(6)?, personnel_number: row.get(7)?, checkout_policy: row.get(8)?,
                         },
                     }),
                 )
@@ -952,7 +976,7 @@ pub fn export_journal_since(conn: &Connection, recipient_frontier: Option<&Value
                 .ok()
                 .flatten();
             let version = version.unwrap_or_else(|| {
-                let fields = MembershipFields { rights, position, role_name, personnel_number };
+                let fields = MembershipFields { rights, position, role_name, personnel_number, checkout_policy };
                 StoredMembershipVersion {
                     revision: 1,
                     version_hash: membership_version_hash(
@@ -967,13 +991,14 @@ pub fn export_journal_since(conn: &Connection, recipient_frontier: Option<&Value
                 "userGuid":user_guid,"workspaceGuid":workspace_guid,"revision":version.revision,
                 "active":true,"rights":version.fields.rights,"position":version.fields.position,
                 "roleName":version.fields.role_name,"personnelNumber":version.fields.personnel_number,
+                "checkoutPolicy":version.fields.checkout_policy,
                 "ledgerHash":version.ledger_hash,"versionHash":version.version_hash,
                 "updatedAt":version.updated_at,
             }));
         }
     }
     if let Ok(mut statement) = conn.prepare(
-        "SELECT workspace_guid,user_guid,revision,rights_json,position,role_name,personnel_number,
+        "SELECT workspace_guid,user_guid,revision,rights_json,position,role_name,personnel_number,checkout_policy,
                 ledger_hash,version_hash,updated_at FROM membership_versions WHERE active=0",
     ) {
         if let Ok(rows) = statement.query_map([], |row| {
@@ -982,8 +1007,9 @@ pub fn export_journal_since(conn: &Connection, recipient_frontier: Option<&Value
                 "revision":row.get::<_,i64>(2)?,"active":false,
                 "rights":row.get::<_,Option<String>>(3)?,"position":row.get::<_,Option<String>>(4)?,
                 "roleName":row.get::<_,Option<String>>(5)?,"personnelNumber":row.get::<_,Option<String>>(6)?,
-                "ledgerHash":row.get::<_,Option<String>>(7)?,"versionHash":row.get::<_,String>(8)?,
-                "updatedAt":row.get::<_,String>(9)?,
+                "checkoutPolicy":row.get::<_,Option<String>>(7)?,
+                "ledgerHash":row.get::<_,Option<String>>(8)?,"versionHash":row.get::<_,String>(9)?,
+                "updatedAt":row.get::<_,String>(10)?,
             }))
         }) {
             memberships.extend(rows.flatten());
@@ -3246,15 +3272,16 @@ fn merge_membership_record(conn: &Connection, record: &Value) {
         return;
     }
     let _ = conn.execute(
-        "INSERT INTO membership_versions(workspace_guid,user_guid,revision,active,rights_json,position,role_name,personnel_number,ledger_hash,version_hash,updated_at)
-         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)
+        "INSERT INTO membership_versions(workspace_guid,user_guid,revision,active,rights_json,position,role_name,personnel_number,checkout_policy,ledger_hash,version_hash,updated_at)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)
          ON CONFLICT(workspace_guid,user_guid) DO UPDATE SET revision=excluded.revision,
            active=excluded.active,rights_json=excluded.rights_json,position=excluded.position,
            role_name=excluded.role_name,personnel_number=excluded.personnel_number,
+           checkout_policy=excluded.checkout_policy,
            ledger_hash=excluded.ledger_hash,version_hash=excluded.version_hash,updated_at=excluded.updated_at",
         params![workspace_guid,user_guid,revision,i64::from(active),record.get("rights").and_then(Value::as_str),
             record.get("position").and_then(Value::as_str),record.get("roleName").and_then(Value::as_str),
-            record.get("personnelNumber").and_then(Value::as_str),record.get("ledgerHash").and_then(Value::as_str),
+            record.get("personnelNumber").and_then(Value::as_str),record.get("checkoutPolicy").and_then(Value::as_str),record.get("ledgerHash").and_then(Value::as_str),
             incoming_hash,record.get("updatedAt").and_then(Value::as_str).unwrap_or("")],
     );
     let Some(workspace) = id_by_guid(conn, "workspaces", workspace_guid) else {
@@ -3289,15 +3316,17 @@ fn merge_membership_record(conn: &Connection, record: &Value) {
     let position = record.get("position").and_then(Value::as_str);
     let role_name = record.get("roleName").and_then(Value::as_str);
     let personnel_number = record.get("personnelNumber").and_then(Value::as_str);
+    let checkout_policy = record.get("checkoutPolicy").and_then(Value::as_str);
     let changed = conn
         .execute(
-            "UPDATE user_workspaces SET rights_json=?1,position=?2,role_name=?3,personnel_number=?4
-             WHERE user_id=?5 AND workspace_id=?6",
+            "UPDATE user_workspaces SET rights_json=?1,position=?2,role_name=?3,personnel_number=?4,checkout_policy=?5
+             WHERE user_id=?6 AND workspace_id=?7",
             params![
                 rights,
                 position,
                 role_name,
                 personnel_number,
+                checkout_policy,
                 user,
                 workspace
             ],
@@ -3305,9 +3334,9 @@ fn merge_membership_record(conn: &Connection, record: &Value) {
         .unwrap_or(0);
     if changed == 0 {
         let _ = conn.execute(
-            "INSERT INTO user_workspaces(user_id,workspace_id,rights_json,position,role_name,personnel_number)
-             VALUES(?1,?2,?3,?4,?5,?6)",
-            params![user,workspace,rights,position,role_name,personnel_number],
+            "INSERT INTO user_workspaces(user_id,workspace_id,rights_json,position,role_name,personnel_number,checkout_policy)
+             VALUES(?1,?2,?3,?4,?5,?6,?7)",
+            params![user,workspace,rights,position,role_name,personnel_number,checkout_policy],
         );
     }
     let _ = conn.execute("UPDATE users SET status=CASE WHEN status='disabled' THEN 'active' ELSE status END WHERE id=?1", [user]);
@@ -8411,10 +8440,15 @@ mod tests {
         let workspace = source.last_insert_rowid();
         source.execute("INSERT INTO users(full_name,phone,status,created_at,guid) VALUES('Owner','+70000000666','active',?1,'device-owner')",[created]).unwrap();
         let owner = source.last_insert_rowid();
+        let checkout_policy = json!({
+            "allowedCategoryIds":null,"maxHours":12,
+            "requireApproval":true,"allowNoDueDate":false
+        })
+        .to_string();
         source
             .execute(
-                "INSERT INTO user_workspaces(user_id,workspace_id,rights_json) VALUES(?1,?2,?3)",
-                params![owner, workspace, crate::db::owner_rights().to_string()],
+                "INSERT INTO user_workspaces(user_id,workspace_id,rights_json,checkout_policy) VALUES(?1,?2,?3,?4)",
+                params![owner, workspace, crate::db::owner_rights().to_string(), checkout_policy],
             )
             .unwrap();
         record_membership_version(&source, workspace, owner, true, None, true).unwrap();
@@ -8454,6 +8488,17 @@ mod tests {
                 |row| row.get::<_,String>(0),
             ).unwrap(),
             "device-owner"
+        );
+        let replicated_policy: String = target
+            .query_row(
+                "SELECT uw.checkout_policy FROM user_workspaces uw JOIN users u ON u.id=uw.user_id WHERE u.guid='device-owner'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&replicated_policy).unwrap()["maxHours"],
+            12
         );
 
         let forged_key = SigningKey::generate(&mut OsRng);
@@ -9817,7 +9862,9 @@ mod tests {
             .unwrap();
         record_membership_version(&source, workspace, user, true, None, true).unwrap();
         let mut forged = export_journal(&source);
-        forged["memberships"][0]["rights"] = json!(crate::db::owner_rights().to_string());
+        forged["memberships"][0]["checkoutPolicy"] = json!(
+            json!({"allowedCategoryIds":null,"maxHours":1,"requireApproval":false,"allowNoDueDate":true}).to_string()
+        );
         ledger::sign_journal(&source, &mut forged).unwrap();
         let rejected = apply_remote_journal(&target, &forged, "");
         assert_eq!(rejected["ok"], false);

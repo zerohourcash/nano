@@ -135,11 +135,14 @@ export const adminRouter = createRouter({
       .input(
         z.object({
           id: z.number().int().positive(),
+          workspaceId: z.number().int().positive(),
           fullName: z.string().min(1).optional(),
           position: z.string().nullable().optional(),
           phone: z.string().min(5).optional(),
           avatarUrl: z.string().nullable().optional(),
           status: z.enum(["active", "invited", "disabled"]).optional(),
+          organizationRole: z.string().max(120).nullable().optional(),
+          personnelNumber: z.string().max(80).nullable().optional(),
           roleRights: roleRightsSchema.optional(),
           checkoutPolicy: z
             .object({
@@ -157,7 +160,7 @@ export const adminRouter = createRouter({
       }),
 
     remove: publicQuery
-      .input(z.object({ id: z.number().int().positive(), workspaceId: z.number().int().positive().optional() }))
+      .input(z.object({ id: z.number().int().positive(), workspaceId: z.number().int().positive() }))
       .mutation(async ({ input }) => {
         await deleteUser(input.id);
         // Узел возвращает, была ли запись удалена или только заблокирована:

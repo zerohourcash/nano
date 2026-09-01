@@ -2913,10 +2913,18 @@ fn next_transfer_code(conn: &Connection, ws: i64) -> String {
     format!("ПП-{:04}", n + 1)
 }
 
-fn checkout_policy(conn: &Connection, uid: i64) -> Value {
-    jsn::user_public(conn, uid)
-        .and_then(|u| u.get("checkoutPolicy").cloned())
-        .unwrap_or_else(db::default_checkout_policy)
+fn checkout_policy(conn: &Connection, uid: i64, workspace_id: i64) -> Value {
+    conn.query_row(
+        "SELECT checkout_policy FROM user_workspaces WHERE user_id=?1 AND workspace_id=?2",
+        params![uid, workspace_id],
+        |row| row.get::<_, Option<String>>(0),
+    )
+    .optional()
+    .ok()
+    .flatten()
+    .flatten()
+    .and_then(|raw| serde_json::from_str(&raw).ok())
+    .unwrap_or_else(db::default_checkout_policy)
 }
 
 /// Списанный, отправленный в ремонт или на проверку предмет не участвует
@@ -3010,7 +3018,7 @@ fn take_one_atomic(
     {
         return Err(ApiError::bad("Инструмент уже у вас"));
     }
-    let policy = checkout_policy(conn, uid);
+    let policy = checkout_policy(conn, uid, item_ws);
     if let Some(cats) = policy.get("allowedCategoryIds").and_then(|v| v.as_array()) {
         if !cats.is_empty() {
             let cat = item["categoryId"].as_i64();
@@ -5614,7 +5622,7 @@ fn profile_delete_account(conn: &mut Connection, input: &Value, user_id: Option<
 
 fn admin_users(conn: &Connection, input: &Value) -> ApiResult {
     let ws = i64v(input, "workspaceId").unwrap_or_else(|| ws_fallback(conn));
-    let mut stmt = conn.prepare("SELECT user_id,position,role_name,personnel_number,rights_json FROM user_workspaces WHERE workspace_id=?1")?;
+    let mut stmt = conn.prepare("SELECT user_id,position,role_name,personnel_number,rights_json,checkout_policy FROM user_workspaces WHERE workspace_id=?1")?;
     let rows = stmt.query_map(params![ws], |r| {
         Ok((
             r.get::<_, i64>(0)?,
@@ -5622,10 +5630,11 @@ fn admin_users(conn: &Connection, input: &Value) -> ApiResult {
             r.get::<_, Option<String>>(2)?,
             r.get::<_, Option<String>>(3)?,
             r.get::<_, Option<String>>(4)?,
+            r.get::<_, Option<String>>(5)?,
         ))
     })?;
     let mut out = Vec::new();
-    for (id, position, role_name, personnel_number, rights) in rows.flatten() {
+    for (id, position, role_name, personnel_number, rights, policy) in rows.flatten() {
         if let Some(mut user) = jsn::user_public(conn, id) {
             user["globalPosition"] = user.get("position").cloned().unwrap_or(Value::Null);
             if position.is_some() {
@@ -5636,6 +5645,9 @@ fn admin_users(conn: &Connection, input: &Value) -> ApiResult {
             if let Some(rights) = rights.and_then(|value| serde_json::from_str(&value).ok()) {
                 user["roleRights"] = rights;
             }
+            user["checkoutPolicy"] = policy
+                .and_then(|value| serde_json::from_str(&value).ok())
+                .unwrap_or_else(db::default_checkout_policy);
             out.push(user);
         }
     }
@@ -5683,32 +5695,95 @@ fn admin_user_update(conn: &mut Connection, input: &Value, actor: Option<i64>) -
 
 fn admin_user_update_atomic(conn: &Connection, input: &Value, actor: Option<i64>) -> ApiResult {
     let actor = require_user(conn, actor)?;
-    require_can(conn, actor, "manageUsers")?;
+    let ws = i64v(input, "workspaceId")
+        .ok_or_else(|| ApiError::bad("workspaceId обязателен для изменения участника"))?;
+    require_can_in_workspace(conn, actor, ws, "manageUsers")?;
     let id = i64v(input, "id").ok_or_else(|| ApiError::bad("id"))?;
+    let target_member: bool = conn
+        .query_row(
+            "SELECT 1 FROM user_workspaces WHERE user_id=?1 AND workspace_id=?2",
+            params![id, ws],
+            |_| Ok(true),
+        )
+        .optional()?
+        .unwrap_or(false);
+    if !target_member {
+        return Err(ApiError::not_found(
+            "Участник не состоит в выбранной организации",
+        ));
+    }
+    if ["fullName", "phone", "avatarUrl"]
+        .iter()
+        .any(|field| input.get(*field).is_some())
+    {
+        return Err(ApiError::bad(
+            "Администратор организации не может менять глобальную личность или статус аккаунта",
+        ));
+    }
+    let checkout_policy = input.get("checkoutPolicy").filter(|value| !value.is_null());
+    if let Some(policy) = checkout_policy {
+        let encoded = serde_json::to_string(policy)
+            .map_err(|_| ApiError::bad("Некорректная политика выдачи"))?;
+        let valid_max = policy.get("maxHours").is_none_or(|value| {
+            value.is_null()
+                || value
+                    .as_f64()
+                    .is_some_and(|hours| hours > 0.0 && hours <= 87_600.0)
+        });
+        let valid_categories = policy.get("allowedCategoryIds").is_none_or(|value| {
+            value.is_null()
+                || value.as_array().is_some_and(|ids| {
+                    ids.len() <= 1_000 && ids.iter().all(|id| id.as_i64().is_some_and(|id| id > 0))
+                })
+        });
+        let valid_flags = ["requireApproval", "allowNoDueDate"]
+            .iter()
+            .all(|key| policy.get(*key).is_none_or(Value::is_boolean));
+        if !policy.is_object()
+            || encoded.len() > 4096
+            || !valid_max
+            || !valid_categories
+            || !valid_flags
+        {
+            return Err(ApiError::bad("Некорректная политика выдачи"));
+        }
+    }
     let before = jsn::user_public(conn, id).ok_or_else(|| ApiError::not_found("нет"))?;
-    conn.execute("UPDATE users SET full_name=COALESCE(?2,full_name), position=COALESCE(?3,position), phone=COALESCE(?4,phone), status=COALESCE(?5,status) WHERE id=?1",
-        params![id, s(input,"fullName"), s(input,"position"), s(input,"phone"), s(input,"status")])?;
+    if let Some(status) = s(input, "status") {
+        if status != "active" || before["status"].as_str() != Some("invited") {
+            return Err(ApiError::bad(
+                "Через организацию разрешена только первичная активация приглашённого аккаунта",
+            ));
+        }
+        conn.execute("UPDATE users SET status='active' WHERE id=?1", [id])?;
+    }
     if let Some(rr) = input.get("roleRights") {
         if !rr.is_null() {
-            let ws = i64v(input, "workspaceId").unwrap_or_else(|| ws_fallback(conn));
             conn.execute(
                 "UPDATE user_workspaces SET rights_json=?1 WHERE user_id=?2 AND workspace_id=?3",
                 params![rr.to_string(), id, ws],
             )?;
         }
     }
-    let ws = i64v(input, "workspaceId").unwrap_or_else(|| ws_fallback(conn));
-    conn.execute(
-        "UPDATE user_workspaces SET position=COALESCE(?1,position),role_name=COALESCE(?2,role_name),personnel_number=COALESCE(?3,personnel_number) WHERE user_id=?4 AND workspace_id=?5",
-        params![s(input,"position"),s(input,"organizationRole"),s(input,"personnelNumber"),id,ws],
-    )?;
-    if let Some(cp) = input.get("checkoutPolicy") {
-        if !cp.is_null() {
+    for (field, column) in [
+        ("position", "position"),
+        ("organizationRole", "role_name"),
+        ("personnelNumber", "personnel_number"),
+    ] {
+        if input.get(field).is_some() {
             conn.execute(
-                "UPDATE users SET checkout_policy=?1 WHERE id=?2",
-                params![cp.to_string(), id],
+                &format!(
+                    "UPDATE user_workspaces SET {column}=?1 WHERE user_id=?2 AND workspace_id=?3"
+                ),
+                params![s(input, field), id, ws],
             )?;
         }
+    }
+    if let Some(policy) = checkout_policy {
+        conn.execute(
+            "UPDATE user_workspaces SET checkout_policy=?1 WHERE user_id=?2 AND workspace_id=?3",
+            params![policy.to_string(), id, ws],
+        )?;
     }
     let updated = jsn::user_public(conn, id).ok_or_else(|| ApiError::not_found("нет"))?;
     let target_guid = ledger::guid(conn, "users", id)
@@ -5745,6 +5820,9 @@ fn admin_user_remove(conn: &mut Connection, input: &Value, actor: Option<i64>) -
 fn admin_user_remove_atomic(conn: &Connection, input: &Value, actor: Option<i64>) -> ApiResult {
     let uid = require_user(conn, actor)?;
     let id = i64v(input, "id").ok_or_else(|| ApiError::bad("id"))?;
+    let ws = i64v(input, "workspaceId")
+        .ok_or_else(|| ApiError::bad("workspaceId обязателен для исключения участника"))?;
+    require_can_in_workspace(conn, uid, ws, "manageUsers")?;
     if id == uid {
         return Err(ApiError::bad("Нельзя удалить собственную учётную запись"));
     }
@@ -5755,6 +5833,19 @@ fn admin_user_remove_atomic(conn: &Connection, input: &Value, actor: Option<i64>
     if exists == 0 {
         return Err(ApiError::not_found("Пользователь не найден"));
     }
+    let target_member: bool = conn
+        .query_row(
+            "SELECT 1 FROM user_workspaces WHERE user_id=?1 AND workspace_id=?2",
+            params![id, ws],
+            |_| Ok(true),
+        )
+        .optional()?
+        .unwrap_or(false);
+    if !target_member {
+        return Err(ApiError::not_found(
+            "Участник не состоит в выбранной организации",
+        ));
+    }
     let traces: i64 = conn.query_row(
         "SELECT (SELECT COUNT(*) FROM history_entries WHERE actor_user_id=?1)
               + (SELECT COUNT(*) FROM items WHERE responsible_user_id=?1)
@@ -5763,7 +5854,6 @@ fn admin_user_remove_atomic(conn: &Connection, input: &Value, actor: Option<i64>
         params![id],
         |r| r.get(0),
     )?;
-    let ws = i64v(input, "workspaceId").unwrap_or_else(|| ws_fallback(conn));
     let target_guid = ledger::guid(conn, "users", id)
         .map_err(|error| ApiError::internal(format!("Ошибка GUID: {error}")))?;
     let removal_comment = if traces == 0 {
@@ -9935,11 +10025,29 @@ mod tests {
 
     #[test]
     fn one_person_has_distinct_positions_in_multiple_organizations() {
-        let (conn, path, users, first_ws) = test_db();
+        let (mut conn, path, users, first_ws) = test_db();
         conn.execute("INSERT INTO workspaces(name,internal_id_prefix,created_at) VALUES('Вторая организация','B-',?1)",[now()]).unwrap();
         let second_ws = conn.last_insert_rowid();
-        conn.execute("UPDATE user_workspaces SET position='Кладовщик',role_name='Материально ответственное лицо',personnel_number='A-17' WHERE user_id=?1 AND workspace_id=?2",params![users[1],first_ws]).unwrap();
         conn.execute("INSERT INTO user_workspaces(user_id,workspace_id,rights_json,position,role_name,personnel_number) VALUES(?1,?2,?3,'Аудитор','Наблюдатель','B-04')",params![users[1],second_ws,db::default_rights().to_string()]).unwrap();
+        conn.execute(
+            "INSERT INTO user_workspaces(user_id,workspace_id,rights_json) VALUES(?1,?2,?3)",
+            params![users[0], second_ws, db::owner_rights().to_string()],
+        )
+        .unwrap();
+        dispatch(
+            &mut conn,
+            "admin.users.update",
+            &json!({"workspaceId":first_ws,"id":users[1],"position":"Кладовщик","organizationRole":"Материально ответственное лицо","personnelNumber":"A-17","checkoutPolicy":{"allowedCategoryIds":null,"maxHours":8,"requireApproval":true,"allowNoDueDate":false}}),
+            Some(users[0]),
+        )
+        .unwrap();
+        dispatch(
+            &mut conn,
+            "admin.users.update",
+            &json!({"workspaceId":second_ws,"id":users[1],"position":"Аудитор","organizationRole":"Наблюдатель","personnelNumber":"B-04","checkoutPolicy":{"allowedCategoryIds":null,"maxHours":72,"requireApproval":false,"allowNoDueDate":true}}),
+            Some(users[0]),
+        )
+        .unwrap();
         let first = admin_users(&conn, &json!({"workspaceId":first_ws})).unwrap();
         let second = admin_users(&conn, &json!({"workspaceId":second_ws})).unwrap();
         let a = first
@@ -9956,8 +10064,51 @@ mod tests {
             .unwrap();
         assert_eq!(a["position"], "Кладовщик");
         assert_eq!(a["personnelNumber"], "A-17");
+        assert_eq!(a["checkoutPolicy"]["maxHours"], 8);
+        assert_eq!(a["checkoutPolicy"]["requireApproval"], true);
         assert_eq!(b["position"], "Аудитор");
         assert_eq!(b["organizationRole"], "Наблюдатель");
+        assert_eq!(b["checkoutPolicy"]["maxHours"], 72);
+        assert_eq!(b["checkoutPolicy"]["requireApproval"], false);
+        assert_eq!(checkout_policy(&conn, users[1], first_ws)["maxHours"], 8);
+        assert_eq!(checkout_policy(&conn, users[1], second_ws)["maxHours"], 72);
+        let invalid_policy = dispatch(
+            &mut conn,
+            "admin.users.update",
+            &json!({"workspaceId":first_ws,"id":users[1],"checkoutPolicy":{"maxHours":-1}}),
+            Some(users[0]),
+        )
+        .unwrap_err();
+        assert_eq!(invalid_policy.http, 400);
+        assert_eq!(checkout_policy(&conn, users[1], first_ws)["maxHours"], 8);
+        let missing_scope = dispatch(
+            &mut conn,
+            "admin.users.update",
+            &json!({"id":users[1],"position":"Подмена"}),
+            Some(users[0]),
+        )
+        .unwrap_err();
+        assert_eq!(missing_scope.http, 400);
+        let missing_remove_scope = dispatch(
+            &mut conn,
+            "admin.users.remove",
+            &json!({"id":users[1]}),
+            Some(users[0]),
+        )
+        .unwrap_err();
+        assert_eq!(missing_remove_scope.http, 400);
+        let global_disable = dispatch(
+            &mut conn,
+            "admin.users.update",
+            &json!({"workspaceId":first_ws,"id":users[1],"status":"disabled"}),
+            Some(users[0]),
+        )
+        .unwrap_err();
+        assert_eq!(global_disable.http, 400);
+        assert_eq!(
+            jsn::user_public(&conn, users[1]).unwrap()["status"],
+            "active"
+        );
         cleanup(conn, path);
     }
 

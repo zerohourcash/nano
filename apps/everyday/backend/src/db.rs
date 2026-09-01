@@ -283,6 +283,10 @@ fn migrate(conn: &Connection) -> Result<()> {
         "ALTER TABLE user_workspaces ADD COLUMN personnel_number TEXT",
         [],
     );
+    let _ = conn.execute(
+        "ALTER TABLE user_workspaces ADD COLUMN checkout_policy TEXT",
+        [],
+    );
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS membership_versions(
            workspace_guid TEXT NOT NULL,
@@ -293,11 +297,26 @@ fn migrate(conn: &Connection) -> Result<()> {
            position TEXT,
            role_name TEXT,
            personnel_number TEXT,
+           checkout_policy TEXT,
            ledger_hash TEXT,
            version_hash TEXT NOT NULL,
            updated_at TEXT NOT NULL,
            PRIMARY KEY(workspace_guid,user_guid)
          );",
+    )?;
+    let _ = conn.execute(
+        "ALTER TABLE membership_versions ADD COLUMN checkout_policy TEXT",
+        [],
+    );
+    // Legacy policy was account-global. Copy it once into every existing
+    // membership so organizations can diverge after this migration without
+    // silently changing the effective rule.
+    conn.execute(
+        "UPDATE user_workspaces
+         SET checkout_policy=(SELECT checkout_policy FROM users WHERE users.id=user_workspaces.user_id)
+         WHERE checkout_policy IS NULL
+           AND EXISTS(SELECT 1 FROM users WHERE users.id=user_workspaces.user_id AND users.checkout_policy IS NOT NULL)",
+        [],
     )?;
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS custody_entries(
@@ -837,7 +856,8 @@ fn init_schema(conn: &Connection) -> Result<()> {
           rights_json TEXT,
           position TEXT,
           role_name TEXT,
-          personnel_number TEXT
+          personnel_number TEXT,
+          checkout_policy TEXT
         );
         CREATE TABLE IF NOT EXISTS storages (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
