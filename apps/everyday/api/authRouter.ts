@@ -185,6 +185,12 @@ export const authRouter = createRouter({
       sizeBytes: number
       debug: boolean
     },
+    desktopTestBuild: null as null | {
+      url: string
+      sha256: string
+      sizeBytes: number
+      debug: boolean
+    },
   })),
 
   inviteInfo: publicQuery

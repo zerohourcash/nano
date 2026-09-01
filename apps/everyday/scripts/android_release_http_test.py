@@ -44,6 +44,10 @@ def main() -> None:
         temp = Path(temporary)
         apk = temp / "everyday-test.apk"
         apk.write_bytes(payload)
+        desktop_payload = b"Everyday desktop archive\x00" + bytes(reversed(range(256))) * 16
+        desktop = temp / "everyday-linux.tar.gz"
+        desktop.write_bytes(desktop_payload)
+        desktop_expected = hashlib.sha256(desktop_payload).hexdigest()
         port = free_port()
         env = os.environ.copy()
         env.update(
@@ -54,6 +58,8 @@ def main() -> None:
                 "MESHKEEPER_WEB_ROOT": str(ROOT / "dist/public"),
                 "MESHKEEPER_ANDROID_APK_PATH": str(apk),
                 "MESHKEEPER_ANDROID_APK_SHA256": expected,
+                "MESHKEEPER_DESKTOP_RELEASE_PATH": str(desktop),
+                "MESHKEEPER_DESKTOP_RELEASE_SHA256": desktop_expected,
             }
         )
         process = subprocess.Popen(
@@ -79,7 +85,14 @@ def main() -> None:
                     "application/octet-stream",
                 }
             assert downloaded == payload
-            print("[OK  ] release metadata and downloaded APK bytes match SHA-256")
+            desktop_release = options["desktopTestBuild"]
+            assert desktop_release["sha256"] == desktop_expected
+            assert desktop_release["sizeBytes"] == len(desktop_payload)
+            assert desktop_release["debug"] is False
+            with urllib.request.urlopen(base + desktop_release["url"], timeout=3) as response:
+                assert response.status == 200
+                assert response.read() == desktop_payload
+            print("[OK  ] release metadata and downloaded Android/desktop bytes match SHA-256")
         finally:
             process.terminate()
             process.wait(timeout=5)
@@ -96,6 +109,19 @@ def main() -> None:
         assert b"SHA-256 mismatch" in rejected.stderr
         assert not (temp / "rejected.db").exists(), "bad release must fail before DB startup"
         print("[OK  ] mismatched APK hash prevents node startup before database creation")
+
+        bad_desktop_env = env | {
+            "MESHKEEPER_BIND": f"127.0.0.1:{free_port()}",
+            "MESHKEEPER_DB": str(temp / "desktop-rejected.db"),
+            "MESHKEEPER_DESKTOP_RELEASE_SHA256": "f" * 64,
+        }
+        desktop_rejected = subprocess.run(
+            [str(BINARY)], env=bad_desktop_env, capture_output=True, timeout=10, check=False
+        )
+        assert desktop_rejected.returncode != 0
+        assert b"Desktop release SHA-256 mismatch" in desktop_rejected.stderr
+        assert not (temp / "desktop-rejected.db").exists()
+        print("[OK  ] mismatched desktop hash prevents node startup before database creation")
 
 
 if __name__ == "__main__":

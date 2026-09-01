@@ -932,6 +932,19 @@ export default function AuthForm() {
           <div className="break-all font-mono-num">SHA-256: {optionsQ.data.androidTestBuild.sha256}</div>
         </div>
       )}
+      {optionsQ.data?.desktopTestBuild && !app && (
+        <div className="mt-3 rounded-xl border border-brand-100 bg-brand-50/60 p-3 text-xs leading-5 text-ink-500">
+          <a
+            href={optionsQ.data.desktopTestBuild.url}
+            className="font-semibold text-brand-600 underline underline-offset-2"
+            download
+          >
+            Скачать автономную версию для Linux x86_64
+          </a>
+          <div>{(optionsQ.data.desktopTestBuild.sizeBytes / 1024 / 1024).toFixed(1)} МиБ · Rust-нода и offline UI</div>
+          <div className="break-all font-mono-num">SHA-256: {optionsQ.data.desktopTestBuild.sha256}</div>
+        </div>
+      )}
     </div>
   )
 }

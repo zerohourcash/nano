@@ -47,34 +47,61 @@ const MAX_REQUEST_BYTES: usize = 32 * 1024 * 1024;
 // into memory by the handler.
 const MAX_INTERORG_GOSSIP_REQUEST_BYTES: usize = 3 * 1024 * 1024 + 64 * 1024;
 
-pub(crate) fn android_test_release_metadata() -> Option<Value> {
-    let path = PathBuf::from(std::env::var("MESHKEEPER_ANDROID_APK_PATH").ok()?);
-    let sha256 = std::env::var("MESHKEEPER_ANDROID_APK_SHA256").ok()?;
+fn release_metadata(
+    path_variable: &str,
+    hash_variable: &str,
+    url: &str,
+    debug: bool,
+) -> Option<Value> {
+    let path = PathBuf::from(std::env::var(path_variable).ok()?);
+    let sha256 = std::env::var(hash_variable).ok()?;
     if !path.is_file() || sha256.len() != 64 || !sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
     {
         return None;
     }
     let size = std::fs::metadata(path).ok()?.len();
     Some(json!({
-        "url":"/downloads/everyday-android-debug.apk",
+        "url":url,
         "sha256":sha256.to_ascii_lowercase(),
         "sizeBytes":size,
-        "debug":true
+        "debug":debug
     }))
 }
 
-fn validated_android_test_release() -> anyhow::Result<Option<PathBuf>> {
+pub(crate) fn android_test_release_metadata() -> Option<Value> {
+    release_metadata(
+        "MESHKEEPER_ANDROID_APK_PATH",
+        "MESHKEEPER_ANDROID_APK_SHA256",
+        "/downloads/everyday-android-debug.apk",
+        true,
+    )
+}
+
+pub(crate) fn desktop_test_release_metadata() -> Option<Value> {
+    release_metadata(
+        "MESHKEEPER_DESKTOP_RELEASE_PATH",
+        "MESHKEEPER_DESKTOP_RELEASE_SHA256",
+        "/downloads/everyday-linux-x86_64.tar.gz",
+        false,
+    )
+}
+
+fn validated_release(
+    path_variable: &str,
+    hash_variable: &str,
+    label: &str,
+) -> anyhow::Result<Option<PathBuf>> {
     use sha2::Digest;
     use std::io::Read;
 
-    let Ok(raw_path) = std::env::var("MESHKEEPER_ANDROID_APK_PATH") else {
+    let Ok(raw_path) = std::env::var(path_variable) else {
         return Ok(None);
     };
     let path = PathBuf::from(raw_path);
-    let expected = std::env::var("MESHKEEPER_ANDROID_APK_SHA256")
-        .map_err(|_| anyhow::anyhow!("APK path requires MESHKEEPER_ANDROID_APK_SHA256"))?;
+    let expected = std::env::var(hash_variable)
+        .map_err(|_| anyhow::anyhow!("{path_variable} requires {hash_variable}"))?;
     if expected.len() != 64 || !expected.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        anyhow::bail!("MESHKEEPER_ANDROID_APK_SHA256 must be 64 hexadecimal characters");
+        anyhow::bail!("{hash_variable} must be 64 hexadecimal characters");
     }
     let mut file = std::fs::File::open(&path)?;
     let mut digest = sha2::Sha256::new();
@@ -88,7 +115,7 @@ fn validated_android_test_release() -> anyhow::Result<Option<PathBuf>> {
     }
     let actual = hex::encode(digest.finalize());
     if !actual.eq_ignore_ascii_case(&expected) {
-        anyhow::bail!("Android APK SHA-256 mismatch: expected {expected}, got {actual}");
+        anyhow::bail!("{label} SHA-256 mismatch: expected {expected}, got {actual}");
     }
     Ok(Some(path))
 }
@@ -1249,7 +1276,16 @@ pub async fn run() -> anyhow::Result<()> {
     let dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     // Проверяем распространяемый пакет до открытия/миграции рабочей базы:
     // ошибочная публикация не должна запускать узел даже частично.
-    let android_test_release = validated_android_test_release()?;
+    let android_test_release = validated_release(
+        "MESHKEEPER_ANDROID_APK_PATH",
+        "MESHKEEPER_ANDROID_APK_SHA256",
+        "Android APK",
+    )?;
+    let desktop_test_release = validated_release(
+        "MESHKEEPER_DESKTOP_RELEASE_PATH",
+        "MESHKEEPER_DESKTOP_RELEASE_SHA256",
+        "Desktop release",
+    )?;
     let db_path = std::env::var("MESHKEEPER_DB")
         .map(PathBuf::from)
         .unwrap_or_else(|_| dir.join("data").join("meshkeeper-rs.db"));
@@ -1413,6 +1449,13 @@ pub async fn run() -> anyhow::Result<()> {
         app = app.route_service(
             "/downloads/everyday-android-debug.apk",
             ServeFile::new(apk_path),
+        );
+    }
+    if let Some(release_path) = desktop_test_release {
+        eprintln!("Desktop test release: /downloads/everyday-linux-x86_64.tar.gz");
+        app = app.route_service(
+            "/downloads/everyday-linux-x86_64.tar.gz",
+            ServeFile::new(release_path),
         );
     }
     let app = app

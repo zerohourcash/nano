@@ -497,6 +497,13 @@ SHA-256 до открытия рабочей базы и отказываетс�
 испытаний; публичный релиз должен быть подписан отдельным release-keystore.
 Проверка этого контура: `npm run android:release:http:test`.
 
+Аналогично `MESHKEEPER_DESKTOP_RELEASE_PATH` и
+`MESHKEEPER_DESKTOP_RELEASE_SHA256` публикуют фиксированный маршрут
+`/downloads/everyday-linux-x86_64.tar.gz`. Он появляется на экране входа только
+после успешной полной проверки архива при старте. После распаковки достаточно
+запустить `./start.sh` и открыть `http://127.0.0.1:8080`; Node.js, npm и интернет
+на целевом компьютере не требуются.
+
 `npm run desktop:package` создаёт самодостаточный каталог для текущей ОС в
 `.release/everyday-<os>-<arch>`: нативный Rust-бинарник, offline PWA,
 `start.sh`/`start.cmd` и manifest с размером и SHA-256 каждого файла. Затем
