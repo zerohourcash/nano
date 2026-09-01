@@ -1008,6 +1008,7 @@ mod android_jni {
         web_root: JString<'_>,
         upstream: JString<'_>,
         sync_token: JString<'_>,
+        workspace_scope: JString<'_>,
         node_signing_key: JString<'_>,
         advertise_url: JString<'_>,
     ) -> jint {
@@ -1016,6 +1017,7 @@ mod android_jni {
             let web_root = string(&mut env, web_root)?;
             let upstream = string(&mut env, upstream)?;
             let sync_token = string(&mut env, sync_token)?;
+            let workspace_scope = string(&mut env, workspace_scope)?;
             let node_signing_key = string(&mut env, node_signing_key)?;
             let advertise_url = string(&mut env, advertise_url)?;
             std::env::set_var("MESHKEEPER_DB", db_path);
@@ -1035,6 +1037,11 @@ mod android_jni {
                 std::env::remove_var("MESHKEEPER_SYNC_TOKEN");
             } else {
                 std::env::set_var("MESHKEEPER_SYNC_TOKEN", sync_token);
+            }
+            if workspace_scope.is_empty() {
+                std::env::remove_var("MESHKEEPER_SYNC_WORKSPACES");
+            } else {
+                std::env::set_var("MESHKEEPER_SYNC_WORKSPACES", workspace_scope);
             }
             if node_signing_key.is_empty() {
                 return Err("Android node signing key is empty".into());

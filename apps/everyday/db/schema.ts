@@ -50,6 +50,7 @@ export const workspaces = sqliteTable("workspaces", {
   internalIdPrefix: text("internal_id_prefix").notNull().default("ВН-"),
   comment: text("comment"),
   syncUrl: text("sync_url"),
+  guid: text("guid"),
   // ТЗ §8: группа может требовать фото-подтверждение при списании.
   requireWriteoffPhoto: integer("require_writeoff_photo", { mode: "boolean" })
     .notNull()

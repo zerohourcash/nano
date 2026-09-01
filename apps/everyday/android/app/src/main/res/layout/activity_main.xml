@@ -109,6 +109,28 @@
                 android:textColorHint="#9B9EC4"
                 android:textSize="14sp" />
 
+            <EditText
+                android:id="@+id/workspaceScope"
+                android:layout_width="match_parent"
+                android:layout_height="48dp"
+                android:layout_marginTop="10dp"
+                android:background="@drawable/bg_input"
+                android:hint="GUID организаций через запятую"
+                android:inputType="textNoSuggestions"
+                android:paddingStart="16dp"
+                android:paddingEnd="16dp"
+                android:textColor="#303466"
+                android:textColorHint="#9B9EC4"
+                android:textSize="14sp" />
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="6dp"
+                android:text="Ограничивает mesh указанными организациями. Пусто — доверенная нода синхронизирует всю локальную базу."
+                android:textColor="#6B6E9E"
+                android:textSize="12sp" />
+
             <Button
                 android:id="@+id/btnJoin"
                 android:layout_width="match_parent"

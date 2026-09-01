@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { motion } from 'framer-motion'
-import { Layers, Plus, QrCode } from 'lucide-react'
+import { Copy, Layers, Plus, QrCode } from 'lucide-react'
 import { trpc } from '@/providers/trpc'
 import { useStore } from '@/lib/store'
 import { joinInviteUrl } from '@/lib/app-mode'
@@ -434,6 +434,20 @@ export default function WorkspacesSection() {
                   {tzLabel(ws.timezone)} · префикс{' '}
                   <span className="font-mono-num">{ws.internalIdPrefix}</span>
                 </div>
+                {ws.guid && (
+                  <button
+                    type="button"
+                    className="mt-2 flex max-w-full items-center gap-1.5 text-left font-mono-num text-[11px] text-brand-600"
+                    title="Скопировать GUID для organization scope ноды"
+                    onClick={() => {
+                      void navigator.clipboard.writeText(ws.guid!)
+                      toast('GUID организации скопирован')
+                    }}
+                  >
+                    <Copy size={12} className="shrink-0" />
+                    <span className="truncate">{ws.guid}</span>
+                  </button>
+                )}
               </div>
             </motion.div>
           )

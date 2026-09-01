@@ -436,7 +436,7 @@ pub fn transfer_json(conn: &Connection, id: i64) -> Option<Value> {
 
 pub fn workspace_json(conn: &Connection, id: i64) -> Option<Value> {
     conn.query_row(
-        "SELECT id, name, timezone, internal_id_prefix, comment, created_at, sync_url, require_writeoff_photo FROM workspaces WHERE id=?1",
+        "SELECT id, name, timezone, internal_id_prefix, comment, created_at, sync_url, require_writeoff_photo, guid FROM workspaces WHERE id=?1",
         params![id],
         |r| {
             Ok(json!({
@@ -448,6 +448,7 @@ pub fn workspace_json(conn: &Connection, id: i64) -> Option<Value> {
                 "createdAt": r.get::<_, String>(5)?,
                 "syncUrl": r.get::<_, Option<String>>(6)?,
                 "requireWriteoffPhoto": r.get::<_, i64>(7)? != 0,
+                "guid": r.get::<_, Option<String>>(8)?,
             }))
         },
     )

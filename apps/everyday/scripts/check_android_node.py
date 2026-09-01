@@ -10,6 +10,7 @@ activity = (android / "src/main/java/ru/meshkeeper/app/MainActivity.java").read_
 secrets = (android / "src/main/java/ru/meshkeeper/app/SecretStore.java").read_text(encoding="utf-8")
 gradle = (android / "build.gradle").read_text(encoding="utf-8")
 manifest = (android / "src/main/AndroidManifest.xml").read_text(encoding="utf-8")
+layout = (android / "src/main/res/layout/activity_main.xml").read_text(encoding="utf-8")
 
 required = {
     "Rust JNI symbol": "Java_ru_meshkeeper_app_RustNode_startNode" in lib,
@@ -26,8 +27,11 @@ required = {
     "service decrypts token": "SecretStore.loadSyncToken(this)" in service,
     "service seals node key": "SecretStore.saveNodeSigningKey(this" in service,
     "Rust receives sealed node key": "MESHKEEPER_NODE_SIGNING_KEY" in lib,
+    "Rust receives organization scope": "MESHKEEPER_SYNC_WORKSPACES" in lib and "workspaceScope" in service,
+    "native organization scope control": '@+id/workspaceScope' in layout and "normalizeWorkspaceScope" in activity,
     "authenticated LAN discovery": "MESHKEEPER_DISCOVERY_BIND" in lib and "discovery::run" in lib,
     "token absent from service Intent": "EXTRA_TOKEN" not in service and "EXTRA_TOKEN" not in activity,
+    "scope absent from service Intent": "EXTRA_WORKSPACE_SCOPE" not in service and "EXTRA_WORKSPACE_SCOPE" not in activity,
     "token not restored into UI": "syncToken.setText(SecretStore.loadSyncToken" not in activity,
     "system Share receive": "android.intent.action.SEND" in manifest and "takePendingSyncBundle" in activity,
     "incoming bundle bounded": "MAX_SYNC_BUNDLE_BYTES" in activity and "content\".equalsIgnoreCase" in activity,

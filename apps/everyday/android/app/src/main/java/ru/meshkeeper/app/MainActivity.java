@@ -46,11 +46,13 @@ import com.journeyapps.barcodescanner.ScanOptions;
 public class MainActivity extends AppCompatActivity {
     private static final String PREFS = "meshkeeper";
     private static final String KEY_RELAY = "relay";
+    private static final String KEY_WORKSPACE_SCOPE = "workspace_scope";
 
     private WebView web;
     private View setup;
     private EditText serverUrl;
     private EditText syncToken;
+    private EditText workspaceScope;
     private TextView lanHint;
     private boolean hasStoredToken;
     private String pendingMode = "join";
@@ -92,12 +94,14 @@ public class MainActivity extends AppCompatActivity {
         setup = findViewById(R.id.setup);
         serverUrl = findViewById(R.id.serverUrl);
         syncToken = findViewById(R.id.syncToken);
+        workspaceScope = findViewById(R.id.workspaceScope);
         lanHint = findViewById(R.id.lanHint);
         Button btnJoin = findViewById(R.id.btnJoin);
         Button btnCreate = findViewById(R.id.btnCreate);
 
         SharedPreferences prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
         serverUrl.setText(prefs.getString(KEY_RELAY, ""));
+        workspaceScope.setText(prefs.getString(KEY_WORKSPACE_SCOPE, ""));
         try {
             hasStoredToken = !SecretStore.loadSyncToken(this).isEmpty();
             syncToken.setHint(hasStoredToken
@@ -323,6 +327,13 @@ public class MainActivity extends AppCompatActivity {
             Toast.makeText(this, "Mesh-токен должен содержать не менее 32 символов", Toast.LENGTH_LONG).show();
             return;
         }
+        final String scope;
+        try {
+            scope = normalizeWorkspaceScope(workspaceScope.getText().toString());
+        } catch (IllegalArgumentException error) {
+            Toast.makeText(this, error.getMessage(), Toast.LENGTH_LONG).show();
+            return;
+        }
         try {
             SecretStore.saveSyncToken(this, token);
         } catch (Exception error) {
@@ -330,7 +341,10 @@ public class MainActivity extends AppCompatActivity {
             return;
         }
         hasStoredToken = true;
-        getSharedPreferences(PREFS, MODE_PRIVATE).edit().putString(KEY_RELAY, relay).apply();
+        getSharedPreferences(PREFS, MODE_PRIVATE).edit()
+                .putString(KEY_RELAY, relay)
+                .putString(KEY_WORKSPACE_SCOPE, scope)
+                .apply();
         syncToken.setText("");
         syncToken.setHint("mesh-токен защищён на устройстве");
         Intent service = new Intent(this, NodeService.class)
@@ -376,6 +390,21 @@ public class MainActivity extends AppCompatActivity {
         StringBuilder out = new StringBuilder(64);
         for (byte value : bytes) out.append(String.format("%02x", value & 0xff));
         return out.toString();
+    }
+
+    private static String normalizeWorkspaceScope(String raw) {
+        String trimmed = raw == null ? "" : raw.trim();
+        if (trimmed.isEmpty()) return "";
+        java.util.LinkedHashSet<String> unique = new java.util.LinkedHashSet<>();
+        for (String value : trimmed.split(",")) {
+            String guid = value.trim();
+            if (guid.isEmpty() || guid.length() > 128 || !guid.matches("[A-Za-z0-9_-]+")) {
+                throw new IllegalArgumentException("Некорректный GUID организации: " + guid);
+            }
+            unique.add(guid);
+            if (unique.size() > 100) throw new IllegalArgumentException("Разрешено не более 100 организаций");
+        }
+        return String.join(",", unique);
     }
 
     @Override

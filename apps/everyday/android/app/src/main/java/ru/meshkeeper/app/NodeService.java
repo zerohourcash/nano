@@ -33,6 +33,7 @@ public class NodeService extends Service {
         }
         String relay = intent == null ? null : intent.getStringExtra(EXTRA_RELAY);
         if (relay == null) relay = getSharedPreferences("meshkeeper", MODE_PRIVATE).getString("relay", "");
+        String workspaceScope = getSharedPreferences("meshkeeper", MODE_PRIVATE).getString("workspace_scope", "");
         String token;
         try {
             token = SecretStore.loadSyncToken(this);
@@ -44,13 +45,14 @@ public class NodeService extends Service {
         if (nodeThread == null || !nodeThread.isAlive()) {
             final String upstream = relay == null ? "" : relay;
             final String syncToken = token == null ? "" : token;
-            nodeThread = new Thread(() -> runNode(upstream, syncToken), "meshkeeper-rust-node");
+            final String scope = workspaceScope == null ? "" : workspaceScope;
+            nodeThread = new Thread(() -> runNode(upstream, syncToken, scope), "meshkeeper-rust-node");
             nodeThread.start();
         }
         return START_STICKY;
     }
 
-    private void runNode(String upstream, String token) {
+    private void runNode(String upstream, String token, String workspaceScope) {
         if (!RustNode.isAvailable()) {
             Log.e(TAG, "libmeshkeeper_node.so отсутствует в APK");
             stopSelf();
@@ -69,7 +71,7 @@ public class NodeService extends Service {
             }
             String lan = lanIpv4();
             String advertised = lan.isEmpty() ? "" : "http://" + lan + ":" + RustNode.SYNC_PORT;
-            RustNode.startNode(db.getAbsolutePath(), webRoot.getAbsolutePath(), upstream, token,
+            RustNode.startNode(db.getAbsolutePath(), webRoot.getAbsolutePath(), upstream, token, workspaceScope,
                     nodeSigningKey, advertised);
         } catch (Throwable error) {
             Log.e(TAG, "Rust-узел остановлен", error);

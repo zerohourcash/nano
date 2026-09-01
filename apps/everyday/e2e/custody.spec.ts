@@ -134,6 +134,8 @@ test('browser signs a real custody transaction and ledger retains its proof', as
   forgedBundle.ciphertext = `${forgedBundle.ciphertext.startsWith('A') ? 'B' : 'A'}${forgedBundle.ciphertext.slice(1)}`
 
   await page.goto('/admin')
+  await page.getByRole('button', { name: 'Пространства', exact: true }).click()
+  await expect(page.getByTitle('Скопировать GUID для organization scope ноды').first()).toBeVisible()
   await page.getByRole('button', { name: 'Офлайн-узлы' }).first().click()
   await expect(page.getByRole('heading', { name: 'Целостность локальной копии' })).toBeVisible()
   await expect(
