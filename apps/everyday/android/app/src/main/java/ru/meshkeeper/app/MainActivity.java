@@ -64,6 +64,9 @@ public class MainActivity extends AppCompatActivity {
     private PermissionRequest pendingWebPermission;
     private ValueCallback<Uri[]> fileCallback;
     private volatile String pendingSyncBundle;
+    private BleMeshTransport bleTransport;
+    private byte[] pendingBleSend;
+    private boolean pendingBleEnable;
     private static final int MAX_SYNC_BUNDLE_BYTES = 30 * 1024 * 1024;
 
     private final ActivityResultLauncher<ScanOptions> qrLauncher = registerForActivityResult(
@@ -258,6 +261,93 @@ public class MainActivity extends AppCompatActivity {
             pendingSyncBundle = null;
             return bundle == null ? "" : bundle;
         }
+
+        @android.webkit.JavascriptInterface
+        public void enableBleTransport() {
+            runOnUiThread(() -> enableBle(false, null));
+        }
+
+        @android.webkit.JavascriptInterface
+        public void sendSyncBundleOverBle(String json) {
+            if (json == null) return;
+            byte[] bytes = json.getBytes(StandardCharsets.UTF_8);
+            runOnUiThread(() -> enableBle(true, bytes));
+        }
+    }
+
+    private void enableBle(boolean send, byte[] bundle) {
+        if (send) {
+            try {
+                if (bundle == null || bundle.length > MAX_SYNC_BUNDLE_BYTES) {
+                    throw new IllegalArgumentException("Пакет превышает лимит 30 МБ");
+                }
+                org.json.JSONObject parsed = new org.json.JSONObject(new String(bundle, StandardCharsets.UTF_8));
+                if (!"everyday-sync-bundle".equals(parsed.optString("format"))) {
+                    throw new IllegalArgumentException("Это не пакет Everyday");
+                }
+            } catch (Exception error) {
+                Toast.makeText(this, "BLE: " + error.getMessage(), Toast.LENGTH_LONG).show();
+                return;
+            }
+        }
+        if (!hasBlePermissions()) {
+            pendingBleEnable = true;
+            pendingBleSend = send ? bundle : null;
+            requestBlePermissions();
+            return;
+        }
+        BleMeshTransport transport = bleTransport();
+        transport.enableReceiver();
+        if (send) transport.send(bundle);
+    }
+
+    private BleMeshTransport bleTransport() {
+        if (bleTransport == null) {
+            bleTransport = new BleMeshTransport(this, new BleMeshTransport.Listener() {
+                @Override public void onBundle(byte[] bundle) {
+                    runOnUiThread(() -> acceptBleBundle(bundle));
+                }
+                @Override public void onStatus(String message, boolean error) {
+                    runOnUiThread(() -> {
+                        Toast.makeText(MainActivity.this, message,
+                                error ? Toast.LENGTH_LONG : Toast.LENGTH_SHORT).show();
+                        web.evaluateJavascript("window.dispatchEvent(new CustomEvent('meshkeeper-ble-status',{detail:{message:"
+                                + org.json.JSONObject.quote(message) + ",error:" + error + "}}));", null);
+                    });
+                }
+            });
+        }
+        return bleTransport;
+    }
+
+    private void acceptBleBundle(byte[] bytes) {
+        try {
+            if (bytes == null || bytes.length > MAX_SYNC_BUNDLE_BYTES) throw new IllegalArgumentException("лимит 30 МБ");
+            String json = new String(bytes, StandardCharsets.UTF_8);
+            org.json.JSONObject parsed = new org.json.JSONObject(json);
+            if (!"everyday-sync-bundle".equals(parsed.optString("format"))) throw new IllegalArgumentException("неверный формат");
+            pendingSyncBundle = json;
+            Toast.makeText(this, "BLE-пакет получен — проверяем подписи", Toast.LENGTH_LONG).show();
+            web.evaluateJavascript("window.dispatchEvent(new Event('meshkeeper-native-bundle'));", null);
+        } catch (Exception error) {
+            Toast.makeText(this, "BLE-пакет отклонён: " + error.getMessage(), Toast.LENGTH_LONG).show();
+        }
+    }
+
+    private boolean hasBlePermissions() {
+        if (Build.VERSION.SDK_INT >= 31) {
+            return ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_SCAN) == PackageManager.PERMISSION_GRANTED
+                    && ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED
+                    && ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_ADVERTISE) == PackageManager.PERMISSION_GRANTED;
+        }
+        return ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED;
+    }
+
+    private void requestBlePermissions() {
+        String[] permissions = Build.VERSION.SDK_INT >= 31
+                ? new String[]{Manifest.permission.BLUETOOTH_SCAN, Manifest.permission.BLUETOOTH_CONNECT, Manifest.permission.BLUETOOTH_ADVERTISE}
+                : new String[]{Manifest.permission.ACCESS_FINE_LOCATION};
+        ActivityCompat.requestPermissions(this, permissions, 46);
     }
 
     @Override
@@ -526,6 +616,26 @@ public class MainActivity extends AppCompatActivity {
             return;
         }
         if (requestCode == 45 && granted) startNativeScan();
+        if (requestCode == 46) {
+            boolean allGranted = true;
+            for (int result : grantResults) allGranted &= result == PackageManager.PERMISSION_GRANTED;
+            if (allGranted && pendingBleEnable) {
+                byte[] bundle = pendingBleSend;
+                pendingBleEnable = false;
+                pendingBleSend = null;
+                enableBle(bundle != null, bundle);
+            } else {
+                pendingBleEnable = false;
+                pendingBleSend = null;
+                Toast.makeText(this, "Без разрешений Bluetooth BLE mesh выключен", Toast.LENGTH_LONG).show();
+            }
+        }
+    }
+
+    @Override
+    protected void onDestroy() {
+        if (bleTransport != null) bleTransport.stop();
+        super.onDestroy();
     }
 
     private boolean isTrustedLocalOrigin(Uri uri) {

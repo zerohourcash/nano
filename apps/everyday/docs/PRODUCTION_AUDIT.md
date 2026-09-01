@@ -23,6 +23,7 @@
 | SQLCipher | отдельный feature, обязательный ключ, wrong-key rejection | `npm run encrypted-db:test` | Проверено Linux |
 | Backup/restore | online `.backup`, шифрование, integrity-check, новый target | `npm run backup:restore:test` | Проверено Linux |
 | Потоковый transport core | MTU frames, out-of-order, duplicate, missing ranges, SHA-256, Android JNI | Rust `stream_transport::tests`, encrypted bundle round-trip, APK symbols | Проверено |
+| Android BLE GATT | opt-in advertiser/server + scanner/client, MTU/retry, authorized import handoff | Android compile, manifest/static contract, APK | Реализовано; RF-тест на двух телефонах не выполнен |
 
 ## Release gates
 
@@ -38,8 +39,10 @@ npm run production:audit
 
 ## Не закрыто и поэтому не заявляется production-ready
 
-- BLE Mesh/LoRa radio adapter пока не реализован. Общий bounded MTU framing,
-  out-of-order сборка и resume готовы и тестируются; без IP также работает
+- Android BLE GATT adapter реализован, но ещё не проверен между двумя
+  физическими телефонами. Bluetooth Mesh managed flooding и LoRa radio adapter
+  пока не реализованы. Общий bounded MTU framing, out-of-order сборка и resume
+  готовы и тестируются; без IP также работает
   зашифрованный store-and-forward bundle через системный Bluetooth/Wi‑Fi
   Direct/USB Share, но это ручной перенос, не фоновый BLE gossip.
 - iOS native shell и его Keychain/lifecycle тест отсутствуют; на iOS доступна

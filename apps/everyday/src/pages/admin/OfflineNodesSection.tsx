@@ -35,6 +35,10 @@ export default function OfflineNodesSection() {
   )
   const [peerUrl, setPeerUrl] = useState('')
   const [password, setPassword] = useState('')
+  const [bleStatus, setBleStatus] = useState<{ message: string; error: boolean } | null>(null)
+  const nativeBle = typeof window !== 'undefined' && Boolean((window as Window & {
+    MeshKeeperNative?: { enableBleTransport?: () => void; sendSyncBundleOverBle?: (json: string) => void }
+  }).MeshKeeperNative?.enableBleTransport)
   const addPeer = trpc.sync.addPeer.useMutation({
     onSuccess: () => {
       utils.sync.status.invalidate()
@@ -110,6 +114,16 @@ export default function OfflineNodesSection() {
     window.addEventListener('meshkeeper-native-bundle', consumeNativeBundle)
     return () => window.removeEventListener('meshkeeper-native-bundle', consumeNativeBundle)
   }, [importBundle, toast])
+  useEffect(() => {
+    const onBleStatus = (event: Event) => {
+      const detail = (event as CustomEvent<{ message?: unknown; error?: unknown }>).detail
+      if (typeof detail?.message === 'string') {
+        setBleStatus({ message: detail.message.slice(0, 500), error: detail.error === true })
+      }
+    }
+    window.addEventListener('meshkeeper-ble-status', onBleStatus)
+    return () => window.removeEventListener('meshkeeper-ble-status', onBleStatus)
+  }, [])
   const exp = trpc.backup.export.useMutation({
     onSuccess: (blob) => {
       const a = document.createElement('a')
@@ -168,6 +182,23 @@ export default function OfflineNodesSection() {
     anchor.click()
     URL.revokeObjectURL(url)
     toast('Пакет скачан — передайте его Bluetooth, Wi‑Fi Direct или USB')
+  }
+
+  const sendTransportBundleOverBle = async () => {
+    const bridge = (window as Window & {
+      MeshKeeperNative?: { sendSyncBundleOverBle?: (json: string) => void }
+    }).MeshKeeperNative
+    if (!bridge?.sendSyncBundleOverBle) {
+      toast('BLE mesh доступен только в Android-приложении', 'error')
+      return
+    }
+    const result = await bundleQ.refetch()
+    if (!result.data) {
+      toast(result.error?.message ?? 'Не удалось собрать BLE-пакет', 'error')
+      return
+    }
+    bridge.sendSyncBundleOverBle(JSON.stringify(result.data))
+    toast('Пакет подготовлен; Android ищет BLE-ноды рядом')
   }
 
   const importTransportFile = async (file: File) => {
@@ -476,7 +507,25 @@ export default function OfflineNodesSection() {
               event.target.value = ''
             }} />
           </label>
+          {nativeBle && (
+            <>
+              <button className={btnSecondaryCls} onClick={() => {
+                const bridge = (window as Window & { MeshKeeperNative?: { enableBleTransport?: () => void } }).MeshKeeperNative
+                bridge?.enableBleTransport?.()
+              }}>
+                <Radio size={16} /> Включить BLE-приём
+              </button>
+              <button className={btnPrimaryCls} disabled={bundleQ.isFetching} onClick={() => void sendTransportBundleOverBle()}>
+                <Radio size={16} /> Передать по BLE
+              </button>
+            </>
+          )}
         </div>
+        {nativeBle && bleStatus && (
+          <p className={cn('rounded-xl p-3 text-sm', bleStatus.error ? 'bg-danger/10 text-danger' : 'bg-teal/10 text-teal-dark')}>
+            BLE: {bleStatus.message}
+          </p>
+        )}
         <p className="text-[12px] text-ink-300">Посредник не видит содержимое; AEAD, подпись и хэш проверяются до изменения локальной базы.</p>
       </section>
 

@@ -32,6 +32,12 @@ def main() -> None:
         names = set(archive.namelist())
         if "assets/www/index.html" not in names:
             raise SystemExit("APK does not contain the offline web application")
+        web_scripts = b"".join(
+            archive.read(name) for name in names
+            if name.startswith("assets/www/assets/") and name.endswith(".js")
+        )
+        if b"sendSyncBundleOverBle" not in web_scripts:
+            raise SystemExit("APK web application does not expose the BLE transfer UI")
         for abi in ABIS:
             member = f"lib/{abi}/libmeshkeeper_node.so"
             if member not in names:

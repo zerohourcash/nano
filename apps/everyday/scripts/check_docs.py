@@ -14,7 +14,7 @@ required_docs = {
     "everyday-sync-bundle": "offline bundle",
     "SHA-256": "implemented digest",
     "Ed25519": "implemented signature",
-    "ещё не реализованы": "honest mobile/BLE status",
+    "RF-тест требует двух физических": "honest BLE verification status",
 }
 for marker, label in required_docs.items():
     if marker not in transport:

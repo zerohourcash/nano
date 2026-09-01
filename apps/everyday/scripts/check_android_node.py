@@ -12,6 +12,7 @@ gradle = (android / "build.gradle").read_text(encoding="utf-8")
 manifest = (android / "src/main/AndroidManifest.xml").read_text(encoding="utf-8")
 layout = (android / "src/main/res/layout/activity_main.xml").read_text(encoding="utf-8")
 stream_inbox = (android / "src/main/java/ru/meshkeeper/app/StreamTransportInbox.java").read_text(encoding="utf-8")
+ble_transport = (android / "src/main/java/ru/meshkeeper/app/BleMeshTransport.java").read_text(encoding="utf-8")
 
 required = {
     "Rust JNI symbol": "Java_ru_meshkeeper_app_RustNode_startNode" in lib,
@@ -27,6 +28,19 @@ required = {
         and "RustNode.validateTransportFrame" in stream_inbox
         and "RustNode.assembleTransport" in stream_inbox
         and "Конфликтующий повтор" in stream_inbox,
+    "opt-in BLE GATT radio": "openGattServer" in ble_transport
+        and "startAdvertising" in ble_transport
+        and "startScan" in ble_transport
+        and "fragmentTransport" in ble_transport,
+    "BLE runtime permissions": all(permission in manifest for permission in (
+        "android.permission.BLUETOOTH_SCAN",
+        "android.permission.BLUETOOTH_CONNECT",
+        "android.permission.BLUETOOTH_ADVERTISE",
+    )),
+    "BLE cannot mutate SQLite directly": "sqlite" not in ble_transport.lower()
+        and "pendingSyncBundle" in activity,
+    "Android backup and device transfer disabled": "dataExtractionRules" in manifest
+        and (android / "src/main/res/xml/data_extraction_rules.xml").is_file(),
     "private UI bind": 'MESHKEEPER_BIND", "127.0.0.1:8765' in lib,
     "sync-only LAN bind": 'MESHKEEPER_SYNC_BIND", "0.0.0.0:8766' in lib,
     "foreground Rust launch": "RustNode.startNode" in service,

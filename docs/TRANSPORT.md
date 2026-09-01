@@ -159,8 +159,13 @@ transfer ID, sequence/count, общий SHA-256, размер и доменно 
 кадра. После сборки обязательно проверяется полный SHA-256; затем существующий
 bundle importer независимо проверяет XChaCha20-Poly1305 и Ed25519.
 
-Это готовое ядро протокола, но не заявление о доступе к BLE radio: Android/iOS
-GATT service и конкретная маршрутизация Bluetooth Mesh остаются platform layer.
+Android platform layer содержит opt-in BLE GATT advertiser/server и
+scanner/client. Пользователь явно включает приём или передачу; Android 12+
+запрашивает `SCAN`, `CONNECT`, `ADVERTISE`, старые версии — location. Sender
+запрашивает MTU 185, последовательно пишет кадры с GATT response и при reconnect
+повторяет тот же transfer ID. Receiver сохраняет только проверенные кадры в
+bounded inbox, а собранный bundle возвращает в обычный авторизованный import UI.
+Radio-код не имеет API записи SQLite.
 Android APK экспортирует это ядро через JNI-методы `fragmentTransport`,
 `missingTransportRanges` и `assembleTransport`: Java/Kotlin radio layer не
 реализует framing повторно и получает payload только после нативной проверки.
@@ -177,6 +182,7 @@ Android APK экспортирует это ядро через JNI-методы
   NetworkCallback обновляет advertised endpoint при смене Wi‑Fi/хотспота, а
   discovery вычисляет адрес заново перед каждым подписанным анонсом.
 - Обмен телефонов без IP: уже возможен вручную через системный файловый Share.
-- iOS-оболочка и BLE radio adapter ещё не реализованы; общий MTU framing,
-  resume и проверка encrypted payload уже реализованы и не зависят от radio.
-  Android ABI/APK проверяются отдельным CI job.
+- Android BLE GATT radio adapter реализован и проходит compile/APK contract,
+  но межтелефонный RF-тест требует двух физических BLE-устройств и пока не
+  зафиксирован. iOS-оболочка и Bluetooth Mesh managed-flooding profile ещё не
+  реализованы. Android ABI/APK проверяются отдельным CI job.
