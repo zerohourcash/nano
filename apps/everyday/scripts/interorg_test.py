@@ -118,7 +118,24 @@ def main() -> int:
             "workspaceId": ws_b["id"], "envelopeId": incoming["envelopeId"],
         })
         check("принятие записано в Ledger и повтор идемпотентен",
-              len(accepted.get("ledgerHash", "")) == 64 and duplicate.get("duplicate") is True)
+              len(accepted.get("ledgerHash", "")) == 64
+              and accepted.get("receiptQueued") is True
+              and duplicate.get("duplicate") is True)
+
+        def accepted_outbox_a():
+            rows = a.call("interorg.outbox", {"workspaceId": ws_a["id"]}, mutation=False)
+            return next((row for row in rows if row["transactionId"] == transaction_id
+                         and row["status"] == "accepted"), None)
+
+        check("зашифрованная квитанция прошла обратно через mesh и связалась с исходной транзакцией",
+              wait_for(lambda: accepted_outbox_a() is not None, timeout=20),
+              str(a.call("interorg.outbox", {"workspaceId": ws_a["id"]}, mutation=False)))
+        receipt = accepted_outbox_a()
+        check("отправитель получил hash летописи получателя, но не внутреннюю базу",
+              receipt is not None
+              and receipt["acceptanceLedgerHash"] == accepted["ledgerHash"]
+              and len(receipt["receiptEnvelopeId"]) == 36,
+              str(receipt))
         with sqlite3.connect(b.db) as database:
             accepted_rows = database.execute(
                 "SELECT COUNT(*) FROM history_entries WHERE type='interorg_accept' AND to_label=?",

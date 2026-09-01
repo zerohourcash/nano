@@ -82,6 +82,14 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
            contact_guid TEXT NOT NULL, transaction_id TEXT NOT NULL,
            kind TEXT NOT NULL, body_json TEXT NOT NULL,
            received_at TEXT NOT NULL, accepted INTEGER NOT NULL DEFAULT 0
+         );
+         CREATE TABLE IF NOT EXISTS interorg_outbox(
+           workspace_id INTEGER NOT NULL, transaction_id TEXT NOT NULL,
+           envelope_id TEXT NOT NULL, contact_guid TEXT NOT NULL,
+           kind TEXT NOT NULL, created_at TEXT NOT NULL,
+           status TEXT NOT NULL DEFAULT 'queued',
+           accepted_at TEXT, acceptance_ledger_hash TEXT, receipt_envelope_id TEXT,
+           PRIMARY KEY(workspace_id,transaction_id)
          );",
     )?;
     let replay_index_exists: bool = conn.query_row(
@@ -304,7 +312,68 @@ pub fn send_to_contact(
         work_bits,
     )?;
     relay_store(conn, &envelope, work_bits)?;
+    if kind != "receipt.accepted" {
+        conn.execute(
+            "INSERT OR IGNORE INTO interorg_outbox(workspace_id,transaction_id,envelope_id,contact_guid,kind,created_at)
+             VALUES(?1,?2,?3,?4,?5,?6)",
+            params![workspace_id, transaction_id, envelope.id, contact_guid, kind, Utc::now().to_rfc3339()],
+        )?;
+    }
     Ok(envelope)
+}
+
+pub fn outbox(conn: &Connection, workspace_id: i64) -> Result<serde_json::Value> {
+    let mut statement = conn.prepare(
+        "SELECT o.transaction_id,o.envelope_id,o.kind,o.created_at,o.status,o.accepted_at,
+                o.acceptance_ledger_hash,o.receipt_envelope_id,c.guid,c.name,c.remote_workspace_guid
+         FROM interorg_outbox o JOIN interorg_contacts c ON c.guid=o.contact_guid
+         WHERE o.workspace_id=?1 ORDER BY o.created_at DESC",
+    )?;
+    let rows = statement.query_map([workspace_id], |row| Ok(serde_json::json!({
+        "transactionId":row.get::<_,String>(0)?, "envelopeId":row.get::<_,String>(1)?,
+        "kind":row.get::<_,String>(2)?, "createdAt":row.get::<_,String>(3)?,
+        "status":row.get::<_,String>(4)?, "acceptedAt":row.get::<_,Option<String>>(5)?,
+        "acceptanceLedgerHash":row.get::<_,Option<String>>(6)?, "receiptEnvelopeId":row.get::<_,Option<String>>(7)?,
+        "contact":{"guid":row.get::<_,String>(8)?,"name":row.get::<_,String>(9)?,"remoteWorkspaceGuid":row.get::<_,String>(10)?}
+    })))?;
+    Ok(serde_json::Value::Array(rows.flatten().collect()))
+}
+
+/// Marks an inbox transaction accepted and emits a separately encrypted,
+/// store-and-forward receipt to the sender. The receipt commits to the
+/// receiver's append-only ledger event without exposing either organization
+/// to relay nodes.
+pub fn accept_with_receipt(
+    conn: &Connection,
+    workspace_id: i64,
+    envelope_id: &str,
+    acceptance_ledger_hash: &str,
+    work_bits: u8,
+) -> Result<Envelope> {
+    let (contact_guid, original_transaction): (String, String) = conn.query_row(
+        "SELECT contact_guid,transaction_id FROM interorg_inbox
+         WHERE envelope_id=?1 AND workspace_id=?2 AND accepted=0",
+        params![envelope_id, workspace_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let accepted_at = Utc::now().to_rfc3339();
+    conn.execute(
+        "UPDATE interorg_inbox SET accepted=1 WHERE envelope_id=?1 AND workspace_id=?2 AND accepted=0",
+        params![envelope_id, workspace_id],
+    )?;
+    send_to_contact(
+        conn,
+        workspace_id,
+        &contact_guid,
+        "receipt.accepted",
+        &uuid::Uuid::new_v4().to_string(),
+        serde_json::json!({
+            "originalTransactionId": original_transaction,
+            "acceptedAt": accepted_at,
+            "acceptanceLedgerHash": acceptance_ledger_hash,
+        }),
+        work_bits,
+    )
 }
 
 /// Attempts local delivery for all gateway identities. Unknown senders remain
@@ -364,6 +433,51 @@ pub fn receive_local(conn: &Connection, work_bits: u8) -> Result<usize> {
                     "UPDATE interorg_envelopes SET delivered=2 WHERE id=?1",
                     [&envelope.id],
                 )?;
+                continue;
+            }
+            if payload.kind == "receipt.accepted" {
+                let original = payload
+                    .body
+                    .get("originalTransactionId")
+                    .and_then(serde_json::Value::as_str);
+                let accepted_at = payload
+                    .body
+                    .get("acceptedAt")
+                    .and_then(serde_json::Value::as_str);
+                let ledger_hash = payload
+                    .body
+                    .get("acceptanceLedgerHash")
+                    .and_then(serde_json::Value::as_str);
+                let valid = original.is_some_and(|value| uuid::Uuid::parse_str(value).is_ok())
+                    && accepted_at.is_some_and(|value| DateTime::parse_from_rfc3339(value).is_ok())
+                    && ledger_hash.is_some_and(|value| {
+                        value.len() == 64 && hex::decode(value).is_ok_and(|bytes| bytes.len() == 32)
+                    });
+                let changed = if valid {
+                    conn.execute(
+                        "UPDATE interorg_outbox SET status='accepted',accepted_at=?1,
+                           acceptance_ledger_hash=?2,receipt_envelope_id=?3
+                         WHERE workspace_id=?4 AND contact_guid=?5 AND transaction_id=?6
+                           AND status='queued'",
+                        params![
+                            accepted_at,
+                            ledger_hash,
+                            envelope.id,
+                            workspace_id,
+                            contact_guid,
+                            original
+                        ],
+                    )?
+                } else {
+                    0
+                };
+                conn.execute(
+                    "UPDATE interorg_envelopes SET delivered=?1 WHERE id=?2",
+                    params![if changed == 1 { 1 } else { 2 }, envelope.id],
+                )?;
+                if changed == 1 {
+                    imported += 1;
+                }
                 continue;
             }
             let changed = conn.execute(
@@ -911,7 +1025,7 @@ mod tests {
             identity_b["signingKey"].as_str().unwrap(),
         )
         .unwrap();
-        trust_contact(
+        let contact_a = trust_contact(
             &b,
             1,
             "А",
@@ -988,5 +1102,46 @@ mod tests {
             )
             .unwrap();
         assert_eq!(replay_state, 2);
+
+        // Acceptance creates an opaque return receipt. Until that independent
+        // envelope crosses the partition, A only knows the operation is queued.
+        let acceptance_hash = "ab".repeat(32);
+        let receipt =
+            accept_with_receipt(&b, 1, envelope.id.as_str(), &acceptance_hash, 8).unwrap();
+        assert_eq!(outbox(&a, 1).unwrap()[0]["status"], "queued");
+        assert!(relay_store(&a, &receipt, 8).unwrap());
+        assert_eq!(receive_local(&a, 8).unwrap(), 1);
+        let sent = outbox(&a, 1).unwrap();
+        assert_eq!(sent[0]["status"], "accepted");
+        assert_eq!(sent[0]["acceptanceLedgerHash"], acceptance_hash);
+        assert_eq!(sent[0]["receiptEnvelopeId"], receipt.id);
+        assert_eq!(receive_local(&a, 8).unwrap(), 0);
+
+        // Even a cryptographically valid receipt from the trusted organization
+        // cannot acknowledge a transaction that A never sent to that contact.
+        let forged_receipt = send_to_contact(
+            &b,
+            1,
+            contact_a["guid"].as_str().unwrap(),
+            "receipt.accepted",
+            &uuid::Uuid::new_v4().to_string(),
+            serde_json::json!({
+                "originalTransactionId": uuid::Uuid::new_v4().to_string(),
+                "acceptedAt": Utc::now().to_rfc3339(),
+                "acceptanceLedgerHash": "cd".repeat(32),
+            }),
+            8,
+        )
+        .unwrap();
+        assert!(relay_store(&a, &forged_receipt, 8).unwrap());
+        assert_eq!(receive_local(&a, 8).unwrap(), 0);
+        let rejected_state: i64 = a
+            .query_row(
+                "SELECT delivered FROM interorg_envelopes WHERE id=?1",
+                [&forged_receipt.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rejected_state, 2);
     }
 }

@@ -3,6 +3,12 @@ import { createRouter, publicQuery } from './middleware'
 
 type Identity = { workspaceId: number; publicKey: string; signingKey: string; destination: string; createdAt?: string }
 type Contact = { guid: string; name: string; remoteWorkspaceGuid: string; destination: string; encryptionKey: string; signingKey: string; active: boolean; createdAt?: string }
+type OutboxEntry = {
+  transactionId: string; envelopeId: string; kind: string; createdAt: string
+  status: 'queued' | 'accepted'; acceptedAt: string | null
+  acceptanceLedgerHash: string | null; receiptEnvelopeId: string | null
+  contact: { guid: string; name: string; remoteWorkspaceGuid: string }
+}
 
 export const interorgRouter = createRouter({
   identity: publicQuery.input(z.object({ workspaceId: z.number().int().positive() })).query(async () => null as Identity | null),
@@ -25,6 +31,7 @@ export const interorgRouter = createRouter({
     accepted: boolean
     contact: { guid: string; name: string; remoteWorkspaceGuid: string }
   }>),
+  outbox: publicQuery.input(z.object({ workspaceId: z.number().int().positive() })).query(async () => [] as OutboxEntry[]),
   send: publicQuery.input(z.object({
     workspaceId: z.number().int().positive(),
     contactGuid: z.string().uuid(),
@@ -32,5 +39,5 @@ export const interorgRouter = createRouter({
     kind: z.string().min(1).max(80),
     body: z.unknown(),
   })).mutation(async ({ input }) => ({ ok: true, queued: true, envelopeId: '', destination: '', ledgerHash: '', transactionId: input.transactionId })),
-  accept: publicQuery.input(z.object({ workspaceId: z.number().int().positive(), envelopeId: z.string().uuid() })).mutation(async ({ input }) => ({ ok: true, envelopeId: input.envelopeId, transactionId: '', ledgerHash: '' })),
+  accept: publicQuery.input(z.object({ workspaceId: z.number().int().positive(), envelopeId: z.string().uuid() })).mutation(async ({ input }) => ({ ok: true, envelopeId: input.envelopeId, transactionId: '', ledgerHash: '', receiptEnvelopeId: '', receiptQueued: true })),
 })

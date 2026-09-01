@@ -108,6 +108,7 @@ pub fn is_mutation(procedure: &str) -> bool {
             | "interorg.identity"
             | "interorg.contacts"
             | "interorg.inbox"
+            | "interorg.outbox"
             | "transfers.outgoing"
             | "transfers.incoming"
             | "transfers.byId"
@@ -1025,6 +1026,7 @@ fn dispatch_inner(
         "interorg.trustContact" => interorg_trust_contact(conn, input, user_id),
         "interorg.revokeContact" => interorg_revoke_contact(conn, input, user_id),
         "interorg.inbox" => interorg_inbox(conn, input),
+        "interorg.outbox" => interorg_outbox(conn, input),
         "interorg.send" => interorg_send(conn, input, user_id),
         "interorg.accept" => interorg_accept(conn, input, user_id),
         "sync.addPeer" => {
@@ -7118,6 +7120,11 @@ fn interorg_inbox(conn: &Connection, input: &Value) -> ApiResult {
     crate::interorg::inbox(conn, ws).map_err(|error| ApiError::internal(error.to_string()))
 }
 
+fn interorg_outbox(conn: &Connection, input: &Value) -> ApiResult {
+    let ws = i64v(input, "workspaceId").unwrap_or_else(|| ws_fallback(conn));
+    crate::interorg::outbox(conn, ws).map_err(|error| ApiError::internal(error.to_string()))
+}
+
 fn interorg_send(conn: &mut Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
     let uid = require_user(conn, user_id)?;
     let ws = i64v(input, "workspaceId").unwrap_or_else(|| ws_fallback(conn));
@@ -7195,12 +7202,20 @@ fn interorg_accept(conn: &mut Connection, input: &Value, user_id: Option<i64>) -
             Some(&kind),
         )
         .map_err(|error| ApiError::internal(error.to_string()))?;
-        tx.execute(
-            "UPDATE interorg_inbox SET accepted=1 WHERE envelope_id=?1 AND workspace_id=?2",
-            params![envelope_id, ws],
-        )?;
+        let ledger_hash = event["opId"]
+            .as_str()
+            .ok_or_else(|| ApiError::internal("Летопись не вернула hash"))?;
+        let receipt = crate::interorg::accept_with_receipt(
+            tx,
+            ws,
+            &envelope_id,
+            ledger_hash,
+            crate::interorg_work_bits(),
+        )
+        .map_err(|error| ApiError::internal(error.to_string()))?;
         Ok(
-            json!({"ok":true,"envelopeId":envelope_id,"transactionId":transaction_id,"ledgerHash":event["opId"]}),
+            json!({"ok":true,"envelopeId":envelope_id,"transactionId":transaction_id,
+                "ledgerHash":event["opId"],"receiptEnvelopeId":receipt.id,"receiptQueued":true}),
         )
     })
 }
@@ -9994,6 +10009,19 @@ mod tests {
         )
         .unwrap();
         assert!(accepted["ledgerHash"].as_str().is_some());
+        assert_eq!(accepted["receiptQueued"], true);
+        assert!(accepted["receiptEnvelopeId"]
+            .as_str()
+            .is_some_and(|value| Uuid::parse_str(value).is_ok()));
+        let outbox = dispatch(
+            &mut conn,
+            "interorg.outbox",
+            &json!({"workspaceId":ws}),
+            Some(users[0]),
+        )
+        .unwrap();
+        assert_eq!(outbox[0]["transactionId"], transaction_id);
+        assert_eq!(outbox[0]["status"], "queued");
         let duplicate = dispatch(
             &mut conn,
             "interorg.accept",

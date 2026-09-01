@@ -16,6 +16,10 @@ export default function InterorgSection() {
     { workspaceId },
     { enabled: workspaceId > 0, refetchInterval: 5000 },
   )
+  const outboxQ = trpc.interorg.outbox.useQuery(
+    { workspaceId },
+    { enabled: workspaceId > 0, refetchInterval: 5000 },
+  )
   const [cardText, setCardText] = useState('')
   const [contactName, setContactName] = useState('')
   const [selected, setSelected] = useState('')
@@ -45,7 +49,7 @@ export default function InterorgSection() {
     onError: (error) => toast(error.message, 'error'),
   })
   const send = trpc.interorg.send.useMutation({
-    onSuccess: () => { setMessage(''); toast('Транзакция подписана и поставлена в mesh-очередь') },
+    onSuccess: () => { setMessage(''); void outboxQ.refetch(); toast('Транзакция подписана и поставлена в mesh-очередь') },
     onError: (error) => toast(error.message, 'error'),
   })
   const accept = trpc.interorg.accept.useMutation({
@@ -114,6 +118,25 @@ export default function InterorgSection() {
             </div>
           </div>
         )}
+      </section>
+
+      <section className={`${cardCls} overflow-hidden`}>
+        <div className="border-b border-brand-100 px-5 py-4"><h3 className="font-semibold text-ink-900">Исходящие и квитанции</h3></div>
+        <div className="divide-y divide-brand-100">
+          {(outboxQ.data ?? []).map((item) => (
+            <article key={item.transactionId} className="flex flex-col gap-2 p-5 sm:flex-row sm:items-center sm:justify-between" data-testid="interorg-outbox-item">
+              <div className="min-w-0">
+                <div className="flex items-center gap-2"><span className="font-semibold text-ink-900">{item.contact.name}</span><span className="rounded-full bg-brand-50 px-2 py-0.5 text-xs text-brand-700">{item.kind}</span></div>
+                <p className="mt-1 truncate font-mono text-xs text-ink-500">{item.transactionId}</p>
+                {item.acceptanceLedgerHash && <p className="mt-1 truncate font-mono text-[11px] text-ink-500" title={item.acceptanceLedgerHash}>Летопись получателя: {item.acceptanceLedgerHash}</p>}
+              </div>
+              {item.status === 'accepted'
+                ? <span className="inline-flex items-center gap-1 text-sm font-semibold text-teal"><Check size={16} /> Принято контрагентом</span>
+                : <span className="text-sm font-medium text-ink-500">Ожидает квитанцию</span>}
+            </article>
+          ))}
+          {!outboxQ.isLoading && !(outboxQ.data ?? []).length && <p className="p-6 text-center text-sm text-ink-500">Исходящих транзакций пока нет</p>}
+        </div>
       </section>
 
       <section className={`${cardCls} overflow-hidden`}>

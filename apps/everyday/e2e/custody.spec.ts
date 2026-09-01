@@ -574,7 +574,7 @@ test('browser signs a real custody transaction and ledger retains its proof', as
       signingKey: encode(new Uint8Array(await crypto.subtle.exportKey('raw', signing.publicKey))),
     };
   });
-  await trpc(page, 'interorg.trustContact', {
+  const e2eContact = await trpc<{ guid: string }>(page, 'interorg.trustContact', {
     workspaceId: workspaces[0].id,
     name: 'E2E Контрагент',
     remoteWorkspaceGuid: crypto.randomUUID(),
@@ -583,6 +583,18 @@ test('browser signs a real custody transaction and ledger retains its proof', as
   await page.reload();
   await page.getByRole('button', { name: 'Сеть организаций' }).first().click();
   await expect(page.getByTestId('interorg-contact')).toContainText('E2E Контрагент');
+  const interorgTransactionId = crypto.randomUUID();
+  await trpc(page, 'interorg.send', {
+    workspaceId: workspaces[0].id,
+    contactGuid: e2eContact.guid,
+    transactionId: interorgTransactionId,
+    kind: 'invoice.offer',
+    body: { text: 'Проверка автономной очереди' },
+  });
+  await page.reload();
+  await page.getByRole('button', { name: 'Сеть организаций' }).first().click();
+  const outgoingInterorg = page.getByTestId('interorg-outbox-item').filter({ hasText: interorgTransactionId });
+  await expect(outgoingInterorg).toContainText('Ожидает квитанцию');
   await page.getByRole('button', { name: 'Отозвать ключи' }).click();
   await expect(page.getByTestId('interorg-contact')).toContainText('отозван');
   await page.getByRole('button', { name: 'Пространства', exact: true }).click();
