@@ -1,5 +1,8 @@
 use crate::{db, json as jsn, ledger};
-use base64::{engine::general_purpose::STANDARD_NO_PAD, Engine};
+use base64::{
+    engine::general_purpose::{STANDARD_NO_PAD, URL_SAFE_NO_PAD},
+    Engine,
+};
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use hmac::{Hmac, Mac};
@@ -377,6 +380,21 @@ pub fn export_journal_since(conn: &Connection, recipient_frontier: Option<&Value
             users.push(row);
         }
     }
+    let mut devices = Vec::new();
+    if let Ok(mut stmt) = conn.prepare(
+        "SELECT d.device_id,u.guid,d.name,d.public_key,d.created_at,d.revoked_at
+         FROM user_devices d JOIN users u ON u.id=d.user_id ORDER BY d.device_id",
+    ) {
+        if let Ok(rows) = stmt.query_map([], |row| {
+            Ok(json!({
+                "deviceId":row.get::<_,String>(0)?,"userGuid":row.get::<_,String>(1)?,
+                "name":row.get::<_,String>(2)?,"publicKey":row.get::<_,String>(3)?,
+                "createdAt":row.get::<_,String>(4)?,"revokedAt":row.get::<_,Option<String>>(5)?,
+            }))
+        }) {
+            devices.extend(rows.flatten());
+        }
+    }
     let mut items = Vec::new();
     if let Ok(mut stmt) = conn.prepare(
         "SELECT id, internal_id, title, category_id, status_id, responsible_user_id, workspace_id, serial_number, qr_code, due_at, guid, calibrated_until, min_quantity, quantitative, quantity, unit, cost, comment, source_system, external_id, metadata_json, organization_node_id FROM items",
@@ -644,6 +662,7 @@ pub fn export_journal_since(conn: &Connection, recipient_frontier: Option<&Value
         "frontier": frontier(conn),
         "workspaces": workspaces,
         "users": users,
+        "devices": devices,
         "organizationNodes": organization_nodes,
         "items": items,
         "history": history,
@@ -843,6 +862,13 @@ fn filter_journal_scope(journal: &mut Value, allowed: &HashSet<String>) {
     if let Some(users) = object.get_mut("users").and_then(Value::as_array_mut) {
         users.retain(|row| {
             row.get("guid")
+                .and_then(Value::as_str)
+                .is_some_and(|guid| user_guids.contains(guid))
+        });
+    }
+    if let Some(devices) = object.get_mut("devices").and_then(Value::as_array_mut) {
+        devices.retain(|row| {
+            row.get("userGuid")
                 .and_then(Value::as_str)
                 .is_some_and(|guid| user_guids.contains(guid))
         });
@@ -1243,6 +1269,54 @@ pub fn import_journal(conn: &Connection, journal: &Value) -> Value {
         for u in arr {
             upsert_user(conn, u);
             users += 1;
+        }
+    }
+    if let Ok(devices) = incoming_devices(journal) {
+        for (device_id, device) in devices {
+            let Some(user_id) = id_by_guid(conn, "users", &device.user_guid) else {
+                skipped += 1;
+                continue;
+            };
+            let existing: Option<(i64, String, Option<String>)> = conn
+                .query_row(
+                    "SELECT user_id,public_key,revoked_at FROM user_devices WHERE device_id=?1",
+                    [&device_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()
+                .ok()
+                .flatten();
+            match existing {
+                Some((owner, key, local_revoked))
+                    if owner == user_id && key == device.public_key =>
+                {
+                    let merged_revoked =
+                        match (local_revoked.as_deref(), device.revoked_at.as_deref()) {
+                            (Some(local), Some(remote)) => Some(local.min(remote)),
+                            (Some(local), None) => Some(local),
+                            (None, Some(remote)) => Some(remote),
+                            (None, None) => None,
+                        };
+                    let _ = conn.execute(
+                        "UPDATE user_devices SET revoked_at=?1 WHERE device_id=?2",
+                        params![merged_revoked, device_id],
+                    );
+                }
+                None => {
+                    let _ = conn.execute(
+                        "INSERT INTO user_devices(device_id,user_id,name,public_key,created_at,revoked_at)
+                         VALUES(?1,?2,'Синхронизированное устройство',?3,?4,?5)",
+                        params![
+                            device_id,
+                            user_id,
+                            device.public_key,
+                            device.created_at,
+                            device.revoked_at
+                        ],
+                    );
+                }
+                _ => skipped += 1,
+            }
         }
     }
     if let Some(arr) = journal.get("organizationNodes").and_then(|v| v.as_array()) {
@@ -1994,6 +2068,9 @@ pub fn apply_remote_journal(conn: &Connection, journal: &Value, peer_url: &str) 
     if let Err(error) = ledger::verify_journal(journal) {
         return json!({"ok":false,"error":format!("Криптографическая проверка снимка: {error}")});
     }
+    if let Err(error) = verify_device_registry(conn, journal) {
+        return json!({"ok":false,"error":format!("Проверка устройств: {error}")});
+    }
     if let Err(error) = verify_membership_records(conn, journal) {
         return json!({"ok":false,"error":format!("Проверка членства: {error}")});
     }
@@ -2033,6 +2110,10 @@ pub fn apply_remote_journal(conn: &Connection, journal: &Value, peer_url: &str) 
         let _ = conn.execute_batch("ROLLBACK TO verified_sync; RELEASE verified_sync");
         return json!({"ok":false,"error":format!("Криптографическая проверка входящего журнала: {error}")});
     }
+    if let Err(error) = verify_stored_device_bindings(conn) {
+        let _ = conn.execute_batch("ROLLBACK TO verified_sync; RELEASE verified_sync");
+        return json!({"ok":false,"error":format!("Проверка привязки устройств: {error}")});
+    }
     if let Err(error) = ledger::verify_chat_links(conn) {
         let _ = conn.execute_batch("ROLLBACK TO verified_sync; RELEASE verified_sync");
         return json!({"ok":false,"error":format!("Криптографическая проверка сообщений: {error}")});
@@ -2066,6 +2147,212 @@ pub fn apply_remote_journal(conn: &Connection, journal: &Value, peer_url: &str) 
         resolve_peer_error(conn, peer_url);
     }
     result
+}
+
+#[derive(Clone)]
+struct PortableDevice {
+    user_guid: String,
+    public_key: String,
+    created_at: String,
+    revoked_at: Option<String>,
+}
+
+fn incoming_devices(journal: &Value) -> anyhow::Result<HashMap<String, PortableDevice>> {
+    let users: HashSet<&str> = journal
+        .get("users")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|row| row.get("guid").and_then(Value::as_str))
+        .collect();
+    let mut devices = HashMap::new();
+    for row in journal
+        .get("devices")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("journal does not provide portable device registry"))?
+    {
+        let required = |field: &str| {
+            row.get(field)
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| anyhow::anyhow!("device has no {field}"))
+        };
+        let device_id = required("deviceId")?;
+        let user_guid = required("userGuid")?;
+        let public_key = required("publicKey")?;
+        let created_at = required("createdAt")?;
+        if device_id.len() < 16 || device_id.len() > 100 || !users.contains(user_guid) {
+            anyhow::bail!("device identity is outside signed user set");
+        }
+        let raw = URL_SAFE_NO_PAD
+            .decode(public_key)
+            .map_err(|_| anyhow::anyhow!("invalid device public key encoding"))?;
+        if raw.len() != 32 {
+            anyhow::bail!("invalid device public key length");
+        }
+        chrono::DateTime::parse_from_rfc3339(created_at)
+            .map_err(|_| anyhow::anyhow!("invalid device creation timestamp"))?;
+        let revoked_at = row
+            .get("revokedAt")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned);
+        if let Some(value) = revoked_at.as_deref() {
+            chrono::DateTime::parse_from_rfc3339(value)
+                .map_err(|_| anyhow::anyhow!("invalid device revocation timestamp"))?;
+            if value < created_at {
+                anyhow::bail!("device was revoked before it was created");
+            }
+        }
+        let record = PortableDevice {
+            user_guid: user_guid.to_owned(),
+            public_key: public_key.to_owned(),
+            created_at: created_at.to_owned(),
+            revoked_at,
+        };
+        if let Some(previous) = devices.insert(device_id.to_owned(), record.clone()) {
+            if previous.user_guid != record.user_guid
+                || previous.public_key != record.public_key
+                || previous.created_at != record.created_at
+                || previous.revoked_at != record.revoked_at
+            {
+                anyhow::bail!("conflicting duplicate device identity");
+            }
+            anyhow::bail!("duplicate device identity");
+        }
+    }
+    Ok(devices)
+}
+
+fn local_device(conn: &Connection, device_id: &str) -> anyhow::Result<Option<PortableDevice>> {
+    conn.query_row(
+        "SELECT u.guid,d.public_key,d.created_at,d.revoked_at
+         FROM user_devices d JOIN users u ON u.id=d.user_id WHERE d.device_id=?1",
+        [device_id],
+        |row| {
+            Ok(PortableDevice {
+                user_guid: row.get(0)?,
+                public_key: row.get(1)?,
+                created_at: row.get(2)?,
+                revoked_at: row.get(3)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+fn verify_device_registry(conn: &Connection, journal: &Value) -> anyhow::Result<()> {
+    let devices = incoming_devices(journal)?;
+    for (device_id, incoming) in &devices {
+        if let Some(local) = local_device(conn, device_id)? {
+            if local.user_guid != incoming.user_guid || local.public_key != incoming.public_key {
+                anyhow::bail!("device identity conflicts with local registry");
+            }
+            // Отзыв является monotonic tombstone: старый offline snapshot с
+            // active-записью допустим, но importer не имеет права воскресить ключ.
+        }
+    }
+    for event in journal
+        .get("history")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let proof_fields = [
+            "requestDeviceId",
+            "requestPublicKey",
+            "requestNonce",
+            "requestSignature",
+            "requestHash",
+            "requestTimestamp",
+            "requestPath",
+        ];
+        let present = proof_fields
+            .iter()
+            .filter(|field| event.get(**field).and_then(Value::as_str).is_some())
+            .count();
+        if present == 0 {
+            continue;
+        }
+        if present != proof_fields.len() {
+            anyhow::bail!("incomplete device proof in journal event");
+        }
+        let device_id = event["requestDeviceId"].as_str().unwrap_or_default();
+        let proof_key = event["requestPublicKey"].as_str().unwrap_or_default();
+        let actor = event["actorGuid"].as_str().unwrap_or_default();
+        let created_at = event["createdAt"].as_str().unwrap_or_default();
+        let device = devices
+            .get(device_id)
+            .cloned()
+            .or(local_device(conn, device_id)?)
+            .ok_or_else(|| anyhow::anyhow!("device proof has no registered identity"))?;
+        if device.user_guid != actor || device.public_key != proof_key {
+            anyhow::bail!("device proof is not bound to event actor");
+        }
+        let event_time = chrono::DateTime::parse_from_rfc3339(created_at)
+            .map_err(|_| anyhow::anyhow!("invalid device-proof event timestamp"))?;
+        let registered_time = chrono::DateTime::parse_from_rfc3339(&device.created_at)
+            .map_err(|_| anyhow::anyhow!("invalid registered device timestamp"))?;
+        let revoked_before_event = device
+            .revoked_at
+            .as_deref()
+            .map(chrono::DateTime::parse_from_rfc3339)
+            .transpose()
+            .map_err(|_| anyhow::anyhow!("invalid registered revocation timestamp"))?
+            .is_some_and(|revoked| event_time >= revoked);
+        if event_time < registered_time || revoked_before_event {
+            anyhow::bail!("device proof was produced outside device validity interval");
+        }
+    }
+    Ok(())
+}
+
+fn verify_stored_device_bindings(conn: &Connection) -> anyhow::Result<usize> {
+    let mut statement = conn.prepare(
+        "SELECT h.request_device_id,h.request_public_key,h.created_at,
+                u.guid,du.public_key,du.created_at,du.revoked_at,du.user_id,h.actor_user_id
+         FROM history_entries h
+         JOIN users u ON u.id=h.actor_user_id
+         LEFT JOIN user_devices du ON du.device_id=h.request_device_id
+         WHERE h.request_device_id IS NOT NULL",
+    )?;
+    let mut rows = statement.query([])?;
+    let mut verified = 0;
+    while let Some(row) = rows.next()? {
+        let device_id: String = row.get(0)?;
+        let proof_key: Option<String> = row.get(1)?;
+        let event_created: String = row.get(2)?;
+        let actor_guid: String = row.get(3)?;
+        let registered_key: Option<String> = row.get(4)?;
+        let registered_at: Option<String> = row.get(5)?;
+        let revoked_at: Option<String> = row.get(6)?;
+        let device_user: Option<i64> = row.get(7)?;
+        let actor_user: i64 = row.get(8)?;
+        let (Some(proof_key), Some(registered_key), Some(registered_at), Some(device_user)) =
+            (proof_key, registered_key, registered_at, device_user)
+        else {
+            anyhow::bail!("device proof {device_id} has no stored identity");
+        };
+        if proof_key != registered_key || device_user != actor_user {
+            anyhow::bail!("stored device proof {device_id} is not bound to actor {actor_guid}");
+        }
+        let event_time = chrono::DateTime::parse_from_rfc3339(&event_created)
+            .map_err(|_| anyhow::anyhow!("invalid stored event timestamp"))?;
+        let registered_time = chrono::DateTime::parse_from_rfc3339(&registered_at)
+            .map_err(|_| anyhow::anyhow!("invalid stored device timestamp"))?;
+        let revoked_before_event = revoked_at
+            .as_deref()
+            .map(chrono::DateTime::parse_from_rfc3339)
+            .transpose()
+            .map_err(|_| anyhow::anyhow!("invalid stored revocation timestamp"))?
+            .is_some_and(|revoked| event_time >= revoked);
+        if event_time < registered_time || revoked_before_event {
+            anyhow::bail!("stored device proof {device_id} is outside validity interval");
+        }
+        verified += 1;
+    }
+    Ok(verified)
 }
 
 struct MembershipLedgerEvidence {
@@ -2525,6 +2812,7 @@ pub fn integrity_audit(conn: &Connection) -> Value {
     let knowledge_result = crate::knowledge::verify(conn);
     let snapshot = export_journal(conn);
     let snapshot_result = ledger::verify_journal(&snapshot);
+    let device_result = verify_stored_device_bindings(conn);
     let membership_result = verify_membership_records(conn, &snapshot);
 
     let count = |table: &str| -> i64 {
@@ -2598,6 +2886,7 @@ pub fn integrity_audit(conn: &Connection) -> Value {
     let accounting_error = accounting_result.as_ref().err().map(ToString::to_string);
     let knowledge_error = knowledge_result.as_ref().err().map(ToString::to_string);
     let snapshot_error = snapshot_result.as_ref().err().map(ToString::to_string);
+    let device_error = device_result.as_ref().err().map(ToString::to_string);
     let membership_error = membership_result.as_ref().err().map(ToString::to_string);
     let healthy = database_check == "ok"
         && ledger_result.is_ok()
@@ -2605,6 +2894,7 @@ pub fn integrity_audit(conn: &Connection) -> Value {
         && accounting_result.is_ok()
         && knowledge_result.is_ok()
         && snapshot_result.is_ok()
+        && device_result.is_ok()
         && membership_result.is_ok()
         && orphan_history == 0
         && missing_guids == 0
@@ -2623,6 +2913,9 @@ pub fn integrity_audit(conn: &Connection) -> Value {
         "knowledgeError": knowledge_error,
         "knowledgeVerified": knowledge_result.is_ok(),
         "snapshotError": snapshot_error,
+        "deviceError": device_error,
+        "deviceRegistryVerified": device_result.is_ok(),
+        "deviceProofsVerified": device_result.unwrap_or(0),
         "membershipError": membership_error,
         "membershipVerified": membership_result.is_ok(),
         "snapshotHash": snapshot.get("journalHash"),
@@ -2635,6 +2928,7 @@ pub fn integrity_audit(conn: &Connection) -> Value {
         "counts": {
             "workspaces": count("workspaces"),
             "users": count("users"),
+            "devices": count("user_devices"),
             "items": count("items"),
             "history": count("history_entries"),
             "messages": count("chat_messages"),
@@ -2678,7 +2972,163 @@ pub fn resolve_peer_error(conn: &Connection, url: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ed25519_dalek::{Signer, SigningKey};
+    use rand::rngs::OsRng;
     const BUNDLE_SECRET: &str = "offline-bundle-test-secret-at-least-32-chars";
+
+    fn signed_device_proof(key: &SigningKey, device_id: &str, path: &str) -> crate::device::Proof {
+        let timestamp = chrono::Utc::now().timestamp().to_string();
+        let nonce = uuid::Uuid::new_v4().to_string();
+        let request_hash = hex::encode(Sha256::digest(b"portable-device-test"));
+        let message = format!(
+            "everyday/device-request/v1\nPOST\n{path}\n{timestamp}\n{nonce}\n{request_hash}"
+        );
+        crate::device::Proof {
+            device_id: device_id.to_owned(),
+            public_key: URL_SAFE_NO_PAD.encode(key.verifying_key().to_bytes()),
+            nonce,
+            signature: URL_SAFE_NO_PAD.encode(key.sign(message.as_bytes()).to_bytes()),
+            request_hash,
+            timestamp,
+            path: path.to_owned(),
+        }
+    }
+
+    #[test]
+    fn portable_device_registry_binds_remote_proof_and_keeps_revocation_tombstone() {
+        let source_path = std::env::temp_dir().join(format!(
+            "portable-device-source-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let target_path = std::env::temp_dir().join(format!(
+            "portable-device-target-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let rejected_path = std::env::temp_dir().join(format!(
+            "portable-device-rejected-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let source = crate::db::open(&source_path).unwrap();
+        let target = crate::db::open(&target_path).unwrap();
+        let rejected = crate::db::open(&rejected_path).unwrap();
+        let created = "2026-01-01T00:00:00Z";
+        source.execute("INSERT INTO workspaces(name,internal_id_prefix,created_at,guid) VALUES('Org','O-',?1,'device-workspace')",[created]).unwrap();
+        let workspace = source.last_insert_rowid();
+        source.execute("INSERT INTO users(full_name,phone,status,created_at,guid) VALUES('Owner','+70000000666','active',?1,'device-owner')",[created]).unwrap();
+        let owner = source.last_insert_rowid();
+        source
+            .execute(
+                "INSERT INTO user_workspaces(user_id,workspace_id,rights_json) VALUES(?1,?2,?3)",
+                params![owner, workspace, crate::db::owner_rights().to_string()],
+            )
+            .unwrap();
+        record_membership_version(&source, workspace, owner, true, None, true).unwrap();
+
+        let key = SigningKey::generate(&mut OsRng);
+        let device_id = "portable-device-0001";
+        crate::device::register(
+            &source,
+            owner,
+            &json!({
+                "deviceId":device_id,"name":"Телефон владельца",
+                "publicKey":URL_SAFE_NO_PAD.encode(key.verifying_key().to_bytes())
+            }),
+        )
+        .unwrap();
+        let proof = signed_device_proof(&key, device_id, "/api/trpc/admin.users.update");
+        crate::device::set_pending(&source, owner, &proof).unwrap();
+        ledger::append(
+            &source,
+            workspace,
+            owner,
+            None,
+            "update",
+            None,
+            None,
+            None,
+            Some("valid portable device proof"),
+        )
+        .unwrap();
+        let active_journal = export_journal(&source);
+        let accepted = apply_remote_journal(&target, &active_journal, "");
+        assert_eq!(accepted["ok"], true, "{accepted}");
+        assert_eq!(
+            target.query_row(
+                "SELECT u.guid FROM user_devices d JOIN users u ON u.id=d.user_id WHERE d.device_id=?1 AND d.revoked_at IS NULL",
+                [device_id],
+                |row| row.get::<_,String>(0),
+            ).unwrap(),
+            "device-owner"
+        );
+
+        let forged_key = SigningKey::generate(&mut OsRng);
+        let forged = signed_device_proof(
+            &forged_key,
+            "unregistered-device-0002",
+            "/api/trpc/admin.users.update",
+        );
+        crate::device::set_pending(&source, owner, &forged).unwrap();
+        ledger::append(
+            &source,
+            workspace,
+            owner,
+            None,
+            "update",
+            None,
+            None,
+            None,
+            Some("forged unregistered proof"),
+        )
+        .unwrap();
+        let forged_journal = export_journal(&source);
+        let result = apply_remote_journal(&rejected, &forged_journal, "");
+        assert_eq!(result["ok"], false);
+        assert!(result["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("no registered identity"));
+
+        source
+            .execute(
+                "DELETE FROM history_entries WHERE comment='forged unregistered proof'",
+                [],
+            )
+            .unwrap();
+        source
+            .execute(
+                "UPDATE user_devices SET revoked_at=?1 WHERE device_id=?2",
+                params![chrono::Utc::now().to_rfc3339(), device_id],
+            )
+            .unwrap();
+        let revoked_journal = export_journal(&source);
+        let result = apply_remote_journal(&target, &revoked_journal, "");
+        assert_eq!(result["ok"], true, "{result}");
+        assert!(target
+            .query_row(
+                "SELECT revoked_at FROM user_devices WHERE device_id=?1",
+                [device_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .unwrap()
+            .is_some());
+        import_journal(&target, &active_journal);
+        assert!(
+            target
+                .query_row(
+                    "SELECT revoked_at FROM user_devices WHERE device_id=?1",
+                    [device_id],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .unwrap()
+                .is_some(),
+            "old offline snapshot must not resurrect a revoked device"
+        );
+
+        drop((source, target, rejected));
+        for path in [source_path, target_path, rejected_path] {
+            let _ = std::fs::remove_file(path);
+        }
+    }
 
     #[test]
     fn organization_scope_redacts_state_users_and_cas_and_rejects_foreign_journal() {

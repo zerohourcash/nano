@@ -96,13 +96,42 @@ pub fn register(conn: &Connection, user_id: i64, input: &Value) -> anyhow::Resul
     if existing.is_some_and(|owner| owner != user_id) {
         anyhow::bail!("идентификатор устройства уже занят");
     }
-    conn.execute(
-        "INSERT INTO user_devices(device_id,user_id,name,public_key,created_at)
-         VALUES(?1,?2,?3,?4,?5)
-         ON CONFLICT(device_id) DO UPDATE SET name=excluded.name,public_key=excluded.public_key,revoked_at=NULL",
-        params![device_id,user_id,name,public_key,Utc::now().to_rfc3339()],
-    )?;
-    Ok(json!({"deviceId":device_id,"name":name,"publicKey":public_key,"revoked":false}))
+    if let Some(existing_key) = conn
+        .query_row(
+            "SELECT public_key FROM user_devices WHERE device_id=?1 AND user_id=?2",
+            params![device_id, user_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+    {
+        if existing_key != public_key {
+            anyhow::bail!("идентификатор устройства уже связан с другим ключом");
+        }
+        conn.execute(
+            "UPDATE user_devices SET name=?1 WHERE device_id=?2 AND user_id=?3",
+            params![name, device_id, user_id],
+        )?;
+    } else {
+        conn.execute(
+            "INSERT INTO user_devices(device_id,user_id,name,public_key,created_at)
+             VALUES(?1,?2,?3,?4,?5)",
+            params![
+                device_id,
+                user_id,
+                name,
+                public_key,
+                Utc::now().to_rfc3339()
+            ],
+        )?;
+    }
+    let revoked = conn
+        .query_row(
+            "SELECT revoked_at IS NOT NULL FROM user_devices WHERE device_id=?1",
+            [device_id],
+            |row| row.get::<_, bool>(0),
+        )
+        .unwrap_or(true);
+    Ok(json!({"deviceId":device_id,"name":name,"publicKey":public_key,"revoked":revoked}))
 }
 
 pub fn list(conn: &Connection, user_id: i64) -> anyhow::Result<Value> {
@@ -306,5 +335,50 @@ mod tests {
             "unique-nonce-0003",
         );
         assert!(verify_request(&db, 7, "/api/trpc/transfers.returnItem", body, &headers).is_err());
+    }
+
+    #[test]
+    fn device_identity_cannot_rotate_key_or_clear_revocation() {
+        let db = database();
+        let original = SigningKey::generate(&mut OsRng);
+        let replacement = SigningKey::generate(&mut OsRng);
+        let device_id = "phone-device-immutable-0003";
+        register(
+            &db,
+            7,
+            &json!({
+                "deviceId":device_id,"name":"Телефон",
+                "publicKey":URL_SAFE_NO_PAD.encode(original.verifying_key().to_bytes())
+            }),
+        )
+        .unwrap();
+        assert!(register(
+            &db,
+            7,
+            &json!({
+                "deviceId":device_id,"name":"Подмена",
+                "publicKey":URL_SAFE_NO_PAD.encode(replacement.verifying_key().to_bytes())
+            }),
+        )
+        .is_err());
+        assert!(revoke(&db, 7, device_id).unwrap());
+        let repeated = register(
+            &db,
+            7,
+            &json!({
+                "deviceId":device_id,"name":"Переименован",
+                "publicKey":URL_SAFE_NO_PAD.encode(original.verifying_key().to_bytes())
+            }),
+        )
+        .unwrap();
+        assert_eq!(repeated["revoked"], true);
+        assert!(db
+            .query_row(
+                "SELECT revoked_at FROM user_devices WHERE device_id=?1",
+                [device_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .unwrap()
+            .is_some());
     }
 }
