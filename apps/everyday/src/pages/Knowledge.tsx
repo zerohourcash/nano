@@ -5,6 +5,7 @@ import { trpc } from '@/providers/trpc'
 import { useStore } from '@/lib/store'
 import { toast } from 'sonner'
 import { cn } from '@/lib/utils'
+import { BROWSER_FILE_LIMIT_BYTES, BROWSER_FILE_LIMIT_LABEL } from '@/lib/content-limits'
 
 type Visibility = 'members' | 'accounting' | 'managers'
 type PageSummary = {
@@ -60,6 +61,8 @@ export default function Knowledge() {
   const [content, setContent] = useState('')
   const [visibility, setVisibility] = useState<Visibility>('members')
   const [attachments, setAttachments] = useState<Attachment[]>([])
+  const [draftRevisionGuid, setDraftRevisionGuid] = useState(() => crypto.randomUUID())
+  const [draftPageGuid, setDraftPageGuid] = useState(() => crypto.randomUUID())
   const fileRef = useRef<HTMLInputElement>(null)
 
   const listQ = trpc.knowledge.list.useQuery(
@@ -80,6 +83,8 @@ export default function Knowledge() {
       const saved = raw as unknown as PageDetail
       setSelectedSlug(saved.slug)
       setEditing(false)
+      setDraftRevisionGuid(crypto.randomUUID())
+      setDraftPageGuid(crypto.randomUUID())
       utils.knowledge.list.invalidate()
       utils.knowledge.bySlug.invalidate()
       toast.success('Подписанная ревизия сохранена локально')
@@ -89,6 +94,8 @@ export default function Knowledge() {
   const ingestContent = trpc.content.ingest.useMutation()
 
   const startCreate = () => {
+    setDraftRevisionGuid(crypto.randomUUID())
+    setDraftPageGuid(crypto.randomUUID())
     setTitle('')
     setSlug('')
     setContent('')
@@ -99,6 +106,7 @@ export default function Knowledge() {
 
   const startEdit = () => {
     if (!page) return
+    setDraftRevisionGuid(crypto.randomUUID())
     setTitle(page.title)
     setSlug(page.slug)
     setContent(page.current?.content ?? '')
@@ -116,7 +124,9 @@ export default function Knowledge() {
     }
     try {
       const next = await Promise.all(files.map(async (file) => {
-        if (file.size > 32 * 1024 * 1024) throw new Error(`${file.name}: максимум 32 МБ`)
+        if (file.size === 0 || file.size > BROWSER_FILE_LIMIT_BYTES) {
+          throw new Error(`${file.name}: допустимо от 1 байта до ${BROWSER_FILE_LIMIT_LABEL}`)
+        }
         return { name: file.name, mime: file.type || undefined, url: await fileAsDataUrl(file) }
       }))
       setAttachments((current) => [...current, ...next])
@@ -129,9 +139,15 @@ export default function Knowledge() {
     event.preventDefault()
     if (!workspace?.guid || !title.trim() || !slug.trim()) return
     try {
+      const revisionGuid = draftRevisionGuid
       const compactAttachments = await Promise.all(attachments.map(async ({ name, url, mime }) => {
         if (!url.startsWith('data:')) return { name, url, ...(mime ? { mime } : {}) }
-        const uploaded = await ingestContent.mutateAsync({ workspaceId: workspace.id, dataUrl: url })
+        const uploaded = await ingestContent.mutateAsync({
+          workspaceId: workspace.id,
+          purpose: 'knowledge-attachment',
+          revisionGuid,
+          dataUrl: url,
+        })
         return { name, url: uploaded.url, mime: uploaded.mime }
       }))
       const normalizedSlug = slugify(slug)
@@ -143,8 +159,8 @@ export default function Knowledge() {
         slug: normalizedSlug,
         content,
         visibility,
-        pageGuid: editingCurrentPage ? page.guid : crypto.randomUUID(),
-        revisionGuid: crypto.randomUUID(),
+        pageGuid: editingCurrentPage ? page.guid : draftPageGuid,
+        revisionGuid,
         parentRevisionGuid: editingCurrentPage ? page.currentRevisionGuid ?? undefined : undefined,
         attachments: compactAttachments,
       })

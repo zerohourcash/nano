@@ -1083,6 +1083,71 @@ fn dispatch_inner(
                         Ok(json!({"url":url,"hash":hash,"mime":mime,"size":size}))
                     });
                 }
+                Some("knowledge-attachment") => {
+                    require_can_in_workspace(conn, uid, workspace, "editKnowledge")?;
+                    let revision_guid = s(input, "revisionGuid")
+                        .ok_or_else(|| ApiError::bad("Для wiki-вложения требуется revisionGuid"))?;
+                    Uuid::parse_str(&revision_guid)
+                        .map_err(|_| ApiError::bad("Некорректный revisionGuid"))?;
+                    let minute_ago =
+                        (chrono::Utc::now() - chrono::Duration::minutes(1)).to_rfc3339();
+                    let day_ago = (chrono::Utc::now() - chrono::Duration::hours(24)).to_rfc3339();
+                    let recent_uploads: i64 = conn.query_row(
+                        "SELECT COUNT(*) FROM content_upload_grants WHERE workspace_id=?1 AND user_id=?2 AND purpose='knowledge-attachment' AND created_at>=?3",
+                        params![workspace, uid, minute_ago],
+                        |row| row.get(0),
+                    )?;
+                    let daily_uploads: i64 = conn.query_row(
+                        "SELECT COUNT(*) FROM content_upload_grants WHERE workspace_id=?1 AND user_id=?2 AND purpose='knowledge-attachment' AND created_at>=?3",
+                        params![workspace, uid, day_ago],
+                        |row| row.get(0),
+                    )?;
+                    if recent_uploads >= 20 || daily_uploads >= 1000 {
+                        return Err(ApiError::new(
+                            "TOO_MANY_REQUESTS",
+                            429,
+                            "Лимит wiki-вложений исчерпан",
+                        ));
+                    }
+                    let source = s(input, "dataUrl").ok_or_else(|| ApiError::bad("dataUrl"))?;
+                    return atomic(conn, |conn| {
+                        let url = crate::content::ingest_data_url(conn, &source)
+                            .map_err(|error| {
+                                ApiError::bad(format!("Некорректное вложение: {error}"))
+                            })?
+                            .ok_or_else(|| ApiError::bad("Ожидается base64 data URL"))?;
+                        let hash = url.trim_start_matches("cas:");
+                        let (mime, size): (String, i64) = conn.query_row(
+                            "SELECT mime,size FROM content_catalog WHERE hash=?1",
+                            [hash],
+                            |row| Ok((row.get(0)?, row.get(1)?)),
+                        )?;
+                        let recent_bytes: i64 = conn.query_row(
+                            "SELECT COALESCE(SUM(size),0) FROM content_upload_grants WHERE workspace_id=?1 AND user_id=?2 AND purpose='knowledge-attachment' AND created_at>=?3",
+                            params![workspace, uid, minute_ago],
+                            |row| row.get(0),
+                        )?;
+                        let daily_bytes: i64 = conn.query_row(
+                            "SELECT COALESCE(SUM(size),0) FROM content_upload_grants WHERE workspace_id=?1 AND user_id=?2 AND purpose='knowledge-attachment' AND created_at>=?3",
+                            params![workspace, uid, day_ago],
+                            |row| row.get(0),
+                        )?;
+                        if recent_bytes.saturating_add(size) > 128_i64 * 1024 * 1024
+                            || daily_bytes.saturating_add(size) > 512_i64 * 1024 * 1024
+                        {
+                            return Err(ApiError::new(
+                                "TOO_MANY_REQUESTS",
+                                429,
+                                "Лимит объёма wiki-вложений исчерпан",
+                            ));
+                        }
+                        conn.execute(
+                            "INSERT OR IGNORE INTO content_upload_grants(workspace_id,user_id,purpose,binding_guid,hash,size,created_at) VALUES(?1,?2,'knowledge-attachment',?3,?4,?5,?6)",
+                            params![workspace, uid, revision_guid, hash, size, chrono::Utc::now().to_rfc3339()],
+                        )?;
+                        Ok(json!({"url":url,"hash":hash,"mime":mime,"size":size}))
+                    });
+                }
                 None => require_can_in_workspace(conn, uid, workspace, "createItems")?,
                 Some(_) => return Err(ApiError::bad("Неизвестное назначение вложения")),
             }
@@ -4937,6 +5002,43 @@ fn knowledge_save(conn: &mut Connection, input: &Value, user_id: Option<i64>) ->
         let title = s(input, "title").ok_or_else(|| ApiError::bad("title"))?;
         let content = s(input, "content").unwrap_or_default();
         let visibility = s(input, "visibility").unwrap_or_else(|| "members".into());
+        let attachment_inputs = input
+            .get("attachments")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let revision_guid = s(input, "revisionGuid");
+        if !attachment_inputs.is_empty() && revision_guid.is_none() {
+            return Err(ApiError::bad("Для wiki-вложений требуется revisionGuid"));
+        }
+        let grant_since = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+        let mut attachment_hashes = Vec::new();
+        for attachment in &attachment_inputs {
+            let url = attachment
+                .get("url")
+                .and_then(Value::as_str)
+                .ok_or_else(|| ApiError::bad("Нет CAS-ссылки wiki-вложения"))?;
+            let hash = validate_known_cas(conn, url)?;
+            if attachment_hashes.contains(&hash) {
+                return Err(ApiError::bad("Одинаковое wiki-вложение указано дважды"));
+            }
+            let granted = conn
+                .query_row(
+                    "SELECT 1 FROM content_upload_grants
+                     WHERE workspace_id=?1 AND user_id=?2 AND purpose='knowledge-attachment'
+                       AND binding_guid=?3 AND hash=?4 AND consumed_at IS NULL AND created_at>=?5",
+                    params![ws, uid, revision_guid, hash, grant_since],
+                    |_| Ok(true),
+                )
+                .optional()?
+                .unwrap_or(false);
+            if !granted {
+                return Err(ApiError::bad(
+                    "Wiki-вложение не загружено для этой ревизии или grant истёк",
+                ));
+            }
+            attachment_hashes.push(hash);
+        }
         let page = crate::knowledge::save(
             conn,
             ws,
@@ -4948,7 +5050,7 @@ fn knowledge_save(conn: &mut Connection, input: &Value, user_id: Option<i64>) ->
             s(input, "parentRevisionGuid").as_deref(),
             input.get("attachments").unwrap_or(&Value::Null),
             s(input, "pageGuid").as_deref(),
-            s(input, "revisionGuid").as_deref(),
+            revision_guid.as_deref(),
         )
         .map_err(|e| ApiError::bad(e.to_string()))?;
         let page_guid = page["guid"]
@@ -4969,6 +5071,18 @@ fn knowledge_save(conn: &mut Connection, input: &Value, user_id: Option<i64>) ->
             Some(&format!("База знаний: {title}")),
         )
         .map_err(|e| ApiError::internal(e.to_string()))?;
+        let consumed_at = chrono::Utc::now().to_rfc3339();
+        for attachment_hash in &attachment_hashes {
+            let consumed = conn.execute(
+                "UPDATE content_upload_grants SET consumed_at=?1
+                 WHERE workspace_id=?2 AND user_id=?3 AND purpose='knowledge-attachment'
+                   AND binding_guid=?4 AND hash=?5 AND consumed_at IS NULL",
+                params![consumed_at, ws, uid, revision_guid, attachment_hash],
+            )?;
+            if consumed != 1 {
+                return Err(ApiError::conflict("Wiki-вложение уже использовано"));
+            }
+        }
         Ok(page)
     })
 }
@@ -9791,7 +9905,36 @@ mod tests {
     #[test]
     fn knowledge_revisions_use_cas_acl_and_tamper_evidence() {
         let (mut conn, path, users, ws) = test_db();
-        let page=dispatch(&mut conn,"knowledge.save",&json!({"workspaceId":ws,"slug":"safety/drill","title":"Работа с дрелью","content":"# Инструкция\nОтключить питание.","attachments":[{"name":"Схема","url":"data:image/png;base64,QUJD"}]}),Some(users[0])).unwrap();
+        let revision_guid = Uuid::new_v4().to_string();
+        let uploaded = dispatch(
+            &mut conn,
+            "content.ingest",
+            &json!({"workspaceId":ws,"purpose":"knowledge-attachment",
+                "revisionGuid":revision_guid,"dataUrl":"data:image/png;base64,QUJD"}),
+            Some(users[0]),
+        )
+        .unwrap();
+        let wrong_revision = dispatch(
+            &mut conn,
+            "knowledge.save",
+            &json!({"workspaceId":ws,"slug":"safety/wrong","title":"Чужой grant","content":"x",
+                "revisionGuid":Uuid::new_v4().to_string(),
+                "attachments":[{"name":"Схема","url":uploaded["url"],"mime":uploaded["mime"]}]}),
+            Some(users[0]),
+        )
+        .unwrap_err();
+        assert!(wrong_revision.message.contains("grant"));
+        let wrong_mime = dispatch(
+            &mut conn,
+            "knowledge.save",
+            &json!({"workspaceId":ws,"slug":"safety/mime","title":"Подмена MIME","content":"x",
+                "revisionGuid":revision_guid,
+                "attachments":[{"name":"Схема","url":uploaded["url"],"mime":"text/plain"}]}),
+            Some(users[0]),
+        )
+        .unwrap_err();
+        assert!(wrong_mime.message.contains("MIME"));
+        let page=dispatch(&mut conn,"knowledge.save",&json!({"workspaceId":ws,"slug":"safety/drill","title":"Работа с дрелью","content":"# Инструкция\nОтключить питание.","revisionGuid":revision_guid,"attachments":[{"name":"Схема","url":uploaded["url"],"mime":uploaded["mime"]}]}),Some(users[0])).unwrap();
         assert_eq!(page["hasConflict"], false);
         assert!(page["current"]["attachments"][0]["url"]
             .as_str()
@@ -9803,6 +9946,10 @@ mod tests {
             .unwrap()
             .starts_with("cas:"));
         assert!(!portable.to_string().contains("data:image/png"));
+        let consumed: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM content_upload_grants WHERE purpose='knowledge-attachment' AND consumed_at IS NOT NULL",
+            [], |row| row.get(0)).unwrap();
+        assert_eq!(consumed, 1);
         crate::knowledge::verify(&conn).unwrap();
         let limited = json!({"viewKnowledge":true,"editKnowledge":false,"viewAccounting":false});
         conn.execute(

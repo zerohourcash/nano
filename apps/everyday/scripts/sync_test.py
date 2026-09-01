@@ -704,6 +704,12 @@ def main() -> int:
             {"workspaceId": node_ws_id, "recipientUserId": node_me["id"], "amount": 100, "memo": "Офлайн-эмиссия"},
         )
         check("офлайн-эмиссия Bit записана двойной проводкой", minted.get("status") == "posted", str(minted))
+        knowledge_revision_guid = str(uuid.uuid4())
+        knowledge_blob = node.call(
+            "content.ingest",
+            {"workspaceId": node_ws_id, "purpose": "knowledge-attachment",
+             "revisionGuid": knowledge_revision_guid, "dataUrl": KNOWLEDGE_DATA_URL},
+        )
         knowledge = node.call(
             "knowledge.save",
             {
@@ -711,7 +717,9 @@ def main() -> int:
                 "slug": "offline/safety",
                 "title": "Офлайн-инструкция",
                 "content": "# Безопасность\nПроверить инструмент перед работой.",
-                "attachments": [{"name": "Памятка", "url": KNOWLEDGE_DATA_URL}],
+                "revisionGuid": knowledge_revision_guid,
+                "attachments": [{"name": "Памятка", "url": knowledge_blob["url"],
+                                 "mime": knowledge_blob["mime"]}],
             },
         )
         check("ревизия локальной базы знаний подписана", bool(knowledge.get("savedRevisionHash")), str(knowledge)[:180])

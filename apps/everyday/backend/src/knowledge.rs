@@ -34,19 +34,37 @@ fn normalize_attachments(conn: &Connection, value: &Value) -> anyhow::Result<Val
     }
     let mut out = Vec::new();
     for entry in entries {
-        let name = entry.get("name").and_then(Value::as_str).unwrap_or("Файл");
-        if name.chars().count() > 200 {
-            bail!("слишком длинное имя вложения")
+        let name = entry
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or("Файл");
+        if name.is_empty() || name.chars().count() > 200 || name.chars().any(char::is_control) {
+            bail!("некорректное имя вложения")
         };
         let source = entry
             .get("url")
             .and_then(Value::as_str)
             .ok_or_else(|| anyhow!("нет URL вложения"))?;
-        let stored =
-            crate::content::ingest_data_url(conn, source)?.unwrap_or_else(|| source.to_string());
-        out.push(
-            json!({"name":name,"url":stored,"mime":entry.get("mime").and_then(Value::as_str)}),
-        );
+        let hash = source
+            .strip_prefix("cas:")
+            .filter(|value| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+            .ok_or_else(|| anyhow!("wiki-вложение должно быть CAS-ссылкой"))?;
+        let catalog_mime: String = conn
+            .query_row(
+                "SELECT mime FROM content_catalog WHERE hash=?1",
+                [hash],
+                |row| row.get(0),
+            )
+            .map_err(|_| anyhow!("wiki-вложение отсутствует в локальном CAS"))?;
+        let requested_mime = entry
+            .get("mime")
+            .and_then(Value::as_str)
+            .unwrap_or(&catalog_mime);
+        if requested_mime != catalog_mime {
+            bail!("MIME wiki-вложения не совпадает с CAS-каталогом")
+        }
+        out.push(json!({"name":name,"url":source,"mime":catalog_mime}));
     }
     Ok(Value::Array(out))
 }
