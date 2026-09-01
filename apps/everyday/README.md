@@ -487,6 +487,15 @@ cargo clippy --manifest-path backend/Cargo.toml --all-targets -- -D warnings
 cargo test --manifest-path backend/Cargo.toml
 ```
 
+Оператор тестового стенда может безопасно опубликовать проверенный APK через
+тот же Rust-узел: задайте `MESHKEEPER_ANDROID_APK_PATH` и обязательный
+`MESHKEEPER_ANDROID_APK_SHA256`. При старте узел потоково пересчитывает весь
+SHA-256 до открытия рабочей базы и отказывается запускаться при несовпадении.
+После успешной проверки экран входа показывает размер, checksum и ссылку
+`/downloads/everyday-android-debug.apk`. Debug-сборка предназначена только для
+испытаний; публичный релиз должен быть подписан отдельным release-keystore.
+Проверка этого контура: `npm run android:release:http:test`.
+
 Android CI дополнительно запускает `./gradlew connectedDebugAndroidTest` на API 34
 x86_64 emulator. Этот gate исполняет durable BLE spool: восстановление после
 незавершённой замены, bounded-очередь, quarantine повреждения и цикл

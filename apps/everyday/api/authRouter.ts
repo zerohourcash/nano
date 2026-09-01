@@ -179,6 +179,12 @@ export const authRouter = createRouter({
     registrationOpen: false,
     bootstrap: false,
     demoLogin: false,
+    androidTestBuild: null as null | {
+      url: string
+      sha256: string
+      sizeBytes: number
+      debug: boolean
+    },
   })),
 
   inviteInfo: publicQuery

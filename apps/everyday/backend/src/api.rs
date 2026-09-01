@@ -1465,6 +1465,7 @@ fn auth_options(conn: &Connection) -> ApiResult {
         "registrationOpen": users == 0 || open,
         "bootstrap": users == 0,
         "demoLogin": std::env::var("MESHKEEPER_DEMO_LOGIN").as_deref() == Ok("1"),
+        "androidTestBuild": crate::android_test_release_metadata(),
     }))
 }
 

@@ -919,6 +919,19 @@ export default function AuthForm() {
           </motion.div>
         </AnimatePresence>
       </div>
+      {optionsQ.data?.androidTestBuild && !app && (
+        <div className="mt-6 rounded-xl border border-brand-100 bg-brand-50/60 p-3 text-xs leading-5 text-ink-500">
+          <a
+            href={optionsQ.data.androidTestBuild.url}
+            className="font-semibold text-brand-600 underline underline-offset-2"
+            download
+          >
+            Скачать Android test APK
+          </a>
+          <div>{(optionsQ.data.androidTestBuild.sizeBytes / 1024 / 1024).toFixed(1)} МиБ · debug-сборка</div>
+          <div className="break-all font-mono-num">SHA-256: {optionsQ.data.androidTestBuild.sha256}</div>
+        </div>
+      )}
     </div>
   )
 }

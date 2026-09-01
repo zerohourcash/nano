@@ -35,7 +35,7 @@ use std::{
     path::PathBuf,
     sync::Arc,
 };
-use tower_http::services::ServeDir;
+use tower_http::services::{ServeDir, ServeFile};
 
 struct AppState {
     db: Mutex<Connection>,
@@ -46,6 +46,52 @@ const MAX_REQUEST_BYTES: usize = 32 * 1024 * 1024;
 // the tRPC wrapper while rejecting a generic 32 MiB upload before it is read
 // into memory by the handler.
 const MAX_INTERORG_GOSSIP_REQUEST_BYTES: usize = 3 * 1024 * 1024 + 64 * 1024;
+
+pub(crate) fn android_test_release_metadata() -> Option<Value> {
+    let path = PathBuf::from(std::env::var("MESHKEEPER_ANDROID_APK_PATH").ok()?);
+    let sha256 = std::env::var("MESHKEEPER_ANDROID_APK_SHA256").ok()?;
+    if !path.is_file() || sha256.len() != 64 || !sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return None;
+    }
+    let size = std::fs::metadata(path).ok()?.len();
+    Some(json!({
+        "url":"/downloads/everyday-android-debug.apk",
+        "sha256":sha256.to_ascii_lowercase(),
+        "sizeBytes":size,
+        "debug":true
+    }))
+}
+
+fn validated_android_test_release() -> anyhow::Result<Option<PathBuf>> {
+    use sha2::Digest;
+    use std::io::Read;
+
+    let Ok(raw_path) = std::env::var("MESHKEEPER_ANDROID_APK_PATH") else {
+        return Ok(None);
+    };
+    let path = PathBuf::from(raw_path);
+    let expected = std::env::var("MESHKEEPER_ANDROID_APK_SHA256")
+        .map_err(|_| anyhow::anyhow!("APK path requires MESHKEEPER_ANDROID_APK_SHA256"))?;
+    if expected.len() != 64 || !expected.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        anyhow::bail!("MESHKEEPER_ANDROID_APK_SHA256 must be 64 hexadecimal characters");
+    }
+    let mut file = std::fs::File::open(&path)?;
+    let mut digest = sha2::Sha256::new();
+    let mut chunk = [0_u8; 64 * 1024];
+    loop {
+        let count = file.read(&mut chunk)?;
+        if count == 0 {
+            break;
+        }
+        digest.update(&chunk[..count]);
+    }
+    let actual = hex::encode(digest.finalize());
+    if !actual.eq_ignore_ascii_case(&expected) {
+        anyhow::bail!("Android APK SHA-256 mismatch: expected {expected}, got {actual}");
+    }
+    Ok(Some(path))
+}
 
 /// Единый защитный контур для API и SPA. Заголовки выставляются самим узлом,
 /// поэтому защита остаётся и при ошибочной конфигурации reverse proxy.
@@ -1201,6 +1247,9 @@ fn short_net_error(e: &reqwest::Error) -> String {
 /// Запускает тот же узел из desktop binary или мобильного JNI bridge.
 pub async fn run() -> anyhow::Result<()> {
     let dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    // Проверяем распространяемый пакет до открытия/миграции рабочей базы:
+    // ошибочная публикация не должна запускать узел даже частично.
+    let android_test_release = validated_android_test_release()?;
     let db_path = std::env::var("MESHKEEPER_DB")
         .map(PathBuf::from)
         .unwrap_or_else(|_| dir.join("data").join("meshkeeper-rs.db"));
@@ -1341,7 +1390,7 @@ pub async fn run() -> anyhow::Result<()> {
             });
         }
     }
-    let app = Router::new()
+    let mut app = Router::new()
         .route("/health", get(health))
         .route("/sync/hello", get(sync_hello))
         .route(
@@ -1358,7 +1407,15 @@ pub async fn run() -> anyhow::Result<()> {
             any(trpc_interorg_import)
                 .layer(DefaultBodyLimit::max(MAX_INTERORG_GOSSIP_REQUEST_BYTES)),
         )
-        .route("/api/trpc/{*procedures}", any(trpc))
+        .route("/api/trpc/{*procedures}", any(trpc));
+    if let Some(apk_path) = android_test_release {
+        eprintln!("Android test APK: /downloads/everyday-android-debug.apk");
+        app = app.route_service(
+            "/downloads/everyday-android-debug.apk",
+            ServeFile::new(apk_path),
+        );
+    }
+    let app = app
         .fallback_service(static_files)
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
         .layer(middleware::from_fn(security_headers))

@@ -44,6 +44,11 @@ capability, затем применяют только её scope. Неверн�
   SameSite=Strict и Secure в production.
 - Изменяющие browser-запросы требуют same-origin `Origin`.
 - Все запросы ограничены 32 МБ; `metadata_json` — 64 КБ.
+- Опциональная выдача Android test APK включается только парой
+  `MESHKEEPER_ANDROID_APK_PATH`/`MESHKEEPER_ANDROID_APK_SHA256`. Узел читает файл
+  блоками и сверяет полный SHA-256 до открытия или миграции SQLite; неверный или
+  отсутствующий digest останавливает процесс. Маршрут имеет фиксированное имя,
+  поэтому переменная пути не превращает сервер в произвольный файловый браузер.
 - CSP, запрет iframe/MIME sniffing, строгая referrer-policy и Permissions-Policy.
 - API и sync-ответы получают `Cache-Control: no-store`.
 - Не-loopback bind требует secure-cookie; каждый peer синхронизации требует HTTPS.
