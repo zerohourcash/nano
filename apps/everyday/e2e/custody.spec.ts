@@ -316,6 +316,22 @@ test('browser signs a real custody transaction and ledger retains its proof', as
     );
     return hash === document.hash && valid && JSON.stringify(canonicalAct) === JSON.stringify(document.act);
   }, signedAct)).toBe(true);
+  await page.getByRole('button', { name: 'Все сессии' }).click();
+  const actUpload = page.getByTestId('inventory-act-upload');
+  await actUpload.setInputFiles({
+    name: 'verified-act.json',
+    mimeType: 'application/json',
+    buffer: Buffer.from(JSON.stringify(signedAct)),
+  });
+  await expect(page.getByTestId('inventory-act-verification')).toContainText('Акт полностью подтверждён');
+  const tamperedAct = structuredClone(signedAct) as typeof signedAct & { act: Record<string, unknown> };
+  tamperedAct.act.number = 'ИНВ-ПОДМЕНА';
+  await actUpload.setInputFiles({
+    name: 'tampered-act.json',
+    mimeType: 'application/json',
+    buffer: Buffer.from(JSON.stringify(tamperedAct)),
+  });
+  await expect(page.getByTestId('inventory-act-verification')).toContainText('Подпись или содержимое акта повреждены');
   await trpc(page, 'transfers.returnItem', { itemId: qrItem.id });
 
   await page.goto('/knowledge');

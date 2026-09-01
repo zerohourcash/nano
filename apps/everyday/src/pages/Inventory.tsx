@@ -10,6 +10,7 @@ import {
   Loader2,
   Plus,
   ScanLine,
+  ShieldCheck,
   TriangleAlert,
   Warehouse,
   X,
@@ -25,6 +26,7 @@ type RouterOutputs = inferRouterOutputs<AppRouter>
 type SessionListItem = RouterOutputs['inventory']['sessions'][number]
 type SessionDetail = NonNullable<RouterOutputs['inventory']['byId']>
 type ResultRow = SessionDetail['results'][number]
+type ActVerification = RouterOutputs['inventory']['verifyAct']
 
 const EASE = [0.22, 1, 0.36, 1] as [number, number, number, number]
 
@@ -145,10 +147,33 @@ function ProgressBar({ value, total, big }: { value: number; total: number; big?
 export default function Inventory() {
   const [activeId, setActiveId] = useState<number | null>(null)
   const [createOpen, setCreateOpen] = useState(false)
+  const [actVerification, setActVerification] = useState<ActVerification | null>(null)
   const { toast, show } = useToast()
 
   const sessionsQ = trpc.inventory.sessions.useQuery()
   const sessions = useMemo(() => sessionsQ.data ?? [], [sessionsQ.data])
+  const verifyAct = trpc.inventory.verifyAct.useMutation({
+    onSuccess: (result) => setActVerification(result),
+    onError: (error) => show(error.message, 'error'),
+  })
+
+  const uploadAct = async (file: File | undefined) => {
+    if (!file) return
+    if (file.size > 6 * 1024 * 1024) {
+      show('Акт превышает 6 МиБ', 'error')
+      return
+    }
+    try {
+      const document = JSON.parse(await file.text()) as unknown
+      if (!document || typeof document !== 'object' || Array.isArray(document)) {
+        throw new Error('not an object')
+      }
+      setActVerification(null)
+      verifyAct.mutate({ document: document as Record<string, unknown> })
+    } catch {
+      show('Файл не является актом Everyday JSON', 'error')
+    }
+  }
 
   if (activeId != null) {
     return (
@@ -186,7 +211,60 @@ export default function Inventory() {
           <Plus size={16} />
           Новая инвентаризация
         </button>
+        <label className="inline-flex h-10 cursor-pointer items-center gap-2 rounded-xl border border-brand-100 bg-surface px-4 text-sm font-semibold text-ink-900 transition-colors hover:bg-brand-50">
+          {verifyAct.isPending ? <Loader2 size={16} className="animate-spin" /> : <ShieldCheck size={16} />}
+          Проверить акт
+          <input
+            data-testid="inventory-act-upload"
+            type="file"
+            accept="application/json,.json"
+            className="sr-only"
+            disabled={verifyAct.isPending}
+            onChange={(event) => {
+              void uploadAct(event.target.files?.[0])
+              event.currentTarget.value = ''
+            }}
+          />
+        </label>
       </motion.div>
+
+      {actVerification && (
+        <motion.div
+          data-testid="inventory-act-verification"
+          initial={{ opacity: 0, y: 8 }}
+          animate={{ opacity: 1, y: 0 }}
+          className={cn(
+            'rounded-card border p-4 shadow-card',
+            actVerification.verdict === 'verified'
+              ? 'border-success/30 bg-success-bg'
+              : actVerification.cryptographicValid
+                ? 'border-warning/30 bg-warning-bg'
+                : 'border-danger/30 bg-danger-bg'
+          )}
+        >
+          <div className="flex items-start gap-3">
+            {actVerification.verdict === 'verified' ? (
+              <ShieldCheck className="mt-0.5 shrink-0 text-success" size={20} />
+            ) : (
+              <TriangleAlert className="mt-0.5 shrink-0 text-danger" size={20} />
+            )}
+            <div className="min-w-0">
+              <h2 className="font-semibold text-ink-900">
+                {actVerification.verdict === 'verified' ? 'Акт полностью подтверждён' : 'Акт требует внимания'}
+              </h2>
+              <p className="mt-1 text-sm text-ink-500">{actVerification.message}</p>
+              <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-xs text-ink-500">
+                <span>Криптография: {actVerification.cryptographicValid ? 'верна' : 'ошибка'}</span>
+                <span>Ключ ноды: {actVerification.trustedKey ? 'доверенный' : 'не одобрен'}</span>
+                <span>Летопись: {actVerification.localMatch ? 'совпадает' : 'не подтверждена'}</span>
+                {(actVerification.missingRecords > 0 || actVerification.extraRecords > 0) && (
+                  <span>Записи: −{actVerification.missingRecords} / +{actVerification.extraRecords}</span>
+                )}
+              </div>
+            </div>
+          </div>
+        </motion.div>
+      )}
 
       {/* ── Список сессий ── */}
       {sessionsQ.isLoading ? (

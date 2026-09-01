@@ -25,6 +25,18 @@ type InventoryAct = {
   signatureDomain: "everyday/inventory-act/v1";
 };
 
+type InventoryActVerification = {
+  verdict: "verified" | "invalid" | "untrusted_key" | "foreign_organization" | "history_missing" | "history_mismatch";
+  cryptographicValid: boolean;
+  trustedKey: boolean;
+  workspaceKnown: boolean;
+  localSession: boolean;
+  localMatch: boolean;
+  missingRecords: number;
+  extraRecords: number;
+  message: string;
+};
+
 export const inventoryRouter = createRouter({
   sessions: publicQuery
     .input(z.object({ workspaceId: z.number().int().positive().optional() }).optional())
@@ -53,6 +65,12 @@ export const inventoryRouter = createRouter({
     .input(z.object({ id: z.number().int().positive() }))
     .query(async (): Promise<InventoryAct> => {
       throw new TRPCError({ code: "PRECONDITION_FAILED", message: "Проверяемый акт формирует автономный Rust-узел" });
+    }),
+
+  verifyAct: publicQuery
+    .input(z.object({ document: z.record(z.string(), z.unknown()) }))
+    .mutation(async (): Promise<InventoryActVerification> => {
+      throw new TRPCError({ code: "PRECONDITION_FAILED", message: "Акты проверяет автономный Rust-узел" });
     }),
 
   create: publicQuery

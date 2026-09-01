@@ -170,6 +170,16 @@ capability, затем применяют только её scope. Неверн�
   public key. Проверяющий обязан декодировать `canonical`, сопоставить его с
   `act`, пересчитать hash и лишь затем проверить подпись; перечисленные в акте
   Ledger/record hashes связывают его с пользовательскими device-proof.
+  `inventory.verifyAct` выполняет эти проверки на принимающей ноде, сравнивает
+  ключ по декодированным Ed25519 bytes с local/approved node trust store и лишь
+  после этого ищет организацию в memberships вызывающего пользователя. Затем
+  независимо строит акт из локального materialized state и сообщает отдельные
+  состояния `verified`, `untrusted_key`, `foreign_organization`,
+  `history_missing`, `history_mismatch` или `invalid`. Так отсутствие mesh-delta
+  не маскируется под криптографическую подделку и не пробивает изоляцию tenant.
+  `createdAt/completedAt` берутся из переносимых create/complete records, а не
+  из времени локальной материализации, поэтому акт побайтово воспроизводится
+  другой нодой после partition/heal.
 - «Удаление» ТМЦ реализовано как delete-wins `itemTombstoneMode=monotonic/v1`.
   Tombstone коммитит GUID организации, карточки и автора, Ledger hash и время;
   связанное `item_archive` обязано иметь полный device-proof. Проверка проходит

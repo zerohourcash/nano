@@ -8774,7 +8774,7 @@ mod tests {
         let rejected_path =
             std::env::temp_dir().join(format!("inventory-rejected-{}.db", uuid::Uuid::new_v4()));
         let mut source = crate::db::open(&source_path).unwrap();
-        let target = crate::db::open(&target_path).unwrap();
+        let mut target = crate::db::open(&target_path).unwrap();
         let rejected = crate::db::open(&rejected_path).unwrap();
         let created = chrono::Utc::now().to_rfc3339();
         source.execute("INSERT INTO workspaces(name,internal_id_prefix,created_at,guid) VALUES('Inventory org','I-',?1,'inventory-workspace')",[&created]).unwrap();
@@ -8852,6 +8852,13 @@ mod tests {
             Some(owner),
         )
         .unwrap();
+        let portable_act = crate::api::dispatch(
+            &mut source,
+            "inventory.act",
+            &json!({"id":session["id"]}),
+            Some(owner),
+        )
+        .unwrap();
         let valid = export_journal(&source);
         assert_eq!(valid["inventoryRecords"].as_array().unwrap().len(), 3);
         let accepted = apply_remote_journal(&target, &valid, "");
@@ -8859,6 +8866,29 @@ mod tests {
         let restored:(String,f64,bool,bool)=target.query_row("SELECT s.status,r.actual_qty,r.checked!=0,s.block_transfers!=0 FROM inventory_sessions s JOIN inventory_results r ON r.session_id=s.id",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap();
         assert_eq!(restored, ("completed".into(), 7.0, true, true));
         assert_eq!(verify_stored_inventory_records(&target).unwrap(), 3);
+        let restored_owner: i64 = target
+            .query_row(
+                "SELECT id FROM users WHERE guid='inventory-owner'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        target
+            .execute(
+                "INSERT OR IGNORE INTO trusted_node_keys(public_key,label,source,created_at)
+             VALUES(?1,'Source inventory node','approved',?2)",
+                params![ledger::node_public_key(&source).unwrap(), created],
+            )
+            .unwrap();
+        let remote_verification = crate::api::dispatch(
+            &mut target,
+            "inventory.verifyAct",
+            &json!({"document":portable_act}),
+            Some(restored_owner),
+        )
+        .unwrap();
+        assert_eq!(remote_verification["verdict"], "verified");
+        assert_eq!(remote_verification["localMatch"], true);
         let mut forged = valid.clone();
         forged["inventoryRecords"][1]["fields"]["actualQty"] = json!(99);
         ledger::sign_journal(&source, &mut forged).unwrap();

@@ -4,8 +4,13 @@ use argon2::{
     password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
     Argon2,
 };
-use base64::{engine::general_purpose::STANDARD as B64, Engine};
-use ed25519_dalek::Signer;
+use base64::{
+    engine::general_purpose::{
+        STANDARD as B64, STANDARD_NO_PAD as B64_NO_PAD, URL_SAFE_NO_PAD as URL_B64,
+    },
+    Engine,
+};
+use ed25519_dalek::{Signer, Verifier};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -1102,6 +1107,7 @@ fn dispatch_inner(
         "inventory.byId" => inv_by_id(conn, input, user_id),
         "inventory.results" => inv_results(conn, input, user_id),
         "inventory.act" => inv_act(conn, input, user_id),
+        "inventory.verifyAct" => inv_verify_act(conn, input, user_id),
         "inventory.create" => inv_create(conn, input, user_id),
         "inventory.checkItem" => inv_check(conn, input, user_id),
         "inventory.complete" => inv_complete(conn, input, user_id),
@@ -3773,10 +3779,25 @@ fn inv_act(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiResult 
         "recordHash":row.get::<_,String>(0)?,"ledgerHash":row.get::<_,String>(1)?,"kind":row.get::<_,String>(2)?,
         "actorGuid":row.get::<_,String>(3)?,"itemGuid":row.get::<_,Option<String>>(4)?,"payloadHash":row.get::<_,String>(5)?,"createdAt":row.get::<_,String>(6)?
     })))?.flatten().collect();
+    // Portable acts use ledger-record time, not local materialization time.
+    // A receiving node reconstructs session timestamps from these records, so
+    // this keeps the signed document byte-identical after an offline round trip.
+    let portable_created_at = records
+        .iter()
+        .find(|record| record.get("kind").and_then(Value::as_str) == Some("create"))
+        .and_then(|record| record.get("createdAt").and_then(Value::as_str))
+        .unwrap_or(&created_at)
+        .to_string();
+    let portable_completed_at = records
+        .iter()
+        .find(|record| record.get("kind").and_then(Value::as_str) == Some("complete"))
+        .and_then(|record| record.get("createdAt").and_then(Value::as_str))
+        .map(str::to_owned)
+        .or(completed_at);
     let act = json!({
         "domain":"everyday/inventory-act/v1","workspaceGuid":workspace_guid,
         "sessionGuid":session_guid,"number":number,"status":status,
-        "createdAt":created_at,"completedAt":completed_at,"scopeType":scope_type,
+        "createdAt":portable_created_at,"completedAt":portable_completed_at,"scopeType":scope_type,
         "scopeRefGuid":scope_ref_guid,"blockTransfers":block_transfers,
         "items":items,"records":records
     });
@@ -3792,6 +3813,182 @@ fn inv_act(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiResult 
         "signature":B64.encode(signing_key.sign(transcript.as_bytes()).to_bytes()),
         "publicKey":B64.encode(signing_key.verifying_key().as_bytes()),
         "signatureDomain":"everyday/inventory-act/v1"
+    }))
+}
+
+fn decode_portable_base64(value: &str) -> Option<Vec<u8>> {
+    B64.decode(value)
+        .ok()
+        .or_else(|| B64_NO_PAD.decode(value).ok())
+        .or_else(|| URL_B64.decode(value).ok())
+}
+
+fn inv_verify_act(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
+    let uid = require_user(conn, user_id)?;
+    let document = input
+        .get("document")
+        .and_then(Value::as_object)
+        .ok_or_else(|| ApiError::bad("document"))?;
+    let canonical_text = document
+        .get("canonical")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if canonical_text.len() > 8 * 1024 * 1024 {
+        return Err(ApiError::bad("Акт превышает допустимый размер"));
+    }
+    let canonical = decode_portable_base64(canonical_text).unwrap_or_default();
+    let parsed = serde_json::from_slice::<Value>(&canonical).ok();
+    let embedded = document.get("act");
+    let claimed_hash = document
+        .get("hash")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let actual_hash = format!("{:x}", Sha256::digest(&canonical));
+    let canonical_matches = parsed.as_ref() == embedded;
+    let hash_matches = claimed_hash.len() == 64 && claimed_hash == actual_hash;
+    let domain_matches = document.get("format").and_then(Value::as_str)
+        == Some("everyday-inventory-act")
+        && document.get("version").and_then(Value::as_i64) == Some(1)
+        && document.get("signatureDomain").and_then(Value::as_str)
+            == Some("everyday/inventory-act/v1");
+    let public_key_bytes = document
+        .get("publicKey")
+        .and_then(Value::as_str)
+        .and_then(decode_portable_base64)
+        .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok());
+    let signature_bytes = document
+        .get("signature")
+        .and_then(Value::as_str)
+        .and_then(decode_portable_base64)
+        .and_then(|bytes| <[u8; 64]>::try_from(bytes).ok());
+    let signature_valid = match (public_key_bytes, signature_bytes) {
+        (Some(key), Some(signature)) if hash_matches && domain_matches => {
+            ed25519_dalek::VerifyingKey::from_bytes(&key)
+                .and_then(|verifier| {
+                    verifier.verify(
+                        format!("everyday/inventory-act/v1\n{claimed_hash}").as_bytes(),
+                        &ed25519_dalek::Signature::from_bytes(&signature),
+                    )
+                })
+                .is_ok()
+        }
+        _ => false,
+    };
+    let cryptographic_valid = !canonical.is_empty()
+        && canonical_matches
+        && hash_matches
+        && domain_matches
+        && signature_valid;
+    if !cryptographic_valid {
+        return Ok(json!({
+            "verdict":"invalid","cryptographicValid":false,"trustedKey":false,
+            "workspaceKnown":false,"localSession":false,"localMatch":false,
+            "missingRecords":0,"extraRecords":0,"message":"Подпись или содержимое акта повреждены"
+        }));
+    }
+
+    let key = public_key_bytes.expect("validated key");
+    let mut trusted_key = ledger::node_public_key(conn)
+        .ok()
+        .and_then(|encoded| decode_portable_base64(&encoded))
+        .as_deref()
+        == Some(key.as_slice());
+    let mut trusted = conn.prepare("SELECT public_key FROM trusted_node_keys")?;
+    for encoded in trusted
+        .query_map([], |row| row.get::<_, String>(0))?
+        .flatten()
+    {
+        if decode_portable_base64(&encoded).as_deref() == Some(key.as_slice()) {
+            trusted_key = true;
+            break;
+        }
+    }
+    let act = parsed.expect("validated canonical JSON");
+    let workspace_guid = act
+        .get("workspaceGuid")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let workspace_id: Option<i64> = conn
+        .query_row(
+            "SELECT w.id FROM workspaces w JOIN user_workspaces uw ON uw.workspace_id=w.id
+             WHERE w.guid=?1 AND uw.user_id=?2",
+            params![workspace_guid, uid],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(workspace_id) = workspace_id else {
+        return Ok(json!({
+            "verdict":"foreign_organization","cryptographicValid":true,"trustedKey":trusted_key,
+            "workspaceKnown":false,"localSession":false,"localMatch":false,
+            "missingRecords":0,"extraRecords":0,
+            "message":"Акт действителен, но относится к недоступной организации"
+        }));
+    };
+    let session_guid = act
+        .get("sessionGuid")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let local_session: Option<(i64, String)> = conn
+        .query_row(
+            "SELECT id,status FROM inventory_sessions WHERE guid=?1 AND workspace_id=?2",
+            params![session_guid, workspace_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((session_id, local_status)) = local_session else {
+        return Ok(json!({
+            "verdict":if trusted_key {"history_missing"} else {"untrusted_key"},
+            "cryptographicValid":true,"trustedKey":trusted_key,"workspaceKnown":true,
+            "localSession":false,"localMatch":false,
+            "missingRecords":act.get("records").and_then(Value::as_array).map_or(0,Vec::len),
+            "extraRecords":0,"message":if trusted_key {"Локальная нода ещё не получила историю этого акта"} else {"Подпись верна, но ключ ноды не одобрен"}
+        }));
+    };
+    if local_status != "completed" {
+        return Ok(json!({
+            "verdict":if trusted_key {"history_missing"} else {"untrusted_key"},
+            "cryptographicValid":true,"trustedKey":trusted_key,"workspaceKnown":true,
+            "localSession":true,"localMatch":false,
+            "missingRecords":act.get("records").and_then(Value::as_array).map_or(0,Vec::len),
+            "extraRecords":0,"message":if trusted_key {"Локальная нода получила только часть истории этого акта"} else {"Подпись верна, но ключ ноды не одобрен"}
+        }));
+    }
+    let local = inv_act(conn, &json!({"id":session_id}), Some(uid))?;
+    let local_act = local.get("act").cloned().unwrap_or(Value::Null);
+    let local_hashes: std::collections::HashSet<String> = local_act
+        .get("records")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|record| record.get("recordHash")?.as_str().map(str::to_owned))
+        .collect();
+    let supplied_hashes: std::collections::HashSet<String> = act
+        .get("records")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|record| record.get("recordHash")?.as_str().map(str::to_owned))
+        .collect();
+    let missing_records = supplied_hashes.difference(&local_hashes).count();
+    let extra_records = local_hashes.difference(&supplied_hashes).count();
+    let local_match = act == local_act;
+    let (verdict, message) = if !trusted_key {
+        ("untrusted_key", "Подпись верна, но ключ ноды не одобрен")
+    } else if local_match {
+        (
+            "verified",
+            "Акт, подпись и локальная летопись полностью совпадают",
+        )
+    } else {
+        (
+            "history_mismatch",
+            "Акт не совпадает с текущей локальной летописью",
+        )
+    };
+    Ok(json!({
+        "verdict":verdict,"cryptographicValid":true,"trustedKey":trusted_key,
+        "workspaceKnown":true,"localSession":true,"localMatch":local_match,
+        "missingRecords":missing_records,"extraRecords":extra_records,"message":message
     }))
 }
 fn inv_create(conn: &mut Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
@@ -7382,6 +7579,45 @@ mod tests {
                 &ed25519_dalek::Signature::from_bytes(&signature),
             )
             .unwrap();
+        let verified = dispatch(
+            &mut conn,
+            "inventory.verifyAct",
+            &json!({"document":act}),
+            Some(users[0]),
+        )
+        .unwrap();
+        assert_eq!(verified["verdict"], "verified");
+        assert_eq!(verified["localMatch"], true);
+
+        let mut tampered = act.clone();
+        tampered["act"]["number"] = json!("ИНВ-ПОДМЕНА");
+        let rejected = dispatch(
+            &mut conn,
+            "inventory.verifyAct",
+            &json!({"document":tampered}),
+            Some(users[0]),
+        )
+        .unwrap();
+        assert_eq!(rejected["verdict"], "invalid");
+
+        let foreign_key = ed25519_dalek::SigningKey::from_bytes(&[42_u8; 32]);
+        let mut untrusted = act.clone();
+        untrusted["publicKey"] = json!(B64.encode(foreign_key.verifying_key().as_bytes()));
+        untrusted["signature"] = json!(B64.encode(
+            foreign_key
+                .sign(format!("everyday/inventory-act/v1\n{expected_hash}").as_bytes())
+                .to_bytes()
+        ));
+        let warning = dispatch(
+            &mut conn,
+            "inventory.verifyAct",
+            &json!({"document":untrusted}),
+            Some(users[0]),
+        )
+        .unwrap();
+        assert_eq!(warning["cryptographicValid"], true);
+        assert_eq!(warning["trustedKey"], false);
+        assert_eq!(warning["verdict"], "untrusted_key");
         dispatch(
             &mut conn,
             "transfers.take",
@@ -7389,6 +7625,57 @@ mod tests {
             Some(users[0]),
         )
         .unwrap();
+        conn.execute(
+            "UPDATE inventory_sessions SET status='in_progress',completed_at=NULL WHERE id=?1",
+            [session["id"].as_i64().unwrap()],
+        )
+        .unwrap();
+        let partial = dispatch(
+            &mut conn,
+            "inventory.verifyAct",
+            &json!({"document":act}),
+            Some(users[0]),
+        )
+        .unwrap();
+        assert_eq!(partial["verdict"], "history_missing");
+        assert_eq!(partial["localSession"], true);
+        conn.execute(
+            "DELETE FROM inventory_sessions WHERE id=?1",
+            [session["id"].as_i64().unwrap()],
+        )
+        .unwrap();
+        let missing = dispatch(
+            &mut conn,
+            "inventory.verifyAct",
+            &json!({"document":act}),
+            Some(users[0]),
+        )
+        .unwrap();
+        assert_eq!(missing["verdict"], "history_missing");
+        assert!(missing["missingRecords"].as_u64().unwrap() > 0);
+
+        let mut foreign = act.clone();
+        foreign["act"]["workspaceGuid"] = json!(Uuid::new_v4().to_string());
+        let foreign_canonical = serde_json::to_vec(&foreign["act"]).unwrap();
+        let foreign_hash = format!("{:x}", Sha256::digest(&foreign_canonical));
+        let node_key = ledger::signing_key(&conn).unwrap();
+        foreign["canonical"] = json!(B64.encode(foreign_canonical));
+        foreign["hash"] = json!(foreign_hash);
+        foreign["signature"] = json!(B64.encode(
+            node_key
+                .sign(format!("everyday/inventory-act/v1\n{foreign_hash}").as_bytes())
+                .to_bytes()
+        ));
+        let isolated = dispatch(
+            &mut conn,
+            "inventory.verifyAct",
+            &json!({"document":foreign}),
+            Some(users[0]),
+        )
+        .unwrap();
+        assert_eq!(isolated["cryptographicValid"], true);
+        assert_eq!(isolated["verdict"], "foreign_organization");
+        assert_eq!(isolated["workspaceKnown"], false);
         cleanup(conn, path);
     }
 
