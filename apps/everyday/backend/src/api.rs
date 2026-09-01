@@ -2588,6 +2588,25 @@ fn take_one(
     })
 }
 
+fn ensure_item_not_inventory_locked(conn: &Connection, item_id: i64) -> Result<(), ApiError> {
+    let lock: Option<String> = conn
+        .query_row(
+            "SELECT s.number FROM inventory_sessions s
+         JOIN inventory_results r ON r.session_id=s.id
+         WHERE r.item_id=?1 AND s.status='in_progress' AND s.block_transfers=1
+         ORDER BY s.id LIMIT 1",
+            [item_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(number) = lock {
+        return Err(ApiError::conflict(format!(
+            "Передачи заблокированы инвентаризацией {number}"
+        )));
+    }
+    Ok(())
+}
+
 fn take_one_atomic(
     conn: &Connection,
     uid: i64,
@@ -2597,6 +2616,7 @@ fn take_one_atomic(
     photo_url: Option<&str>,
     qty: Option<f64>,
 ) -> ApiResult {
+    ensure_item_not_inventory_locked(conn, item_id)?;
     let item_ws = require_item_access(conn, uid, item_id)?;
     require_can_in_workspace(conn, uid, item_ws, "transferItems")?;
     let stored_photo = photo_url
@@ -2895,6 +2915,7 @@ fn transfers_return(conn: &mut Connection, input: &Value, user_id: Option<i64>) 
 fn transfers_return_atomic(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
     let uid = require_user(conn, user_id)?;
     let id = i64v(input, "itemId").ok_or_else(|| ApiError::bad("itemId"))?;
+    ensure_item_not_inventory_locked(conn, id)?;
     let item = jsn::item_json(conn, id, false)
         .ok_or_else(|| ApiError::not_found("Инструмент не найден"))?;
     if item["quantitative"].as_bool().unwrap_or(false) {
@@ -3005,6 +3026,7 @@ fn transfers_prepare(conn: &mut Connection, input: &Value, user_id: Option<i64>)
 fn transfers_prepare_atomic(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
     let uid = require_user(conn, user_id)?;
     let item_id = i64v(input, "itemId").ok_or_else(|| ApiError::bad("itemId"))?;
+    ensure_item_not_inventory_locked(conn, item_id)?;
     let to = i64v(input, "toUserId").ok_or_else(|| ApiError::bad("toUserId"))?;
     let item = jsn::item_json(conn, item_id, false)
         .ok_or_else(|| ApiError::not_found("Инструмент не найден"))?;
@@ -3146,6 +3168,7 @@ fn transfers_accept_atomic(
         let item_id = t["itemId"]
             .as_i64()
             .ok_or_else(|| ApiError::bad("В передаче нет инструмента"))?;
+        ensure_item_not_inventory_locked(conn, item_id)?;
         let item = jsn::item_json(conn, item_id, false)
             .ok_or_else(|| ApiError::not_found("Инструмент не найден"))?;
         if item["quantitative"].as_bool().unwrap_or(false) {
@@ -3561,7 +3584,7 @@ fn inv_sessions(conn: &Connection, input: &Value) -> ApiResult {
 
 fn inv_session_full(conn: &Connection, id: i64) -> Option<Value> {
     conn.query_row(
-        "SELECT id, number, workspace_id, status, started_by, created_at, completed_at FROM inventory_sessions WHERE id=?1",
+        "SELECT id,number,workspace_id,status,started_by,created_at,completed_at,scope_type,scope_ref_id,block_transfers FROM inventory_sessions WHERE id=?1",
         params![id],
         |r| {
             let mut results = Vec::new();
@@ -3579,6 +3602,7 @@ fn inv_session_full(conn: &Connection, id: i64) -> Option<Value> {
                 "id": r.get::<_, i64>(0)?, "number": r.get::<_, String>(1)?, "workspaceId": r.get::<_, i64>(2)?,
                 "status": r.get::<_, String>(3)?, "startedBy": r.get::<_, i64>(4)?,
                 "createdAt": r.get::<_, String>(5)?, "completedAt": r.get::<_, Option<String>>(6)?,
+                "scopeType":r.get::<_,String>(7)?,"scopeRefId":r.get::<_,Option<i64>>(8)?,"blockTransfers":r.get::<_,bool>(9)?,
                 "starter": jsn::user_public(conn, r.get(4)?),
                 "results": results
             }))
@@ -3712,19 +3736,69 @@ fn inv_create_atomic(conn: &Connection, input: &Value, user_id: Option<i64>) -> 
         |r| r.get(0),
     )?;
     let number = format!("ИНВ-{:03}", n + 1);
-    conn.execute("INSERT INTO inventory_sessions (guid,number, workspace_id, started_by, created_at) VALUES (?1,?2,?3,?4,?5)", params![Uuid::new_v4().to_string(),number, ws, uid, now()])?;
-    let sid = conn.last_insert_rowid();
-    let mut sql = String::from(
-        "SELECT id, quantity, quantitative FROM items WHERE workspace_id=?1 AND archived=0",
-    );
-    if let Some(st) = i64v(input, "storageId") {
-        sql.push_str(&format!(" AND storage_id={st}"));
+    let storage_id = i64v(input, "storageId");
+    let site_id = i64v(input, "buildingSiteId");
+    if storage_id.is_some() && site_id.is_some() {
+        return Err(ApiError::bad("Выберите только одну область сверки"));
     }
-    let mut stmt = conn.prepare(&sql)?;
-    let rows: Vec<(i64, Option<f64>, i64)> = stmt
-        .query_map(params![ws], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
-        .filter_map(|x| x.ok())
-        .collect();
+    let (scope_type, scope_ref_id) = if let Some(id) = storage_id {
+        let valid: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM storages WHERE id=?1 AND workspace_id=?2",
+            params![id, ws],
+            |row| row.get(0),
+        )?;
+        if valid == 0 {
+            return Err(ApiError::bad("Склад не относится к организации"));
+        }
+        ("storage", Some(id))
+    } else if let Some(id) = site_id {
+        let valid: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM building_sites WHERE id=?1 AND workspace_id=?2",
+            params![id, ws],
+            |row| row.get(0),
+        )?;
+        if valid == 0 {
+            return Err(ApiError::bad("Объект не относится к организации"));
+        }
+        ("site", Some(id))
+    } else {
+        ("all", None)
+    };
+    let block_transfers = b(input, "blockTransfers").unwrap_or(false);
+    let scope_ref_guid = match (scope_type, scope_ref_id) {
+        ("storage", Some(id)) => ledger::guid(conn, "storages", id).ok(),
+        ("site", Some(id)) => ledger::guid(conn, "building_sites", id).ok(),
+        _ => None,
+    };
+    conn.execute("INSERT INTO inventory_sessions (guid,number,workspace_id,started_by,created_at,scope_type,scope_ref_id,block_transfers) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)", params![Uuid::new_v4().to_string(),number,ws,uid,now(),scope_type,scope_ref_id,block_transfers])?;
+    let sid = conn.last_insert_rowid();
+    let rows: Vec<(i64, Option<f64>, i64)> = {
+        let (column, scoped) = match scope_type {
+            "storage" => ("storage_id", true),
+            "site" => ("building_site_id", true),
+            _ => ("id", false),
+        };
+        let sql = if scoped {
+            format!("SELECT id,quantity,quantitative FROM items WHERE workspace_id=?1 AND archived=0 AND {column}=?2")
+        } else {
+            "SELECT id,quantity,quantitative FROM items WHERE workspace_id=?1 AND archived=0"
+                .to_string()
+        };
+        let mut statement = conn.prepare(&sql)?;
+        if scoped {
+            statement
+                .query_map(params![ws, scope_ref_id], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })?
+                .flatten()
+                .collect()
+        } else {
+            statement
+                .query_map([ws], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+                .flatten()
+                .collect()
+        }
+    };
     for (id, qty, qnt) in rows {
         let exp = if qnt != 0 { qty.unwrap_or(0.0) } else { 1.0 };
         conn.execute("INSERT INTO inventory_results (session_id, item_id, expected_qty, checked) VALUES (?1,?2,?3,0)", params![sid, id, exp])?;
@@ -3737,7 +3811,7 @@ fn inv_create_atomic(conn: &Connection, input: &Value, user_id: Option<i64>) -> 
         uid,
         "create",
         None,
-        json!({"number":number,"results":results}),
+        json!({"number":number,"scopeType":scope_type,"scopeRefGuid":scope_ref_guid,"blockTransfers":block_transfers,"results":results}),
     )?;
     let mut session = session;
     session["recordHash"] = proof["recordHash"].clone();
@@ -7127,6 +7201,89 @@ mod tests {
             )
             .unwrap();
         assert_eq!(events, 1);
+        cleanup(conn, path);
+    }
+
+    #[test]
+    fn site_inventory_scopes_items_and_enforces_transfer_lock_until_completion() {
+        let (mut conn, path, users, ws) = test_db();
+        conn.execute(
+            "INSERT INTO building_sites(name,workspace_id,guid) VALUES('Корпус А',?1,'site-a')",
+            [ws],
+        )
+        .unwrap();
+        let site_a = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO building_sites(name,workspace_id,guid) VALUES('Корпус Б',?1,'site-b')",
+            [ws],
+        )
+        .unwrap();
+        let site_b = conn.last_insert_rowid();
+        let in_scope = insert_item(&conn, ws, None, false, None);
+        let outside = insert_item(&conn, ws, None, false, None);
+        conn.execute(
+            "UPDATE items SET building_site_id=?1 WHERE id=?2",
+            params![site_a, in_scope],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE items SET building_site_id=?1 WHERE id=?2",
+            params![site_b, outside],
+        )
+        .unwrap();
+
+        let session = dispatch(
+            &mut conn,
+            "inventory.create",
+            &json!({"workspaceId":ws,"buildingSiteId":site_a,"blockTransfers":true}),
+            Some(users[0]),
+        )
+        .unwrap();
+        assert_eq!(session["scopeType"], "site");
+        assert_eq!(session["scopeRefId"], site_a);
+        assert_eq!(session["results"].as_array().unwrap().len(), 1);
+        assert_eq!(session["results"][0]["itemId"], in_scope);
+        let signed_fields: Value = serde_json::from_str(
+            &conn.query_row(
+                "SELECT fields_json FROM inventory_records WHERE session_guid=(SELECT guid FROM inventory_sessions WHERE id=?1) AND kind='create'",
+                [session["id"].as_i64().unwrap()],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(signed_fields["scopeRefGuid"], "site-a");
+        assert_eq!(signed_fields["blockTransfers"], true);
+
+        let blocked = dispatch(
+            &mut conn,
+            "transfers.take",
+            &json!({"itemId":in_scope}),
+            Some(users[0]),
+        )
+        .unwrap_err();
+        assert_eq!(blocked.http, 409);
+        dispatch(
+            &mut conn,
+            "transfers.take",
+            &json!({"itemId":outside}),
+            Some(users[0]),
+        )
+        .unwrap();
+        dispatch(
+            &mut conn,
+            "inventory.complete",
+            &json!({"sessionId":session["id"]}),
+            Some(users[0]),
+        )
+        .unwrap();
+        dispatch(
+            &mut conn,
+            "transfers.take",
+            &json!({"itemId":in_scope}),
+            Some(users[0]),
+        )
+        .unwrap();
         cleanup(conn, path);
     }
 

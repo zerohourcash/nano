@@ -351,11 +351,15 @@ function CreateSessionModal({
   const utils = trpc.useUtils()
   const [scope, setScope] = useState<ScopeKey>('all')
   const [storageId, setStorageId] = useState<number | null>(null)
+  const [siteId, setSiteId] = useState<number | null>(null)
   const [blockTransfers, setBlockTransfers] = useState(false)
 
   const meQ = trpc.meta.currentUser.useQuery(undefined, { enabled: open })
   const storagesQ = trpc.admin.storages.list.useQuery(undefined, {
     enabled: open && scope === 'storage',
+  })
+  const sitesQ = trpc.admin.buildingSites.list.useQuery(undefined, {
+    enabled: open && scope === 'site',
   })
 
   const create = trpc.inventory.create.useMutation({
@@ -380,8 +384,11 @@ function CreateSessionModal({
   }, [open, onClose])
 
   const submit = () => {
-    if (scope === 'storage' && storageId) create.mutate({ storageId })
-    else create.mutate({})
+    create.mutate({
+      ...(scope === 'storage' && storageId ? { storageId } : {}),
+      ...(scope === 'site' && siteId ? { buildingSiteId: siteId } : {}),
+      blockTransfers,
+    })
   }
 
   return (
@@ -485,10 +492,14 @@ function CreateSessionModal({
                 )}
 
                 {scope === 'site' && (
-                  <div className="mt-2 flex items-start gap-2 rounded-xl bg-info-bg border-l-[3px] border-teal px-3 py-2.5 text-sm text-ink-900">
-                    <ClipboardCheck size={16} className="mt-0.5 shrink-0 text-teal-dark" />
-                    В демо-версии сверка по объекту охватывает все позиции пространства.
-                  </div>
+                  <select
+                    value={siteId ?? ''}
+                    onChange={(event) => setSiteId(event.target.value ? Number(event.target.value) : null)}
+                    className="mt-2 h-11 w-full rounded-xl border border-brand-100 bg-surface px-4 text-sm text-ink-900 focus:border-brand-600 focus:ring-[3px] focus:ring-[#5E629B22]"
+                  >
+                    <option value="" disabled>{sitesQ.isLoading ? 'Загрузка объектов…' : 'Выберите объект'}</option>
+                    {(sitesQ.data ?? []).map((site) => <option key={site.id} value={site.id}>{site.name}</option>)}
+                  </select>
                 )}
               </div>
 
@@ -521,11 +532,7 @@ function CreateSessionModal({
                 </span>
                 <span className="text-sm leading-5 text-ink-900">
                   Блокировать передачи в области сверки до завершения
-                  {blockTransfers && (
-                    <span className="block text-xs text-ink-300">
-                      В демо-версии блокировка не применяется
-                    </span>
-                  )}
+                  {blockTransfers && <span className="block text-xs text-ink-300">Выдача, возврат и передача будут отклоняться до завершения</span>}
                 </span>
               </label>
             </div>
@@ -541,7 +548,7 @@ function CreateSessionModal({
               <button
                 type="button"
                 onClick={submit}
-                disabled={create.isPending || (scope === 'storage' && !storageId)}
+                disabled={create.isPending || (scope === 'storage' && !storageId) || (scope === 'site' && !siteId)}
                 className="inline-flex h-10 items-center gap-2 rounded-xl bg-accent px-5 text-sm font-semibold text-white transition-all hover:bg-accent-hover active:scale-[0.97] disabled:opacity-50"
               >
                 {create.isPending && <Loader2 size={16} className="animate-spin" />}

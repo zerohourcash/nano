@@ -159,6 +159,18 @@ fn migrate(conn: &Connection) -> Result<()> {
         [],
     );
     let _ = conn.execute("ALTER TABLE inventory_sessions ADD COLUMN guid TEXT", []);
+    let _ = conn.execute(
+        "ALTER TABLE inventory_sessions ADD COLUMN scope_type TEXT NOT NULL DEFAULT 'all'",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE inventory_sessions ADD COLUMN scope_ref_id INTEGER",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE inventory_sessions ADD COLUMN block_transfers INTEGER NOT NULL DEFAULT 0",
+        [],
+    );
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS content_blobs (
            hash TEXT PRIMARY KEY, mime TEXT NOT NULL, size INTEGER NOT NULL,
@@ -914,7 +926,10 @@ fn init_schema(conn: &Connection) -> Result<()> {
           status TEXT NOT NULL DEFAULT 'in_progress',
           started_by INTEGER NOT NULL,
           created_at TEXT NOT NULL,
-          completed_at TEXT
+          completed_at TEXT,
+          scope_type TEXT NOT NULL DEFAULT 'all',
+          scope_ref_id INTEGER,
+          block_transfers INTEGER NOT NULL DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS inventory_results (
           id INTEGER PRIMARY KEY AUTOINCREMENT,

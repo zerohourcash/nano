@@ -5285,10 +5285,26 @@ fn rebuild_inventory_state(conn: &Connection) -> anyhow::Result<()> {
             .get("number")
             .and_then(Value::as_str)
             .unwrap_or("ИНВ-OFFLINE");
+        let scope_type = fields
+            .get("scopeType")
+            .and_then(Value::as_str)
+            .unwrap_or("all");
+        let scope_ref_id = fields
+            .get("scopeRefGuid")
+            .and_then(Value::as_str)
+            .and_then(|guid| match scope_type {
+                "storage" => id_by_guid(conn, "storages", guid),
+                "site" => id_by_guid(conn, "building_sites", guid),
+                _ => None,
+            });
+        let block_transfers = fields
+            .get("blockTransfers")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         conn.execute("INSERT OR IGNORE INTO inventory_sessions(guid,number,workspace_id,status,started_by,created_at) VALUES(?1,?2,?3,'in_progress',?4,?5)",params![session_guid,number,ws,actor,created_at])?;
         conn.execute(
-            "UPDATE inventory_sessions SET number=?1,workspace_id=?2,started_by=?3 WHERE guid=?4",
-            params![number, ws, actor, session_guid],
+            "UPDATE inventory_sessions SET number=?1,workspace_id=?2,started_by=?3,scope_type=?4,scope_ref_id=?5,block_transfers=?6 WHERE guid=?7",
+            params![number,ws,actor,scope_type,scope_ref_id,block_transfers,session_guid],
         )?;
         let sid = id_by_guid(conn, "inventory_sessions", &session_guid)
             .ok_or_else(|| anyhow::anyhow!("inventory session unavailable"))?;
@@ -8782,7 +8798,7 @@ mod tests {
         )
         .unwrap();
         let item=crate::api::dispatch(&mut source,"items.create",&json!({"workspaceId":workspace,"title":"Cable","internalId":"I-0001","quantitative":true,"quantity":10,"unit":"pcs"}),Some(owner)).unwrap();
-        let create_input = json!({"workspaceId":workspace});
+        let create_input = json!({"workspaceId":workspace,"blockTransfers":true});
         crate::device::set_pending(
             &source,
             owner,
@@ -8840,8 +8856,8 @@ mod tests {
         assert_eq!(valid["inventoryRecords"].as_array().unwrap().len(), 3);
         let accepted = apply_remote_journal(&target, &valid, "");
         assert_eq!(accepted["ok"], true, "{accepted}");
-        let restored:(String,f64,bool)=target.query_row("SELECT s.status,r.actual_qty,r.checked!=0 FROM inventory_sessions s JOIN inventory_results r ON r.session_id=s.id",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
-        assert_eq!(restored, ("completed".into(), 7.0, true));
+        let restored:(String,f64,bool,bool)=target.query_row("SELECT s.status,r.actual_qty,r.checked!=0,s.block_transfers!=0 FROM inventory_sessions s JOIN inventory_results r ON r.session_id=s.id",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap();
+        assert_eq!(restored, ("completed".into(), 7.0, true, true));
         assert_eq!(verify_stored_inventory_records(&target).unwrap(), 3);
         let mut forged = valid.clone();
         forged["inventoryRecords"][1]["fields"]["actualQty"] = json!(99);

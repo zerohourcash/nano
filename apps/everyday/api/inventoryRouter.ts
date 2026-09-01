@@ -43,12 +43,14 @@ export const inventoryRouter = createRouter({
       z.object({
         workspaceId: z.number().int().positive().optional(),
         storageId: z.number().int().positive().optional(),
+        buildingSiteId: z.number().int().positive().optional(),
+        blockTransfers: z.boolean().optional(),
       }),
     )
     .mutation(async ({ ctx, input }) => {
       const me = await requireMe(ctx);
       const workspaceId = input.workspaceId ?? (await getDefaultWorkspaceId());
-      return createInventorySession({ workspaceId, startedBy: me.id, storageId: input.storageId });
+      return createInventorySession({ workspaceId, startedBy: me.id, storageId: input.storageId, buildingSiteId: input.buildingSiteId });
     }),
 
   checkItem: publicQuery

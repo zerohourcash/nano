@@ -231,13 +231,26 @@ test('browser signs a real custody transaction and ledger retains its proof', as
   expect(qrEvent?.requestDeviceId).toBeTruthy();
   expect(qrEvent?.requestHash).toMatch(/^[a-f0-9]{64}$/);
 
-  const inventory = await trpc<{ id: number; number: string }>(
-    page,
-    'inventory.create',
-    { workspaceId: workspaces[0].id }
-  );
+  const inventorySite = await trpc<{ id: number }>(page, 'admin.buildingSites.create', {
+    workspaceId: workspaces[0].id,
+    name: 'Корпус QR E2E',
+  });
+  await trpc(page, 'items.update', { id: qrItem.id, buildingSiteId: inventorySite.id });
   await page.goto('/inventory');
-  await page.getByText(inventory.number, { exact: true }).click();
+  await page.getByRole('button', { name: 'Новая инвентаризация' }).first().click();
+  await page.getByRole('button', { name: 'Объект', exact: true }).click();
+  await page.locator('select').filter({ has: page.locator(`option[value="${inventorySite.id}"]`) }).selectOption(String(inventorySite.id));
+  await page.getByText('Блокировать передачи в области сверки до завершения').click();
+  await page.getByRole('button', { name: 'Начать сверку' }).click();
+  await expect(page.getByText('Инвентаризация ИНВ-001 начата')).toBeVisible();
+  const inventories = await trpc<Array<{ id: number; number: string }>>(
+    page, 'inventory.sessions', { workspaceId: workspaces[0].id }, false
+  );
+  const inventory = inventories.find(session => session.number === 'ИНВ-001');
+  expect(inventory).toBeTruthy();
+  await expect(
+    trpc(page, 'transfers.returnItem', { itemId: qrItem.id })
+  ).rejects.toThrow(/заблокированы инвентаризацией/);
   await page.getByRole('button', { name: 'Сканировать QR' }).first().click();
   const inventoryScanner = page.getByTestId('inventory-qr-scanner');
   await expect(inventoryScanner).toBeVisible();
@@ -254,7 +267,7 @@ test('browser signs a real custody transaction and ledger retains its proof', as
   await inventoryScanner.getByRole('button', { name: 'Закрыть сканер' }).click();
   const inventoryAfterScan = await trpc<{
     results: Array<{ itemId: number; checked: boolean; actualQty: number | null }>;
-  }>(page, 'inventory.byId', { id: inventory.id }, false);
+  }>(page, 'inventory.byId', { id: inventory!.id }, false);
   expect(inventoryAfterScan.results.find(result => result.itemId === qrItem.id)).toMatchObject({
     checked: true,
     actualQty: 1,
@@ -270,6 +283,9 @@ test('browser signs a real custody transaction and ledger retains its proof', as
     requestDeviceId: expect.any(String),
     requestHash: expect.stringMatching(/^[a-f0-9]{64}$/),
   });
+  await page.getByRole('button', { name: 'Завершить сверку' }).click();
+  await expect(page.getByText('Итоги инвентаризации')).toBeVisible();
+  await trpc(page, 'transfers.returnItem', { itemId: qrItem.id });
 
   await page.goto('/knowledge');
   await expect(
