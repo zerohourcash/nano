@@ -3521,6 +3521,9 @@ pub fn apply_remote_journal(conn: &Connection, journal: &Value, peer_url: &str) 
     if let Err(error) = verify_writeoff_records(journal) {
         return json!({"ok":false,"error":format!("Проверка списаний: {error}")});
     }
+    if let Err(error) = verify_stock_operation_records(journal) {
+        return json!({"ok":false,"error":format!("Проверка складских операций: {error}")});
+    }
     if let Err(error) = verify_photo_records(conn, journal) {
         return json!({"ok":false,"error":format!("Проверка фото-летописи: {error}")});
     }
@@ -3622,6 +3625,10 @@ pub fn apply_remote_journal(conn: &Connection, journal: &Value, peer_url: &str) 
     if let Err(error) = verify_writeoff_records(&export_journal(conn)) {
         let _ = conn.execute_batch("ROLLBACK TO verified_sync; RELEASE verified_sync");
         return json!({"ok":false,"error":format!("Проверка сохранённых списаний: {error}")});
+    }
+    if let Err(error) = verify_stock_operation_records(&export_journal(conn)) {
+        let _ = conn.execute_batch("ROLLBACK TO verified_sync; RELEASE verified_sync");
+        return json!({"ok":false,"error":format!("Проверка сохранённых складских операций: {error}")});
     }
     if let Err(error) = verify_photo_records(conn, &export_journal(conn)) {
         let _ = conn.execute_batch("ROLLBACK TO verified_sync; RELEASE verified_sync");
@@ -4994,6 +5001,117 @@ fn verify_writeoff_records(journal: &Value) -> anyhow::Result<(usize, usize)> {
             })
         {
             anyhow::bail!("writeoff photo is not CAS-backed")
+        }
+        verified += 1;
+    }
+    Ok((verified, legacy))
+}
+
+fn stock_operation_commitment(
+    event: &Value,
+    kind: &str,
+    storage_guid: Option<&str>,
+    site_guid: Option<&str>,
+) -> anyhow::Result<String> {
+    let required = |field: &str| {
+        event
+            .get(field)
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("stock operation has no {field}"))
+    };
+    let payload = json!({
+        "domain":"everyday/stock-operation/v1",
+        "kind":kind,
+        "operationGuid":required("fromLabel")?,
+        "workspaceGuid":required("workspaceGuid")?,
+        "itemGuid":required("itemGuid")?,
+        "actorGuid":required("actorGuid")?,
+        "quantityDelta":event.get("quantityDelta").filter(|value| !value.is_null()),
+        "comment":event.get("comment").filter(|value| !value.is_null()),
+        "storageGuid":storage_guid,
+        "buildingSiteGuid":site_guid,
+    });
+    Ok(hex::encode(Sha256::digest(serde_json::to_vec(&payload)?)))
+}
+
+fn verify_stock_operation_records(journal: &Value) -> anyhow::Result<(usize, usize)> {
+    let mut verified = 0;
+    let mut legacy = 0;
+    for event in journal
+        .get("history")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|event| {
+            matches!(
+                event.get("type").and_then(Value::as_str),
+                Some("replenish" | "move")
+            )
+        })
+    {
+        let kind = event
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let expected_path = format!("/api/trpc/history.{kind}");
+        if event.get("eventVersion").and_then(Value::as_i64) != Some(3)
+            || event.get("requestPath").and_then(Value::as_str) != Some(expected_path.as_str())
+            || event.get("requestBody").and_then(Value::as_str).is_none()
+        {
+            legacy += 1;
+            continue;
+        }
+        let body = event["requestBody"].as_str().unwrap_or_default();
+        if event.get("requestHash").and_then(Value::as_str)
+            != Some(hex::encode(Sha256::digest(body.as_bytes())).as_str())
+        {
+            anyhow::bail!("stock operation request body hash mismatch")
+        }
+        let envelope: Value = serde_json::from_str(body)?;
+        let input = trpc_request_input(&envelope)?;
+        for field in ["operationGuid", "workspaceGuid", "itemGuid"] {
+            let event_field = if field == "operationGuid" {
+                "fromLabel"
+            } else {
+                field
+            };
+            if input.get(field).and_then(Value::as_str)
+                != event.get(event_field).and_then(Value::as_str)
+            {
+                anyhow::bail!("stock operation differs from signed user intent")
+            }
+        }
+        let input_comment = input.get("comment").filter(|value| !value.is_null());
+        let event_comment = event.get("comment").filter(|value| !value.is_null());
+        if input_comment != event_comment {
+            anyhow::bail!("stock operation comment differs from signed user intent")
+        }
+        let (storage_guid, site_guid) = if kind == "replenish" {
+            let quantity = input.get("quantity").and_then(Value::as_f64).unwrap_or(0.0);
+            let delta = event
+                .get("quantityDelta")
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0);
+            if !quantity.is_finite() || quantity <= 0.0 || (quantity - delta).abs() > 1e-9 {
+                anyhow::bail!("replenishment quantity differs from signed user intent")
+            }
+            (None, None)
+        } else {
+            if event
+                .get("quantityDelta")
+                .is_some_and(|value| !value.is_null())
+            {
+                anyhow::bail!("move unexpectedly changes quantity")
+            }
+            (
+                input.get("toStorageGuid").and_then(Value::as_str),
+                input.get("toBuildingSiteGuid").and_then(Value::as_str),
+            )
+        };
+        let commitment = stock_operation_commitment(event, kind, storage_guid, site_guid)?;
+        if event.get("toLabel").and_then(Value::as_str) != Some(commitment.as_str()) {
+            anyhow::bail!("stock operation commitment does not match ledger")
         }
         verified += 1;
     }
@@ -7015,6 +7133,7 @@ pub fn integrity_audit(conn: &Connection) -> Value {
     let organization_node_result = verify_stored_organization_node_versions(conn);
     let inventory_result = verify_stored_inventory_records(conn);
     let writeoff_result = verify_writeoff_records(&snapshot);
+    let stock_operation_result = verify_stock_operation_records(&snapshot);
     let photo_result = verify_photo_records(conn, &snapshot);
     let document_result = verify_document_records(conn, &snapshot);
     let knowledge_intent_result = verify_knowledge_records(conn, &snapshot);
@@ -7118,6 +7237,10 @@ pub fn integrity_audit(conn: &Connection) -> Value {
         .map(ToString::to_string);
     let inventory_error = inventory_result.as_ref().err().map(ToString::to_string);
     let writeoff_error = writeoff_result.as_ref().err().map(ToString::to_string);
+    let stock_operation_error = stock_operation_result
+        .as_ref()
+        .err()
+        .map(ToString::to_string);
     let photo_error = photo_result.as_ref().err().map(ToString::to_string);
     let document_error = document_result.as_ref().err().map(ToString::to_string);
     let knowledge_intent_error = knowledge_intent_result
@@ -7152,6 +7275,7 @@ pub fn integrity_audit(conn: &Connection) -> Value {
         && organization_node_result.is_ok()
         && inventory_result.is_ok()
         && writeoff_result.is_ok()
+        && stock_operation_result.is_ok()
         && photo_result.is_ok()
         && document_result.is_ok()
         && knowledge_intent_result.is_ok()
@@ -7301,6 +7425,26 @@ pub fn integrity_audit(conn: &Connection) -> Value {
         object.insert(
             "writeoffError".into(),
             writeoff_error.map(Value::String).unwrap_or(Value::Null),
+        );
+        object.insert(
+            "stockOperationsVerified".into(),
+            json!(stock_operation_result
+                .as_ref()
+                .map(|value| value.0)
+                .unwrap_or(0)),
+        );
+        object.insert(
+            "stockOperationsLegacy".into(),
+            json!(stock_operation_result
+                .as_ref()
+                .map(|value| value.1)
+                .unwrap_or(0)),
+        );
+        object.insert(
+            "stockOperationError".into(),
+            stock_operation_error
+                .map(Value::String)
+                .unwrap_or(Value::Null),
         );
         object.insert(
             "photoError".into(),
@@ -9168,6 +9312,52 @@ mod tests {
             &json!([{"workspaceGuid":"ws","publicKey":"key-a","head":"unknown"}]),
         );
         assert_eq!(divergent, original);
+    }
+
+    #[test]
+    fn stock_operation_intent_rejects_quantity_and_destination_rewrites() {
+        let body = json!({"0":{"json":{
+            "operationGuid":"op-1","workspaceGuid":"ws-1","itemGuid":"item-1",
+            "quantity":4.0,"comment":"delivery"
+        }}})
+        .to_string();
+        let mut replenish = json!({
+            "type":"replenish","eventVersion":3,
+            "requestPath":"/api/trpc/history.replenish","requestBody":body,
+            "requestHash":hex::encode(Sha256::digest(body.as_bytes())),
+            "fromLabel":"op-1","workspaceGuid":"ws-1","itemGuid":"item-1",
+            "actorGuid":"actor-1","quantityDelta":4.0,"comment":"delivery"
+        });
+        replenish["toLabel"] =
+            json!(stock_operation_commitment(&replenish, "replenish", None, None).unwrap());
+        assert_eq!(
+            verify_stock_operation_records(&json!({"history":[replenish.clone()]})).unwrap(),
+            (1, 0)
+        );
+        replenish["quantityDelta"] = json!(40.0);
+        assert!(verify_stock_operation_records(&json!({"history":[replenish]})).is_err());
+
+        let move_body = json!({"0":{"json":{
+            "operationGuid":"op-2","workspaceGuid":"ws-1","itemGuid":"item-1",
+            "toStorageGuid":"storage-a","toBuildingSiteGuid":null
+        }}})
+        .to_string();
+        let mut movement = json!({
+            "type":"move","eventVersion":3,"requestPath":"/api/trpc/history.move",
+            "requestBody":move_body,
+            "requestHash":hex::encode(Sha256::digest(move_body.as_bytes())),
+            "fromLabel":"op-2","workspaceGuid":"ws-1","itemGuid":"item-1",
+            "actorGuid":"actor-1","quantityDelta":null,"comment":null
+        });
+        movement["toLabel"] =
+            json!(stock_operation_commitment(&movement, "move", Some("storage-a"), None).unwrap());
+        assert_eq!(
+            verify_stock_operation_records(&json!({"history":[movement.clone()]})).unwrap(),
+            (1, 0)
+        );
+        movement["toLabel"] =
+            json!(stock_operation_commitment(&movement, "move", Some("storage-b"), None).unwrap());
+        assert!(verify_stock_operation_records(&json!({"history":[movement]})).is_err());
     }
 
     #[test]

@@ -429,6 +429,7 @@ export default function OfflineNodesSection() {
               <div>Версий структуры: <b>{auditQ.data?.organizationNodeVersionsVerified ?? 0}</b></div>
               <div>Фактов инвентаризации: <b>{auditQ.data?.inventoryRecordsVerified ?? 0}</b></div>
               <div>Проверенных списаний: <b>{auditQ.data?.writeoffsVerified ?? 0}</b></div>
+              <div>Проверенных складских операций: <b>{auditQ.data?.stockOperationsVerified ?? 0}</b></div>
               <div>Legacy списаний: <b>{auditQ.data?.writeoffsLegacy ?? 0}</b></div>
               <div>Bit user-intent V3: <b>{auditQ.data?.accountingIntentsVerified ?? 0}</b></div>
               <div>Legacy Bit-проводок: <b>{auditQ.data?.accountingIntentsLegacy ?? 0}</b></div>
@@ -441,9 +442,9 @@ export default function OfflineNodesSection() {
               <div>Legacy межорг. транзакций: <b>{auditQ.data?.interorgInboxLegacy ?? 0}</b></div>
               <div>Недокачанных файлов: <b>{auditQ.data?.missingBlobs ?? 0}</b></div>
             </div>
-            {(auditQ.data?.ledgerError || auditQ.data?.chatError || auditQ.data?.deviceError || auditQ.data?.custodyError || auditQ.data?.itemTombstoneError || auditQ.data?.itemCommentError || auditQ.data?.faultError || auditQ.data?.changeRequestError || auditQ.data?.configError || auditQ.data?.itemStateError || auditQ.data?.organizationNodeError || auditQ.data?.inventoryError || auditQ.data?.writeoffError || auditQ.data?.membershipError || auditQ.data?.accountingError || auditQ.data?.knowledgeError || auditQ.data?.interorgInboxError || auditQ.data?.interorgReceiptError || auditQ.data?.snapshotError) && (
+            {(auditQ.data?.ledgerError || auditQ.data?.chatError || auditQ.data?.deviceError || auditQ.data?.custodyError || auditQ.data?.itemTombstoneError || auditQ.data?.itemCommentError || auditQ.data?.faultError || auditQ.data?.changeRequestError || auditQ.data?.configError || auditQ.data?.itemStateError || auditQ.data?.organizationNodeError || auditQ.data?.inventoryError || auditQ.data?.writeoffError || auditQ.data?.stockOperationError || auditQ.data?.membershipError || auditQ.data?.accountingError || auditQ.data?.knowledgeError || auditQ.data?.interorgInboxError || auditQ.data?.interorgReceiptError || auditQ.data?.snapshotError) && (
               <p className="text-sm text-danger break-all">
-                {auditQ.data.ledgerError || auditQ.data.chatError || auditQ.data.deviceError || auditQ.data.custodyError || auditQ.data.itemTombstoneError || auditQ.data.itemCommentError || auditQ.data.faultError || auditQ.data.changeRequestError || auditQ.data.configError || auditQ.data.itemStateError || auditQ.data.organizationNodeError || auditQ.data.inventoryError || auditQ.data.writeoffError || auditQ.data.membershipError || auditQ.data.accountingError || auditQ.data.knowledgeError || auditQ.data.interorgInboxError || auditQ.data.interorgReceiptError || auditQ.data.snapshotError}
+                {auditQ.data.ledgerError || auditQ.data.chatError || auditQ.data.deviceError || auditQ.data.custodyError || auditQ.data.itemTombstoneError || auditQ.data.itemCommentError || auditQ.data.faultError || auditQ.data.changeRequestError || auditQ.data.configError || auditQ.data.itemStateError || auditQ.data.organizationNodeError || auditQ.data.inventoryError || auditQ.data.writeoffError || auditQ.data.stockOperationError || auditQ.data.membershipError || auditQ.data.accountingError || auditQ.data.knowledgeError || auditQ.data.interorgInboxError || auditQ.data.interorgReceiptError || auditQ.data.snapshotError}
               </p>
             )}
             {(auditQ.data?.interorgInboxLegacy ?? 0) > 0 && (

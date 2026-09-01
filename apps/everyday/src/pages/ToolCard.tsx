@@ -740,7 +740,18 @@ function QuantityModal({
 
   const submit = async () => {
     if (isReplenish) {
-      replenish.mutate({ itemId: item.id, quantity: qty, comment: comment || undefined })
+      if (!workspace?.guid || workspace.id !== item.workspaceId || !item.guid) {
+        setUploadError('Нет глобального идентификатора организации или ТМЦ')
+        return
+      }
+      replenish.mutate({
+        itemId: item.id,
+        workspaceGuid: workspace.guid,
+        itemGuid: item.guid,
+        operationGuid,
+        quantity: qty,
+        comment: comment || undefined,
+      })
       return
     }
     setUploadError(null)

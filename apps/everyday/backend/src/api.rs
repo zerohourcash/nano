@@ -3817,13 +3817,35 @@ fn writeoff_commitment(
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
+fn stock_operation_commitment(
+    kind: &str,
+    operation_guid: &str,
+    workspace_guid: &str,
+    item_guid: &str,
+    actor_guid: &str,
+    quantity_delta: Option<f64>,
+    comment: Option<&str>,
+    storage_guid: Option<&str>,
+    building_site_guid: Option<&str>,
+) -> String {
+    let payload = json!({
+        "domain":"everyday/stock-operation/v1","kind":kind,
+        "operationGuid":operation_guid,"workspaceGuid":workspace_guid,
+        "itemGuid":item_guid,"actorGuid":actor_guid,"quantityDelta":quantity_delta,
+        "comment":comment,"storageGuid":storage_guid,"buildingSiteGuid":building_site_guid,
+    });
+    hex::encode(Sha256::digest(
+        serde_json::to_vec(&payload).expect("JSON serialization"),
+    ))
+}
+
 fn history_write_off(conn: &mut Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
     atomic(conn, |conn| history_write_off_atomic(conn, input, user_id))
 }
 
 fn history_write_off_atomic(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
     let uid = require_user(conn, user_id)?;
-    require_can(conn, uid, "writeOff")?;
     if s(input, "comment").is_none() {
         return Err(ApiError::bad("Укажите причину списания"));
     }
@@ -3833,6 +3855,7 @@ fn history_write_off_atomic(conn: &Connection, input: &Value, user_id: Option<i6
     Uuid::parse_str(&operation_guid).map_err(|_| ApiError::bad("Некорректный operationGuid"))?;
     let id = i64v(input, "itemId").ok_or_else(|| ApiError::bad("itemId"))?;
     let item_ws = require_item_access(conn, uid, id)?;
+    require_can_in_workspace(conn, uid, item_ws, "writeOff")?;
     let duplicate: i64 = conn.query_row(
         "SELECT COUNT(*) FROM history_entries
          WHERE workspace_id=?1 AND type='write_off' AND from_label=?2",
@@ -3991,31 +4014,63 @@ fn history_replenish(conn: &mut Connection, input: &Value, user_id: Option<i64>)
 
 fn history_replenish_atomic(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
     let uid = require_user(conn, user_id)?;
-    require_can(conn, uid, "replenish")?;
     let id = i64v(input, "itemId").ok_or_else(|| ApiError::bad("itemId"))?;
     let qty = f64v(input, "quantity").ok_or_else(|| ApiError::bad("quantity"))?;
     if qty <= 0.0 {
         return Err(ApiError::bad("Количество должно быть больше нуля"));
     }
-    require_item_access(conn, uid, id)?;
+    let ws = require_item_access(conn, uid, id)?;
+    require_can_in_workspace(conn, uid, ws, "replenish")?;
     let item = jsn::item_json(conn, id, false).ok_or_else(|| ApiError::not_found("нет"))?;
     if !item["quantitative"].as_bool().unwrap_or(false) {
         return Err(ApiError::bad("Инструмент не количественный"));
     }
+    let operation_guid = s(input, "operationGuid")
+        .ok_or_else(|| ApiError::bad("Для пополнения требуется operationGuid"))?;
+    Uuid::parse_str(&operation_guid).map_err(|_| ApiError::bad("Некорректный operationGuid"))?;
+    if conn.query_row(
+        "SELECT COUNT(*) FROM history_entries WHERE workspace_id=?1 AND type='replenish' AND from_label=?2",
+        params![ws, operation_guid], |row| row.get::<_, i64>(0),
+    )? != 0 {
+        return Err(ApiError::conflict("Операция пополнения уже существует"));
+    }
+    let workspace_guid = ledger::guid(conn, "workspaces", ws)
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    let item_guid =
+        ledger::guid(conn, "items", id).map_err(|error| ApiError::internal(error.to_string()))?;
+    if s(input, "workspaceGuid").as_deref() != Some(workspace_guid.as_str())
+        || s(input, "itemGuid").as_deref() != Some(item_guid.as_str())
+    {
+        return Err(ApiError::bad("GUID пополнения не соответствуют карточке"));
+    }
+    let actor_guid =
+        ledger::guid(conn, "users", uid).map_err(|error| ApiError::internal(error.to_string()))?;
+    let comment = s(input, "comment");
+    let commitment = stock_operation_commitment(
+        "replenish",
+        &operation_guid,
+        &workspace_guid,
+        &item_guid,
+        &actor_guid,
+        Some(qty),
+        comment.as_deref(),
+        None,
+        None,
+    );
     conn.execute(
         "UPDATE items SET quantity=COALESCE(quantity,0)+?1 WHERE id=?2",
         params![qty, id],
     )?;
     ledger::append(
         conn,
-        item["workspaceId"].as_i64().unwrap_or(1),
+        ws,
         uid,
         Some(id),
         "replenish",
-        None,
-        None,
+        Some(&operation_guid),
+        Some(&commitment),
         Some(qty),
-        s(input, "comment").as_deref(),
+        comment.as_deref(),
     )
     .map_err(|e| ApiError::internal(format!("Ошибка журнала: {e}")))?;
     jsn::item_json(conn, id, false).ok_or_else(|| ApiError::bad("ошибка"))
@@ -4027,28 +4082,98 @@ fn history_move(conn: &mut Connection, input: &Value, user_id: Option<i64>) -> A
 
 fn history_move_atomic(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
     let uid = require_user(conn, user_id)?;
-    require_can(conn, uid, "editItems")?;
     let id = i64v(input, "itemId").ok_or_else(|| ApiError::bad("itemId"))?;
-    require_item_access(conn, uid, id)?;
+    let ws = require_item_access(conn, uid, id)?;
+    require_can_in_workspace(conn, uid, ws, "editItems")?;
+    let operation_guid = s(input, "operationGuid")
+        .ok_or_else(|| ApiError::bad("Для перемещения требуется operationGuid"))?;
+    Uuid::parse_str(&operation_guid).map_err(|_| ApiError::bad("Некорректный operationGuid"))?;
+    if conn.query_row(
+        "SELECT COUNT(*) FROM history_entries WHERE workspace_id=?1 AND type='move' AND from_label=?2",
+        params![ws, operation_guid], |row| row.get::<_, i64>(0),
+    )? != 0 {
+        return Err(ApiError::conflict("Операция перемещения уже существует"));
+    }
+    let workspace_guid = ledger::guid(conn, "workspaces", ws)
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    let item_guid =
+        ledger::guid(conn, "items", id).map_err(|error| ApiError::internal(error.to_string()))?;
+    if s(input, "workspaceGuid").as_deref() != Some(workspace_guid.as_str())
+        || s(input, "itemGuid").as_deref() != Some(item_guid.as_str())
+    {
+        return Err(ApiError::bad("GUID перемещения не соответствуют карточке"));
+    }
+    let storage_id = i64v(input, "toStorageId");
+    if storage_id.is_some_and(|value| {
+        conn.query_row(
+            "SELECT COUNT(*) FROM storages WHERE id=?1 AND workspace_id=?2",
+            params![value, ws],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or(0)
+            == 0
+    }) {
+        return Err(ApiError::bad("Склад не принадлежит этой организации"));
+    }
+    let storage_guid = storage_id
+        .map(|value| ledger::guid(conn, "storages", value))
+        .transpose()
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    let site_id = i64v(input, "toBuildingSiteId");
+    if site_id.is_some_and(|value| {
+        conn.query_row(
+            "SELECT COUNT(*) FROM building_sites WHERE id=?1 AND workspace_id=?2",
+            params![value, ws],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or(0)
+            == 0
+    }) {
+        return Err(ApiError::bad("Объект не принадлежит этой организации"));
+    }
+    let site_guid = site_id
+        .map(|value| ledger::guid(conn, "building_sites", value))
+        .transpose()
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    if input.get("toStorageId").is_some()
+        && input.get("toStorageGuid").and_then(Value::as_str) != storage_guid.as_deref()
+    {
+        return Err(ApiError::bad("toStorageGuid не соответствует складу"));
+    }
+    if input.get("toBuildingSiteId").is_some()
+        && input.get("toBuildingSiteGuid").and_then(Value::as_str) != site_guid.as_deref()
+    {
+        return Err(ApiError::bad("toBuildingSiteGuid не соответствует объекту"));
+    }
     conn.execute(
         "UPDATE items SET storage_id=COALESCE(?1,storage_id), building_site_id=?2 WHERE id=?3",
-        params![
-            i64v(input, "toStorageId"),
-            i64v(input, "toBuildingSiteId"),
-            id
-        ],
+        params![storage_id, site_id, id],
     )?;
     let item = jsn::item_json(conn, id, false).ok_or_else(|| ApiError::not_found("нет"))?;
+    let actor_guid =
+        ledger::guid(conn, "users", uid).map_err(|error| ApiError::internal(error.to_string()))?;
+    let comment = s(input, "comment");
+    let commitment = stock_operation_commitment(
+        "move",
+        &operation_guid,
+        &workspace_guid,
+        &item_guid,
+        &actor_guid,
+        None,
+        comment.as_deref(),
+        storage_guid.as_deref(),
+        site_guid.as_deref(),
+    );
     ledger::append(
         conn,
-        item["workspaceId"].as_i64().unwrap_or(1),
+        ws,
         uid,
         Some(id),
         "move",
+        Some(&operation_guid),
+        Some(&commitment),
         None,
-        None,
-        None,
-        s(input, "comment").as_deref(),
+        comment.as_deref(),
     )
     .map_err(|e| ApiError::internal(format!("Ошибка журнала: {e}")))?;
     Ok(item)

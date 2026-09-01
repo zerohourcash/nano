@@ -125,6 +125,9 @@ export const historyRouter = createRouter({
     .input(
       z.object({
         itemId: z.number().int().positive(),
+        workspaceGuid: z.string().uuid(),
+        itemGuid: z.string().uuid(),
+        operationGuid: z.string().uuid(),
         quantity: z.number().positive(),
         comment: z.string().optional(),
       }),
@@ -154,8 +157,13 @@ export const historyRouter = createRouter({
     .input(
       z.object({
         itemId: z.number().int().positive(),
+        workspaceGuid: z.string().uuid(),
+        itemGuid: z.string().uuid(),
+        operationGuid: z.string().uuid(),
         toStorageId: z.number().int().positive().optional(),
+        toStorageGuid: z.string().uuid().nullable().optional(),
         toBuildingSiteId: z.number().int().positive().nullable().optional(),
+        toBuildingSiteGuid: z.string().uuid().nullable().optional(),
         comment: z.string().optional(),
       }),
     )

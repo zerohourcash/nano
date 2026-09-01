@@ -112,6 +112,10 @@ fn should_retain_request_body(path: &str, body: &[u8]) -> bool {
         || (path == "/api/trpc/history.writeOff"
             && body.len() <= 16 * 1024
             && is_compact_writeoff_intent(body))
+        || (matches!(
+            path,
+            "/api/trpc/history.replenish" | "/api/trpc/history.move"
+        ) && body.len() <= 16 * 1024)
         || (path == "/api/trpc/knowledge.save" && is_compact_knowledge_intent(body))
         || (path == "/api/trpc/chat.send" && is_compact_chat_intent(body))
 }
@@ -597,6 +601,15 @@ mod tests {
             "/api/trpc/history.writeOff",
             &vec![0; 16 * 1024 + 1]
         ));
+    }
+
+    #[test]
+    fn stock_operation_request_bodies_are_retained_with_a_strict_limit() {
+        let body = br#"{"0":{"json":{"operationGuid":"d014d5ea-d7e9-4b39-b195-b90ec8451018","workspaceGuid":"f8390f35-63e0-4772-92e8-a440ec8c9286","itemGuid":"2e7caf4e-9da2-47f1-9801-d155990bfc19","quantity":4}}}"#;
+        for path in ["/api/trpc/history.replenish", "/api/trpc/history.move"] {
+            assert!(should_retain_request_body(path, body), "{path}");
+            assert!(!should_retain_request_body(path, &vec![0; 16 * 1024 + 1]));
+        }
     }
 
     #[test]
