@@ -166,10 +166,8 @@ token-ом `/sync/*` и CAS routes. Старой копии бизнес-лог�
 Сборка (нужны JDK 17, Android SDK/NDK, Rust Android targets и `cargo-ndk`):
 
 ```bash
-npm run build                    # сначала фронтенд
-cd android
-gradle :app:assembleDebug        # Rust ABI собираются автоматически
-# APK: app/build/outputs/apk/debug/app-debug.apk
+npm run android:debug:audit      # PWA + Rust ABI + APK + проверка JNI
+# APK: android/app/build/outputs/apk/debug/app-debug.apk
 ```
 
 Две особенности Windows:

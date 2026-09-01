@@ -406,6 +406,7 @@ npm run interorg:test # две изолированные организации
 npm run spam:test     # реальный HTTP flooding, дубль, restart и атомарный отказ
 npm run scale:test   # 100 реальных процессов и отказ 10 узлов
 npm run test:e2e     # production-сборка + Chromium/Playwright
+npm run release:candidate:audit # все gates + 100 нод + свежий Android APK
 
 cargo fmt --check --manifest-path backend/Cargo.toml
 cargo clippy --manifest-path backend/Cargo.toml --all-targets -- -D warnings
@@ -457,7 +458,7 @@ QR-onboarding (повторено 2026-09-01): 100/100 узлов сошлись
 операция leaf→root — за 8,1 с,
 сеть пережила одновременное отключение 10 узлов, после возврата 10/10 догнали
 журнал и CAS-вложение. RSS p95 составил 9,7 МиБ на процесс, суммарный RSS —
-923,3 МиБ, учтённый sync-трафик — 22,85 МиБ. Методика и ограничения:
+1057,7 МиБ, учтённый sync-трафик — 26,90 МиБ. Методика и ограничения:
 [docs/SCALE_TEST.md](docs/SCALE_TEST.md).
 
 Протокол `meshkeeper-sync/3` обменивается heads каждой account-chain и отправляет
