@@ -26,6 +26,7 @@ pub fn requires_signature(procedure: &str) -> bool {
         "items.create"
             | "items.update"
             | "items.remove"
+            | "items.addComment"
             | "transfers.take"
             | "transfers.takeMany"
             | "transfers.returnItem"
@@ -321,6 +322,7 @@ mod tests {
             "items.create",
             "items.update",
             "items.remove",
+            "items.addComment",
             "items.addDocument",
         ] {
             assert!(requires_signature(procedure), "unsigned {procedure}");

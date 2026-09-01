@@ -2128,17 +2128,87 @@ fn items_add_document_atomic(conn: &Connection, input: &Value, user_id: Option<i
     }))
 }
 
-fn items_add_comment(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
+fn item_comment_payload_hash(
+    workspace_guid: &str,
+    item_guid: &str,
+    author_guid: &str,
+    guid: &str,
+    text: &str,
+    created_at: &str,
+) -> String {
+    let payload = json!({
+        "domain":"everyday/item-comment/v1","workspaceGuid":workspace_guid,
+        "itemGuid":item_guid,"authorGuid":author_guid,"guid":guid,
+        "text":text,"createdAt":created_at,
+    });
+    format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&payload).expect("JSON serialization"))
+    )
+}
+
+fn items_add_comment(conn: &mut Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
+    atomic(conn, |conn| items_add_comment_atomic(conn, input, user_id))
+}
+
+fn items_add_comment_atomic(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
     let uid = require_user(conn, user_id)?;
     let item_id = i64v(input, "itemId").ok_or_else(|| ApiError::bad("itemId"))?;
-    require_item_access(conn, uid, item_id)?;
+    let ws = require_item_access(conn, uid, item_id)?;
     let text = s(input, "text").ok_or_else(|| ApiError::bad("text"))?;
+    if text.chars().count() > 8_000 {
+        return Err(ApiError::bad("Комментарий длиннее 8000 символов"));
+    }
+    let guid = Uuid::new_v4().to_string();
+    let created_at = now();
+    let workspace_guid = ledger::guid(conn, "workspaces", ws)
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    let item_guid = ledger::guid(conn, "items", item_id)
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    let author_guid =
+        ledger::guid(conn, "users", uid).map_err(|error| ApiError::internal(error.to_string()))?;
+    let payload_hash = item_comment_payload_hash(
+        &workspace_guid,
+        &item_guid,
+        &author_guid,
+        &guid,
+        &text,
+        &created_at,
+    );
+    let event = ledger::append(
+        conn,
+        ws,
+        uid,
+        Some(item_id),
+        "item_comment",
+        Some(&guid),
+        Some(&payload_hash),
+        None,
+        Some(&text),
+    )
+    .map_err(|error| ApiError::internal(format!("Ошибка журнала: {error}")))?;
+    let ledger_hash = event["opId"]
+        .as_str()
+        .ok_or_else(|| ApiError::internal("Ledger не вернул hash"))?;
+    let record_hash = format!(
+        "{:x}",
+        Sha256::digest(
+            format!("everyday/item-comment-record/v1\n{payload_hash}\n{ledger_hash}").as_bytes()
+        )
+    );
     conn.execute(
         "INSERT INTO item_comments (item_id, user_id, text, created_at) VALUES (?1,?2,?3,?4)",
-        params![item_id, uid, text, now()],
+        params![item_id, uid, text, created_at],
+    )?;
+    let id = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO item_comment_records(record_hash,guid,workspace_guid,item_guid,author_guid,text,payload_hash,ledger_hash,created_at)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+        params![record_hash,guid,workspace_guid,item_guid,author_guid,text,payload_hash,ledger_hash,created_at],
     )?;
     Ok(
-        json!({"id": conn.last_insert_rowid(), "itemId": item_id, "userId": uid, "text": text, "user": jsn::user_public(conn, uid)}),
+        json!({"id": id, "guid":guid, "recordHash":record_hash, "ledgerHash":ledger_hash,
+            "itemId": item_id, "userId": uid, "text": text, "user": jsn::user_public(conn, uid)}),
     )
 }
 

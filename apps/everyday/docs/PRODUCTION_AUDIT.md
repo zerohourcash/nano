@@ -10,6 +10,7 @@
 | Подписанная выдача по QR | canonical `everyday:item:<UUID>`, Ed25519 device-proof, Ledger V2, append-only custody commitment и восстановление holdings | `npm run test:e2e`, `npm run sync:test`, Rust QR/custody tamper tests | Проверено |
 | Master-карточка ТМЦ | создание/изменение требует отдельный Ed25519-signed HTTP request; proof сохраняется в Ledger V2, signed batch запрещён | `npm run smoke`, `npm run sync:test`, Rust device policy tests | Проверено |
 | Удаление без воскрешения | физические строки сохраняются; delete-wins item tombstone связан с device-signed Ledger и монотонно распространяется после offline-разрыва | `npm run smoke`, `npm run sync:test`, Rust forged-tombstone test | Проверено |
+| Текстовые комментарии ТМЦ | append-only SHA-256 record связан с device-signed Ledger; offline round-trip и подмена текста доверенной нодой проверяются до импорта | Rust `item_comment_round_trips_and_rejects_node_signed_text_falsification`, integrity audit | Проверено |
 | Прямая передача | двухфазные sender prepare / recipient accept; custody debit+credit только после подтверждения, без повторного списания склада | Rust direct-transfer/forged-recipient tests, `npm run adversarial:test` | Проверено |
 | Работа без интернета | локальные Rust/SQLite/PWA, операции не требуют peer | `npm run mesh:test`, `npm run mobile:node:test` | Проверено |
 | Догон после разрыва | account-chain frontier, идемпотентный store-and-forward | `npm run mesh:test`, `npm run sync:test` | Проверено |

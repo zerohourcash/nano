@@ -55,6 +55,35 @@ fn metric(conn: &Connection, key: &str) -> u64 {
         .unwrap_or(0)
 }
 
+fn item_comment_payload_hash(record: &Value) -> anyhow::Result<String> {
+    let required = |name: &str| {
+        record
+            .get(name)
+            .and_then(Value::as_str)
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("item comment has no {name}"))
+    };
+    let payload = json!({
+        "domain":"everyday/item-comment/v1",
+        "workspaceGuid":required("workspaceGuid")?, "itemGuid":required("itemGuid")?,
+        "authorGuid":required("authorGuid")?, "guid":required("guid")?,
+        "text":required("text")?, "createdAt":required("createdAt")?,
+    });
+    Ok(format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&payload)?)
+    ))
+}
+
+fn item_comment_record_hash(payload_hash: &str, ledger_hash: &str) -> String {
+    format!(
+        "{:x}",
+        Sha256::digest(
+            format!("everyday/item-comment-record/v1\n{payload_hash}\n{ledger_hash}").as_bytes()
+        )
+    )
+}
+
 fn next_journal_sequence(conn: &Connection) -> u64 {
     let next = kv_get(conn, "sync_journal_sequence")
         .and_then(|value| value.parse::<u64>().ok())
@@ -755,6 +784,19 @@ pub fn export_journal_since(conn: &Connection, recipient_frontier: Option<&Value
             item_tombstones.extend(rows.flatten());
         }
     }
+    let mut item_comments = Vec::new();
+    if let Ok(mut statement) = conn.prepare(
+        "SELECT record_hash,guid,workspace_guid,item_guid,author_guid,text,payload_hash,ledger_hash,created_at
+         FROM item_comment_records ORDER BY created_at,guid",
+    ) {
+        if let Ok(rows) = statement.query_map([], |row| Ok(json!({
+            "recordHash":row.get::<_,String>(0)?, "guid":row.get::<_,String>(1)?,
+            "workspaceGuid":row.get::<_,String>(2)?, "itemGuid":row.get::<_,String>(3)?,
+            "authorGuid":row.get::<_,String>(4)?, "text":row.get::<_,String>(5)?,
+            "payloadHash":row.get::<_,String>(6)?, "ledgerHash":row.get::<_,String>(7)?,
+            "createdAt":row.get::<_,String>(8)?,
+        }))) { item_comments.extend(rows.flatten()); }
+    }
     let mut messages = Vec::new();
     if let Ok(mut stmt) = conn.prepare(
         "SELECT guid,workspace_id,user_id,text,ledger_hash,created_at
@@ -832,6 +874,7 @@ pub fn export_journal_since(conn: &Connection, recipient_frontier: Option<&Value
         "membershipMode": "versioned-tombstones/v1",
         "custodyMode": "ledger-delta/v1",
         "itemTombstoneMode": "monotonic/v1",
+        "itemCommentMode": "ledger-records/v1",
         "historyMode": if recipient_frontier.is_some() { "delta" } else { "full" },
         "frontier": frontier(conn),
         "workspaces": workspaces,
@@ -844,6 +887,7 @@ pub fn export_journal_since(conn: &Connection, recipient_frontier: Option<&Value
         "memberships": memberships,
         "custody": custody,
         "itemTombstones": item_tombstones,
+        "itemComments": item_comments,
         "messages": messages,
         "photos": photos,
         "documents": documents,
@@ -909,6 +953,7 @@ fn filter_journal_scope(journal: &mut Value, allowed: &HashSet<String>) {
         "memberships",
         "custody",
         "itemTombstones",
+        "itemComments",
         "messages",
         "frontier",
     ] {
@@ -2004,6 +2049,47 @@ pub fn import_journal(conn: &Connection, journal: &Value) -> Value {
             return json!({"ok":false,"error":format!("Не удалось восстановить custody-состояние: {error}")});
         }
     }
+    if let Some(records) = journal.get("itemComments").and_then(Value::as_array) {
+        for record in records {
+            let Some(item_id) = record
+                .get("itemGuid")
+                .and_then(Value::as_str)
+                .and_then(|g| id_by_guid(conn, "items", g))
+            else {
+                skipped += 1;
+                continue;
+            };
+            let Some(author_id) = record
+                .get("authorGuid")
+                .and_then(Value::as_str)
+                .and_then(|g| id_by_guid(conn, "users", g))
+            else {
+                skipped += 1;
+                continue;
+            };
+            let Some(text) = record.get("text").and_then(Value::as_str) else {
+                skipped += 1;
+                continue;
+            };
+            let Some(created_at) = record.get("createdAt").and_then(Value::as_str) else {
+                skipped += 1;
+                continue;
+            };
+            let inserted=conn.execute(
+                "INSERT OR IGNORE INTO item_comment_records(record_hash,guid,workspace_guid,item_guid,author_guid,text,payload_hash,ledger_hash,created_at)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",params![
+                    record.get("recordHash").and_then(Value::as_str),record.get("guid").and_then(Value::as_str),
+                    record.get("workspaceGuid").and_then(Value::as_str),record.get("itemGuid").and_then(Value::as_str),
+                    record.get("authorGuid").and_then(Value::as_str),text,record.get("payloadHash").and_then(Value::as_str),
+                    record.get("ledgerHash").and_then(Value::as_str),created_at]).unwrap_or(0);
+            if inserted > 0 {
+                let _=conn.execute("INSERT INTO item_comments(item_id,user_id,text,created_at) VALUES(?1,?2,?3,?4)",params![item_id,author_id,text,created_at]);
+                ops += 1;
+            } else {
+                skipped += 1;
+            }
+        }
+    }
     if let Some(arr) = journal.get("messages").and_then(Value::as_array) {
         for message in arr {
             let guid = message.get("guid").and_then(Value::as_str).unwrap_or("");
@@ -2419,6 +2505,9 @@ pub fn apply_remote_journal(conn: &Connection, journal: &Value, peer_url: &str) 
     if let Err(error) = verify_item_tombstones(conn, journal) {
         return json!({"ok":false,"error":format!("Проверка tombstone ТМЦ: {error}")});
     }
+    if let Err(error) = verify_item_comments(conn, journal) {
+        return json!({"ok":false,"error":format!("Проверка комментариев ТМЦ: {error}")});
+    }
     if let Err(error) = crate::accounting::verify_journal_links(conn, journal) {
         return json!({"ok":false,"error":format!("Проверка Bit-летописи: {error}")});
     }
@@ -2473,6 +2562,10 @@ pub fn apply_remote_journal(conn: &Connection, journal: &Value, peer_url: &str) 
     if let Err(error) = verify_stored_item_tombstones(conn) {
         let _ = conn.execute_batch("ROLLBACK TO verified_sync; RELEASE verified_sync");
         return json!({"ok":false,"error":format!("Проверка сохранённых tombstone ТМЦ: {error}")});
+    }
+    if let Err(error) = verify_stored_item_comments(conn) {
+        let _ = conn.execute_batch("ROLLBACK TO verified_sync; RELEASE verified_sync");
+        return json!({"ok":false,"error":format!("Проверка сохранённых комментариев ТМЦ: {error}")});
     }
     if let Err(error) = ledger::verify_chat_links(conn) {
         let _ = conn.execute_batch("ROLLBACK TO verified_sync; RELEASE verified_sync");
@@ -3156,6 +3249,123 @@ fn verify_membership_records(conn: &Connection, journal: &Value) -> anyhow::Resu
     Ok(())
 }
 
+fn verify_item_comments(conn: &Connection, journal: &Value) -> anyhow::Result<()> {
+    if journal.get("itemCommentMode").and_then(Value::as_str) != Some("ledger-records/v1") {
+        anyhow::bail!("journal does not provide ledger-bound item comments");
+    }
+    let incoming_history: HashMap<&str, &Value> = journal
+        .get("history")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|event| {
+            event
+                .get("opId")
+                .and_then(Value::as_str)
+                .map(|h| (h, event))
+        })
+        .collect();
+    let mut seen = HashSet::new();
+    for record in journal
+        .get("itemComments")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("journal has no item comment array"))?
+    {
+        let get = |name: &str| {
+            record
+                .get(name)
+                .and_then(Value::as_str)
+                .filter(|v| !v.is_empty())
+                .ok_or_else(|| anyhow::anyhow!("item comment has no {name}"))
+        };
+        let guid = get("guid")?;
+        let workspace = get("workspaceGuid")?;
+        let item = get("itemGuid")?;
+        let actor = get("authorGuid")?;
+        let text = get("text")?;
+        let ledger_hash = get("ledgerHash")?;
+        let payload_hash = get("payloadHash")?;
+        let record_hash = get("recordHash")?;
+        if text.chars().count() > 8_000 || !seen.insert(guid) {
+            anyhow::bail!("invalid or duplicate item comment");
+        }
+        if item_comment_payload_hash(record)? != payload_hash
+            || item_comment_record_hash(payload_hash, ledger_hash) != record_hash
+        {
+            anyhow::bail!("item comment hash mismatch");
+        }
+        if let Some(event) = incoming_history.get(ledger_hash) {
+            let proof = [
+                "requestDeviceId",
+                "requestPublicKey",
+                "requestNonce",
+                "requestSignature",
+                "requestHash",
+                "requestTimestamp",
+                "requestPath",
+            ];
+            let valid = event.get("type").and_then(Value::as_str) == Some("item_comment")
+                && event.get("workspaceGuid").and_then(Value::as_str) == Some(workspace)
+                && event.get("itemGuid").and_then(Value::as_str) == Some(item)
+                && event.get("actorGuid").and_then(Value::as_str) == Some(actor)
+                && event.get("fromLabel").and_then(Value::as_str) == Some(guid)
+                && event.get("toLabel").and_then(Value::as_str) == Some(payload_hash)
+                && event.get("comment").and_then(Value::as_str) == Some(text)
+                && proof.iter().all(|name| {
+                    event
+                        .get(*name)
+                        .and_then(Value::as_str)
+                        .is_some_and(|v| !v.is_empty())
+                });
+            if !valid {
+                anyhow::bail!("item comment ledger evidence mismatch");
+            }
+        } else {
+            let exists:i64=conn.query_row(
+                "SELECT count(*) FROM history_entries h JOIN workspaces w ON w.id=h.workspace_id JOIN users u ON u.id=h.actor_user_id JOIN items i ON i.id=h.item_id
+                 WHERE h.hash=?1 AND h.type='item_comment' AND w.guid=?2 AND i.guid=?3 AND u.guid=?4
+                   AND h.from_label=?5 AND h.to_label=?6 AND h.comment=?7
+                   AND h.request_device_id IS NOT NULL AND h.request_signature IS NOT NULL",
+                params![ledger_hash,workspace,item,actor,guid,payload_hash,text],|row|row.get(0))?;
+            if exists == 0 {
+                anyhow::bail!("item comment ledger event is unavailable");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn verify_stored_item_comments(conn: &Connection) -> anyhow::Result<usize> {
+    let mut statement=conn.prepare(
+        "SELECT r.record_hash,r.guid,r.workspace_guid,r.item_guid,r.author_guid,r.text,r.payload_hash,r.ledger_hash,r.created_at,
+                h.type,h.from_label,h.to_label,h.comment,h.request_device_id,h.request_signature
+         FROM item_comment_records r LEFT JOIN history_entries h ON h.hash=r.ledger_hash")?;
+    let records:Vec<Value>=statement.query_map([],|row|Ok(json!({
+        "recordHash":row.get::<_,String>(0)?,"guid":row.get::<_,String>(1)?,"workspaceGuid":row.get::<_,String>(2)?,
+        "itemGuid":row.get::<_,String>(3)?,"authorGuid":row.get::<_,String>(4)?,"text":row.get::<_,String>(5)?,
+        "payloadHash":row.get::<_,String>(6)?,"ledgerHash":row.get::<_,String>(7)?,"createdAt":row.get::<_,String>(8)?,
+        "type":row.get::<_,Option<String>>(9)?,"from":row.get::<_,Option<String>>(10)?,"to":row.get::<_,Option<String>>(11)?,
+        "eventText":row.get::<_,Option<String>>(12)?,"device":row.get::<_,Option<String>>(13)?,"signature":row.get::<_,Option<String>>(14)?,
+    })))?.collect::<Result<_,_>>()?;
+    for record in &records {
+        let payload = item_comment_payload_hash(record)?;
+        let ledger = record["ledgerHash"].as_str().unwrap_or("");
+        let valid = record["payloadHash"].as_str() == Some(payload.as_str())
+            && record["recordHash"].as_str()
+                == Some(item_comment_record_hash(&payload, ledger).as_str())
+            && record["type"].as_str() == Some("item_comment")
+            && record["from"] == record["guid"]
+            && record["to"] == record["payloadHash"]
+            && record["eventText"] == record["text"]
+            && record["device"].as_str().is_some_and(|v| !v.is_empty())
+            && record["signature"].as_str().is_some_and(|v| !v.is_empty());
+        if !valid {
+            anyhow::bail!("stored item comment is not bound to its ledger event");
+        }
+    }
+    Ok(records.len())
+}
+
 fn verify_item_tombstones(conn: &Connection, journal: &Value) -> anyhow::Result<()> {
     if journal.get("itemTombstoneMode").and_then(Value::as_str) != Some("monotonic/v1") {
         anyhow::bail!("journal does not provide item tombstones");
@@ -3617,6 +3827,7 @@ pub fn integrity_audit(conn: &Connection) -> Value {
     let device_result = verify_stored_device_bindings(conn);
     let custody_result = verify_stored_custody(conn);
     let item_tombstone_result = verify_stored_item_tombstones(conn);
+    let item_comment_result = verify_stored_item_comments(conn);
     let membership_result = verify_membership_records(conn, &snapshot);
 
     let count = |table: &str| -> i64 {
@@ -3696,6 +3907,7 @@ pub fn integrity_audit(conn: &Connection) -> Value {
         .as_ref()
         .err()
         .map(ToString::to_string);
+    let item_comment_error = item_comment_result.as_ref().err().map(ToString::to_string);
     let membership_error = membership_result.as_ref().err().map(ToString::to_string);
     let healthy = database_check == "ok"
         && ledger_result.is_ok()
@@ -3706,6 +3918,7 @@ pub fn integrity_audit(conn: &Connection) -> Value {
         && device_result.is_ok()
         && custody_result.is_ok()
         && item_tombstone_result.is_ok()
+        && item_comment_result.is_ok()
         && membership_result.is_ok()
         && orphan_history == 0
         && missing_guids == 0
@@ -3721,6 +3934,7 @@ pub fn integrity_audit(conn: &Connection) -> Value {
         "knowledgeRevisions": count("knowledge_revisions"),
         "membershipVersions": count("membership_versions"),
         "itemTombstones": count("item_tombstones"),
+        "itemComments": count("item_comment_records"),
     });
     json!({
         "healthy": healthy,
@@ -3743,6 +3957,8 @@ pub fn integrity_audit(conn: &Connection) -> Value {
         "custodyEntriesVerified": custody_result.unwrap_or(0),
         "itemTombstoneError": item_tombstone_error,
         "itemTombstonesVerified": item_tombstone_result.unwrap_or(0),
+        "itemCommentError": item_comment_error,
+        "itemCommentsVerified": item_comment_result.unwrap_or(0),
         "membershipError": membership_error,
         "membershipVerified": membership_result.is_ok(),
         "snapshotHash": snapshot.get("journalHash"),
@@ -4039,6 +4255,113 @@ mod tests {
 
         drop((source, target, rejected));
         for path in [source_path, target_path, rejected_path] {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    #[test]
+    fn item_comment_round_trips_and_rejects_node_signed_text_falsification() {
+        let paths = (0..3)
+            .map(|kind| {
+                std::env::temp_dir()
+                    .join(format!("item-comment-{kind}-{}.db", uuid::Uuid::new_v4()))
+            })
+            .collect::<Vec<_>>();
+        let source = crate::db::open(&paths[0]).unwrap();
+        let target = crate::db::open(&paths[1]).unwrap();
+        let rejected = crate::db::open(&paths[2]).unwrap();
+        let created = chrono::Utc::now().to_rfc3339();
+        source.execute("INSERT INTO workspaces(name,internal_id_prefix,created_at,guid) VALUES('Org','O-',?1,'comment-workspace')",[&created]).unwrap();
+        let workspace = source.last_insert_rowid();
+        source.execute("INSERT INTO users(full_name,phone,status,role_rights,created_at,guid) VALUES('Owner','+70000000992','active',?1,?2,'comment-owner')",params![crate::db::owner_rights().to_string(),created]).unwrap();
+        let owner = source.last_insert_rowid();
+        source
+            .execute(
+                "INSERT INTO user_workspaces(user_id,workspace_id,rights_json) VALUES(?1,?2,?3)",
+                params![owner, workspace, crate::db::owner_rights().to_string()],
+            )
+            .unwrap();
+        record_membership_version(&source, workspace, owner, true, None, true).unwrap();
+        source.execute("INSERT INTO items(internal_id,title,workspace_id,created_at,guid) VALUES('O-1','Drill',?1,?2,'comment-item')",params![workspace,created]).unwrap();
+        let item = source.last_insert_rowid();
+        let key = SigningKey::generate(&mut OsRng);
+        let device = "comment-device-0001";
+        crate::device::register(&source,owner,&json!({"deviceId":device,"name":"Owner phone","publicKey":URL_SAFE_NO_PAD.encode(key.verifying_key().to_bytes())})).unwrap();
+        crate::device::set_pending(
+            &source,
+            owner,
+            &signed_device_proof(&key, device, "/api/trpc/items.addComment"),
+        )
+        .unwrap();
+        let guid = "offline-comment-1";
+        let text = "Проверить кабель перед сменой";
+        let mut record = json!({"workspaceGuid":"comment-workspace","itemGuid":"comment-item","authorGuid":"comment-owner","guid":guid,"text":text,"createdAt":created});
+        let payload = item_comment_payload_hash(&record).unwrap();
+        let event = ledger::append(
+            &source,
+            workspace,
+            owner,
+            Some(item),
+            "item_comment",
+            Some(guid),
+            Some(&payload),
+            None,
+            Some(text),
+        )
+        .unwrap();
+        let ledger_hash = event["opId"].as_str().unwrap();
+        let record_hash = item_comment_record_hash(&payload, ledger_hash);
+        record["payloadHash"] = json!(payload);
+        record["ledgerHash"] = json!(ledger_hash);
+        record["recordHash"] = json!(record_hash);
+        source.execute("INSERT INTO item_comment_records(record_hash,guid,workspace_guid,item_guid,author_guid,text,payload_hash,ledger_hash,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",params![record_hash,guid,"comment-workspace","comment-item","comment-owner",text,payload,ledger_hash,created]).unwrap();
+        source
+            .execute(
+                "INSERT INTO item_comments(item_id,user_id,text,created_at) VALUES(?1,?2,?3,?4)",
+                params![item, owner, text, created],
+            )
+            .unwrap();
+        let valid = export_journal(&source);
+        assert_eq!(apply_remote_journal(&target, &valid, "")["ok"], true);
+        assert_eq!(
+            target
+                .query_row(
+                    "SELECT text FROM item_comment_records WHERE guid=?1",
+                    [guid],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+            text
+        );
+        verify_stored_item_comments(&target).unwrap();
+
+        let mut forged = valid;
+        forged["itemComments"][0]["text"] = json!("Поддельное указание");
+        let forged_payload = item_comment_payload_hash(&forged["itemComments"][0]).unwrap();
+        forged["itemComments"][0]["payloadHash"] = json!(forged_payload);
+        let forged_record = item_comment_record_hash(
+            forged["itemComments"][0]["payloadHash"].as_str().unwrap(),
+            ledger_hash,
+        );
+        forged["itemComments"][0]["recordHash"] = json!(forged_record);
+        ledger::sign_journal(&source, &mut forged).unwrap();
+        let result = apply_remote_journal(&rejected, &forged, "");
+        assert_eq!(result["ok"], false, "{result}");
+        assert!(result["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("комментар"));
+        assert_eq!(
+            rejected
+                .query_row("SELECT count(*) FROM item_comment_records", [], |row| row
+                    .get::<_, i64>(
+                    0
+                ))
+                .unwrap(),
+            0
+        );
+        drop((source, target, rejected));
+        for path in paths {
             let _ = std::fs::remove_file(path);
         }
     }

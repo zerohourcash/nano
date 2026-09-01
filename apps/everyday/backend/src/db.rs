@@ -285,6 +285,21 @@ fn migrate(conn: &Connection) -> Result<()> {
            tombstone_hash TEXT NOT NULL UNIQUE
          );",
     )?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS item_comment_records(
+           record_hash TEXT PRIMARY KEY,
+           guid TEXT NOT NULL UNIQUE,
+           workspace_guid TEXT NOT NULL,
+           item_guid TEXT NOT NULL,
+           author_guid TEXT NOT NULL,
+           text TEXT NOT NULL,
+           payload_hash TEXT NOT NULL,
+           ledger_hash TEXT NOT NULL UNIQUE,
+           created_at TEXT NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS item_comment_item_idx
+           ON item_comment_records(item_guid,created_at,guid);",
+    )?;
     conn.execute(
         "UPDATE user_workspaces SET rights_json=(SELECT role_rights FROM users WHERE users.id=user_workspaces.user_id) WHERE rights_json IS NULL",
         [],
