@@ -3193,6 +3193,9 @@ pub fn import_journal(conn: &Connection, journal: &Value) -> Value {
     if let Err(error) = rebuild_quantitative_stock(conn) {
         return json!({"ok":false,"error":format!("Не удалось восстановить подписанный остаток: {error}")});
     }
+    if let Err(error) = rebuild_nonquantitative_custody_state(conn) {
+        return json!({"ok":false,"error":format!("Не удалось восстановить ответственного из custody: {error}")});
+    }
     json!({
         "ok": true,
         "workspaces": workspaces,
@@ -5215,6 +5218,21 @@ fn verify_stock_operation_records(journal: &Value) -> anyhow::Result<(usize, usi
                 )
             }
         }
+        for (item_guid, (responsible, status, due_at)) in expected_custody_states(journal)? {
+            let snapshot = journal
+                .get("items")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .find(|item| item.get("guid").and_then(Value::as_str) == Some(item_guid.as_str()))
+                .ok_or_else(|| anyhow::anyhow!("custody item snapshot unavailable"))?;
+            if snapshot.get("responsibleGuid").and_then(Value::as_str) != responsible.as_deref()
+                || snapshot.get("statusSlug").and_then(Value::as_str) != Some(status.as_str())
+                || snapshot.get("dueAt").and_then(Value::as_str) != due_at.as_deref()
+            {
+                anyhow::bail!("item responsible/status/due snapshot differs from signed custody")
+            }
+        }
     }
     Ok((verified, legacy))
 }
@@ -5324,6 +5342,132 @@ fn rebuild_quantitative_stock(conn: &Connection) -> anyhow::Result<()> {
         conn.execute(
             "UPDATE items SET quantity=?1 WHERE guid=?2 AND quantitative=1",
             params![quantity, guid],
+        )?;
+    }
+    Ok(())
+}
+
+type ExpectedCustodyStates = HashMap<String, (Option<String>, String, Option<String>)>;
+
+fn expected_custody_states(journal: &Value) -> anyhow::Result<ExpectedCustodyStates> {
+    let mut winners: HashMap<&str, &Value> = HashMap::new();
+    for record in journal
+        .get("itemStateVersions")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let Some(item) = record.get("itemGuid").and_then(Value::as_str) else {
+            continue;
+        };
+        let candidate = (
+            record.get("depth").and_then(Value::as_i64).unwrap_or(-1),
+            record
+                .get("versionHash")
+                .and_then(Value::as_str)
+                .unwrap_or(""),
+        );
+        if winners.get(item).is_none_or(|current| {
+            candidate
+                > (
+                    current.get("depth").and_then(Value::as_i64).unwrap_or(-1),
+                    current
+                        .get("versionHash")
+                        .and_then(Value::as_str)
+                        .unwrap_or(""),
+                )
+        }) {
+            winners.insert(item, record);
+        }
+    }
+    let mut result = HashMap::new();
+    for (item, winner) in winners {
+        let fields = winner.get("fields").unwrap_or(&Value::Null);
+        if fields.get("quantitative").and_then(Value::as_bool) == Some(true) {
+            continue;
+        }
+        let baseline = winner
+            .get("updatedAt")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let mut balances: HashMap<String, f64> = HashMap::new();
+        let mut due_dates: HashMap<String, Option<String>> = HashMap::new();
+        if let Some(owner) = fields.get("responsibleGuid").and_then(Value::as_str) {
+            balances.insert(owner.to_owned(), 1.0);
+        }
+        let mut observed = false;
+        for entry in journal
+            .get("custody")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|entry| {
+                entry.get("itemGuid").and_then(Value::as_str) == Some(item)
+                    && entry
+                        .get("createdAt")
+                        .and_then(Value::as_str)
+                        .is_some_and(|created| created >= baseline)
+            })
+        {
+            observed = true;
+            let user = entry
+                .get("userGuid")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow::anyhow!("custody entry has no user"))?;
+            let delta = entry
+                .get("quantityDelta")
+                .and_then(Value::as_f64)
+                .ok_or_else(|| anyhow::anyhow!("custody entry has no quantity"))?;
+            *balances.entry(user.to_owned()).or_default() += delta;
+            if delta > 0.0 {
+                due_dates.insert(
+                    user.to_owned(),
+                    entry
+                        .get("dueAt")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                );
+            }
+        }
+        if !observed {
+            continue;
+        }
+        if balances.values().any(|balance| *balance < -1e-8) {
+            anyhow::bail!("custody history produces a negative holding for {item}")
+        }
+        let holders: Vec<String> = balances
+            .into_iter()
+            .filter_map(|(user, balance)| (balance > 1e-8).then_some(user))
+            .collect();
+        let state = match holders.as_slice() {
+            [] => (None, "in-stock".to_owned(), None),
+            [user] => (
+                Some(user.clone()),
+                "in-work".to_owned(),
+                due_dates.get(user).cloned().flatten(),
+            ),
+            _ => (None, "needs-check".to_owned(), None),
+        };
+        result.insert(item.to_owned(), state);
+    }
+    Ok(result)
+}
+
+fn rebuild_nonquantitative_custody_state(conn: &Connection) -> anyhow::Result<()> {
+    let snapshot = export_journal(conn);
+    for (item, (responsible, status, due_at)) in expected_custody_states(&snapshot)? {
+        let responsible_id = responsible
+            .as_deref()
+            .and_then(|guid| id_by_guid(conn, "users", guid));
+        let workspace: i64 = conn.query_row(
+            "SELECT workspace_id FROM items WHERE guid=?1",
+            [&item],
+            |row| row.get(0),
+        )?;
+        let status_id = status_id(conn, workspace, &status);
+        conn.execute(
+            "UPDATE items SET responsible_user_id=?1,status_id=COALESCE(?2,status_id),due_at=?3 WHERE guid=?4 AND quantitative=0",
+            params![responsible_id, status_id, due_at, item],
         )?;
     }
     Ok(())
@@ -9602,6 +9746,46 @@ mod tests {
         let mut forged_stock = stock;
         forged_stock["items"][0]["quantity"] = json!(99.0);
         assert!(verify_stock_operation_records(&forged_stock).is_err());
+
+        let custody_state = json!({
+            "history":[],
+            "custody":[{
+                "itemGuid":"tool-1","userGuid":"alice","quantityDelta":1.0,
+                "dueAt":"2026-09-10T12:00:00Z","createdAt":"2026-09-01T12:01:00Z"
+            }],
+            "itemStateVersions":[{
+                "itemGuid":"tool-1","depth":0,"versionHash":"tool-state",
+                "updatedAt":"2026-09-01T12:00:00Z",
+                "fields":{"quantitative":false,"responsibleGuid":null}
+            }],
+            "items":[{"guid":"tool-1","responsibleGuid":"alice","statusSlug":"in-work","dueAt":"2026-09-10T12:00:00Z"}]
+        });
+        assert_eq!(
+            verify_stock_operation_records(&custody_state).unwrap(),
+            (0, 0)
+        );
+        let mut forged_owner = custody_state.clone();
+        forged_owner["items"][0]["responsibleGuid"] = json!("mallory");
+        assert!(verify_stock_operation_records(&forged_owner).is_err());
+        let mut forged_due = custody_state;
+        forged_due["items"][0]["dueAt"] = json!("2099-01-01T00:00:00Z");
+        assert!(verify_stock_operation_records(&forged_due).is_err());
+
+        let double_checkout = json!({
+            "itemStateVersions":[{
+                "itemGuid":"tool-2","depth":0,"versionHash":"tool-state-2",
+                "updatedAt":"2026-09-01T12:00:00Z",
+                "fields":{"quantitative":false,"responsibleGuid":null}
+            }],
+            "custody":[
+                {"itemGuid":"tool-2","userGuid":"alice","quantityDelta":1.0,"createdAt":"2026-09-01T12:01:00Z"},
+                {"itemGuid":"tool-2","userGuid":"bob","quantityDelta":1.0,"createdAt":"2026-09-01T12:01:01Z"}
+            ]
+        });
+        assert_eq!(
+            expected_custody_states(&double_checkout).unwrap()["tool-2"],
+            (None, "needs-check".to_owned(), None)
+        );
     }
 
     #[test]
