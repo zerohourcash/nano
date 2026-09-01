@@ -128,6 +128,24 @@ def main() -> int:
         check("принятие существует ровно один раз, чужой склад не реплицирован",
               accepted_rows == 1 and foreign_items == 0, f"accept={accepted_rows} foreignItems={foreign_items}")
 
+        replay = a.call("interorg.send", {
+            "workspaceId": ws_a["id"], "contactGuid": contact_b["guid"],
+            "transactionId": transaction_id, "kind": "invoice.offer",
+            "body": {"text": "подмена уже принятой транзакции", "amount": 999999},
+        })
+
+        def replay_quarantined():
+            with sqlite3.connect(b.db) as database:
+                row = database.execute(
+                    "SELECT delivered FROM interorg_envelopes WHERE id=?", (replay["envelopeId"],),
+                ).fetchone()
+                return row is not None and row[0] == 2
+
+        check("новый envelope с прежним transaction ID помещён в карантин",
+              wait_for(replay_quarantined, timeout=20)
+              and len(inbox_b()) == 1
+              and inbox_b()[0]["body"]["text"] == text)
+
         revoked = b.call("interorg.revokeContact", {
             "workspaceId": ws_b["id"], "guid": contact_a["guid"],
         })

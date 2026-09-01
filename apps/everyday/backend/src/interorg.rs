@@ -84,6 +84,29 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
            received_at TEXT NOT NULL, accepted INTEGER NOT NULL DEFAULT 0
          );",
     )?;
+    let replay_index_exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name='interorg_transaction_replay_idx')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !replay_index_exists {
+        // Older preview builds did not have a semantic replay constraint.
+        // Preserve the first observed body and discard only later copies before
+        // installing the invariant. This migration runs once, not per gossip.
+        conn.execute(
+            "DELETE FROM interorg_inbox
+             WHERE rowid NOT IN (
+               SELECT MIN(rowid) FROM interorg_inbox
+               GROUP BY workspace_id,contact_guid,transaction_id
+             )",
+            [],
+        )?;
+        conn.execute(
+            "CREATE UNIQUE INDEX interorg_transaction_replay_idx
+             ON interorg_inbox(workspace_id,contact_guid,transaction_id)",
+            [],
+        )?;
+    }
     Ok(())
 }
 
@@ -354,6 +377,15 @@ pub fn receive_local(conn: &Connection, work_bits: u8) -> Result<usize> {
                     [&envelope.id],
                 )?;
                 imported += 1;
+            } else {
+                // Envelope IDs are transport identifiers and can legitimately
+                // change on a retry. The signed transaction ID is the semantic
+                // idempotency key. Never expose a second body for the same
+                // sender transaction to accounting or acceptance workflows.
+                conn.execute(
+                    "UPDATE interorg_envelopes SET delivered=2 WHERE id=?1",
+                    [&envelope.id],
+                )?;
             }
         }
     }
@@ -833,6 +865,38 @@ mod tests {
     }
 
     #[test]
+    fn replay_index_migration_keeps_first_observed_transaction_body() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(
+            "CREATE TABLE interorg_inbox(
+               envelope_id TEXT PRIMARY KEY, workspace_id INTEGER NOT NULL,
+               contact_guid TEXT NOT NULL, transaction_id TEXT NOT NULL,
+               kind TEXT NOT NULL, body_json TEXT NOT NULL,
+               received_at TEXT NOT NULL, accepted INTEGER NOT NULL DEFAULT 0
+             );
+             INSERT INTO interorg_inbox VALUES
+               ('first',1,'contact','tx','invoice','{\"amount\":1}','2026-01-01T00:00:00Z',1),
+               ('forged',1,'contact','tx','invoice','{\"amount\":999}','2026-01-02T00:00:00Z',0);",
+        )
+        .unwrap();
+        init_schema(&db).unwrap();
+        let retained: (String, String, bool) = db
+            .query_row(
+                "SELECT envelope_id,body_json,accepted FROM interorg_inbox",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(retained, ("first".into(), "{\"amount\":1}".into(), true));
+        assert!(db
+            .execute(
+                "INSERT INTO interorg_inbox VALUES('new',1,'contact','tx','invoice','{}','2026-01-03T00:00:00Z',0)",
+                [],
+            )
+            .is_err());
+    }
+
+    #[test]
     fn trusted_organizations_exchange_transaction_after_partition() {
         let a = organization_db("org-a");
         let b = organization_db("org-b");
@@ -894,9 +958,35 @@ mod tests {
         assert!(relay_store(&b, &envelope, 8).unwrap());
         assert_eq!(receive_local(&b, 8).unwrap(), 1);
         assert_eq!(receive_local(&b, 8).unwrap(), 0);
+        let initial_inbox = inbox(&b, 1).unwrap();
+        assert_eq!(initial_inbox[0]["transactionId"], transaction_id);
+        assert_eq!(initial_inbox[0]["body"]["amount"], 125);
+        assert_eq!(initial_inbox[0]["contact"]["remoteWorkspaceGuid"], "org-a");
+
+        // A trusted (or compromised) sender cannot replay the same semantic
+        // transaction under a fresh envelope ID and substitute another body.
+        let replay = send_to_contact(
+            &a,
+            1,
+            contact_b["guid"].as_str().unwrap(),
+            "invoice.offer",
+            &transaction_id,
+            serde_json::json!({"amount":999999,"currency":"BIT","memo":"Подмена"}),
+            8,
+        )
+        .unwrap();
+        assert!(relay_store(&b, &replay, 8).unwrap());
+        assert_eq!(receive_local(&b, 8).unwrap(), 0);
         let inbox = inbox(&b, 1).unwrap();
-        assert_eq!(inbox[0]["transactionId"], transaction_id);
+        assert_eq!(inbox.as_array().unwrap().len(), 1);
         assert_eq!(inbox[0]["body"]["amount"], 125);
-        assert_eq!(inbox[0]["contact"]["remoteWorkspaceGuid"], "org-a");
+        let replay_state: i64 = b
+            .query_row(
+                "SELECT delivered FROM interorg_envelopes WHERE id=?1",
+                [&replay.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(replay_state, 2);
     }
 }
