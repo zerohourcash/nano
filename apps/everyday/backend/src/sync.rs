@@ -2289,6 +2289,9 @@ pub fn apply_remote_journal(conn: &Connection, journal: &Value, peer_url: &str) 
     if let Err(error) = verify_membership_records(conn, journal) {
         return json!({"ok":false,"error":format!("Проверка членства: {error}")});
     }
+    if let Err(error) = crate::accounting::verify_journal_links(conn, journal) {
+        return json!({"ok":false,"error":format!("Проверка Bit-летописи: {error}")});
+    }
     if let Err(error) = enforce_node_trust(conn, journal, peer_url) {
         return json!({"ok":false,"error":format!("Ключ mesh-ноды не разрешён: {error}")});
     }

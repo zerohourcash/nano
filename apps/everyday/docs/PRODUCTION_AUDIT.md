@@ -19,7 +19,7 @@
 | Фото и документы | SHA-256 CAS, chunks, resume, metadata/smart/full | `npm run sync:test`, `npm run scale:test` | Проверено |
 | Любой узел → full | смена content mode и фоновая догрузка | `npm run sync:test` | Проверено |
 | Чат и wiki | ledger-bound chat; revision DAG и CAS ACL | `npm run mesh:test`, `npm run adversarial:test`, Rust tests | Проверено |
-| Bit и бухгалтерия | двойная запись, deterministic conflict reconciliation | `npm run adversarial:test`, Rust accounting tests | Проверено |
+| Bit и бухгалтерия | двойная запись, deterministic conflict reconciliation, pre-trust binding проводки к device-signed Ledger | `npm run adversarial:test`, Rust recipient/amount tamper tests | Проверено |
 | Android | тот же Rust backend, Keystore, private UI/sync-only LAN | APK verifier, `npm run mobile:node:test` | Проверено ARM64/x86_64 |
 | Смена Wi‑Fi/hotspot | NetworkCallback → JNI, динамический HMAC-анонс | Android contract, `npm run discovery:test` | Проверено на host/JNI build |
 | SQLCipher | отдельный feature, обязательный ключ, wrong-key rejection | `npm run encrypted-db:test` | Проверено Linux |

@@ -3676,7 +3676,7 @@ fn bit_sale(conn: &mut Connection, input: &Value, user_id: Option<i64>) -> ApiRe
             buyer,
             Some(item_id),
             "bit_sale",
-            Some(item_guid),
+            posted["senderAccountGuid"].as_str(),
             posted["txHash"].as_str(),
             Some(amount as f64),
             s(input, "memo").as_deref(),
