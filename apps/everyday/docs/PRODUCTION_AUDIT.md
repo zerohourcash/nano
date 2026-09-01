@@ -19,9 +19,10 @@ fail-closed запуск до создания базы при подменён�
 `npm run android:release:http:test`. Публичный Linux x86_64 архив также собран
 из проверенного desktop-каталога, повторно проходит SHA-256 при старте узла и
 доступен с экрана входа; его распакованный бинарник прошёл startup/health/UI
-smoke без Node.js и сети. Архив, пересобранный после security-коммита
-`acdfeb6`, имеет размер 28 073 520 байт и SHA-256
-`cffe9246cd13b40cee366156dfd9f89e234bc71c7712fedf06badb6915b9838e`.
+smoke без Node.js и сети. Manifest v2 внутри публичного архива фиксирует
+`sourceRevision=0462a0101a57891eec8fb9603f2e973a28a33cd9` и
+`sourceDirty=false`; архив имеет размер 28 073 573 байта и SHA-256
+`6ab3c82a46679ad2fbb966106c40eeec332fa51412fe6f94febeabbb53c0e9cf`.
 Публичный тестовый стенд использует отдельную демо-БД и явную связанную пару
 `DEMO_DATA+DEMO_LOGIN`: посетители выбирают разные роли на экране входа без
 API-токена. Неполная пара запрещена startup-тестом; production onboarding
