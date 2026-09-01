@@ -74,6 +74,7 @@ tasks.register('buildRustNode', Exec) {
             '--manifest-path', rustManifest.absolutePath, 'build', '--release', '--lib'
     inputs.files(fileTree(new File(rootProject.projectDir.parentFile, 'backend/src')))
     inputs.file(rustManifest)
+    inputs.property('sourceRevision', providers.environmentVariable('EVERYDAY_BUILD_REVISION').orElse('development'))
     outputs.files(
             new File(nativeOut, 'arm64-v8a/libmeshkeeper_node.so'),
             new File(nativeOut, 'x86_64/libmeshkeeper_node.so'))

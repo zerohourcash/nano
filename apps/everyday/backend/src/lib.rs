@@ -482,6 +482,7 @@ async fn health() -> impl IntoResponse {
     Json(json!({
         "ok": true,
         "node": "meshkeeper-node",
+        "buildRevision": option_env!("EVERYDAY_BUILD_REVISION").unwrap_or("development"),
         "journal": "signed-account-chains",
         "role": node_role(),
         "sync": if sync_capabilities().is_ok_and(|values| !values.is_empty()) { "enabled" } else { "disabled" },

@@ -7,6 +7,7 @@ import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+REPOSITORY = ROOT.parent.parent
 DEFAULT_APK = ROOT / "android/app/build/outputs/apk/debug/app-debug.apk"
 ABIS = ("arm64-v8a", "x86_64")
 JNI_SYMBOLS = (
@@ -18,6 +19,18 @@ JNI_SYMBOLS = (
     "Java_ru_meshkeeper_app_RustNode_missingTransportRanges",
     "Java_ru_meshkeeper_app_RustNode_assembleTransport",
 )
+
+
+def source_revision() -> bytes:
+    revision = subprocess.run(
+        ["git", "rev-parse", "--verify", "HEAD"], cwd=REPOSITORY,
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    dirty = subprocess.run(
+        ["git", "status", "--porcelain", "--untracked-files=no"], cwd=REPOSITORY,
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    return f"{revision}{'-dirty' if dirty else ''}".encode()
 
 
 def main() -> None:
@@ -44,12 +57,16 @@ def main() -> None:
             raise SystemExit("APK web application does not persist BLE transport diagnostics")
         if b"acknowledgePendingSyncBundle" not in web_scripts:
             raise SystemExit("APK web application does not acknowledge durable BLE imports")
+        revision = source_revision()
         for abi in ABIS:
             member = f"lib/{abi}/libmeshkeeper_node.so"
             if member not in names:
                 raise SystemExit(f"APK does not contain {member}")
             output = Path(temp) / f"{abi}.so"
-            output.write_bytes(archive.read(member))
+            library = archive.read(member)
+            output.write_bytes(library)
+            if revision not in library:
+                raise SystemExit(f"Source revision is missing from {member}")
             symbols = subprocess.run(
                 ["readelf", "-Ws", output], check=True, capture_output=True, text=True
             ).stdout
