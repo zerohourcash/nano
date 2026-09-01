@@ -35,6 +35,8 @@ export const syncRouter = createRouter({
     ledgerVerified: 0,
     chatVerified: 0,
     accountingVerified: true,
+    accountingIntentsVerified: 0,
+    accountingIntentsLegacy: 0,
     knowledgeVerified: true,
     accountingError: null as string | null,
     knowledgeError: null as string | null,

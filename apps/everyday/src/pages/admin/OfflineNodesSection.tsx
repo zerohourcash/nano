@@ -430,6 +430,8 @@ export default function OfflineNodesSection() {
               <div>Фактов инвентаризации: <b>{auditQ.data?.inventoryRecordsVerified ?? 0}</b></div>
               <div>Проверенных списаний: <b>{auditQ.data?.writeoffsVerified ?? 0}</b></div>
               <div>Legacy списаний: <b>{auditQ.data?.writeoffsLegacy ?? 0}</b></div>
+              <div>Bit user-intent V3: <b>{auditQ.data?.accountingIntentsVerified ?? 0}</b></div>
+              <div>Legacy Bit-проводок: <b>{auditQ.data?.accountingIntentsLegacy ?? 0}</b></div>
               <div>Глав цепочек: <b>{auditQ.data?.ledgerHeads.length ?? 0}</b></div>
               <div>Потерянных связей: <b>{auditQ.data?.orphanHistory ?? 0}</b></div>
               <div>CAS-файлов: <b>{auditQ.data?.counts.blobs ?? 0}</b></div>

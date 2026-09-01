@@ -493,7 +493,7 @@ test('browser signs a real custody transaction and ledger retains its proof', as
   }>>(page, 'history.all', { workspaceId: workspaces[0].id, limit: 500 }, false);
   for (const type of ['bit_mint', 'bit_transfer', 'bit_sale']) {
     expect(bitHistory.find(event => event.type === type)).toMatchObject({
-      eventVersion: 2,
+      eventVersion: 3,
       requestDeviceId: expect.any(String),
       requestHash: expect.stringMatching(/^[a-f0-9]{64}$/),
     });

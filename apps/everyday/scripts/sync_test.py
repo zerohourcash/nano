@@ -879,6 +879,19 @@ def main() -> int:
             lambda: server.call("bit.balance", {"workspaceId": ws_id, "userId": owner["id"]}, mutation=False).get("balance") == 100
         )
         check("подписанная бухгалтерская проводка Bit дошла до сервера", bit_synced)
+        bit_audit = server.call("sync.audit", None, mutation=False)
+        check(
+            "owner повторно проверил точный device-signed Bit V3 intent",
+            bit_audit.get("accountingVerified") is True
+            and bit_audit.get("accountingError") is None
+            and bit_audit.get("accountingIntentsVerified", 0) >= 1
+            and bit_audit.get("accountingIntentsLegacy") == 0,
+            str({
+                "verified": bit_audit.get("accountingIntentsVerified"),
+                "legacy": bit_audit.get("accountingIntentsLegacy"),
+                "error": bit_audit.get("accountingError"),
+            }),
+        )
         synced_knowledge: dict = {}
 
         def knowledge_arrived() -> bool:

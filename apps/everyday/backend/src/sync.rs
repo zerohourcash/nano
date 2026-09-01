@@ -6999,9 +6999,10 @@ pub fn integrity_audit(conn: &Connection) -> Value {
         .unwrap_or_else(|error| format!("error: {error}"));
     let ledger_result = ledger::verify_all(conn);
     let chat_result = ledger::verify_chat_links(conn);
-    let accounting_result = crate::accounting::verify(conn);
-    let knowledge_result = crate::knowledge::verify(conn);
     let snapshot = export_journal(conn);
+    let accounting_result = crate::accounting::verify(conn)
+        .and_then(|_| crate::accounting::verify_journal_links_with_intents(conn, &snapshot));
+    let knowledge_result = crate::knowledge::verify(conn);
     let snapshot_result = ledger::verify_journal(&snapshot);
     let device_result = verify_stored_device_bindings(conn);
     let custody_result = verify_stored_custody(conn);
@@ -7229,6 +7230,14 @@ pub fn integrity_audit(conn: &Connection) -> Value {
         "ledgerHeads": heads,
     });
     if let Some(object) = audit.as_object_mut() {
+        object.insert(
+            "accountingIntentsVerified".into(),
+            json!(accounting_result.as_ref().map(|value| value.0).unwrap_or(0)),
+        );
+        object.insert(
+            "accountingIntentsLegacy".into(),
+            json!(accounting_result.as_ref().map(|value| value.1).unwrap_or(0)),
+        );
         object.insert(
             "saleOffersVerified".into(),
             json!(sale_offer_result.is_ok()),

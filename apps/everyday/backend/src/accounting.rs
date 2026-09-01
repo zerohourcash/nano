@@ -240,10 +240,154 @@ pub fn export(conn: &Connection) -> Value {
     json!({"accounts":accounts,"transactions":transactions,"lines":lines})
 }
 
+fn trpc_input(body: &str) -> anyhow::Result<Value> {
+    let envelope: Value = serde_json::from_str(body)?;
+    envelope
+        .get("0")
+        .and_then(|value| value.get("json"))
+        .or_else(|| envelope.get("json"))
+        .cloned()
+        .ok_or_else(|| anyhow!("Bit request body has no input"))
+}
+
+fn source_guid<'a>(
+    journal: &'a Value,
+    collection: &str,
+    id_field: &str,
+    guid_field: &str,
+    source_id: i64,
+) -> Option<&'a str> {
+    journal
+        .get(collection)?
+        .as_array()?
+        .iter()
+        .find(|record| record.get(id_field).and_then(Value::as_i64) == Some(source_id))?
+        .get(guid_field)?
+        .as_str()
+}
+
+fn account_owner<'a>(accounting: &'a Value, account_guid: &str) -> Option<&'a str> {
+    accounting
+        .get("accounts")?
+        .as_array()?
+        .iter()
+        .find(|account| account.get("guid").and_then(Value::as_str) == Some(account_guid))?
+        .get("ownerGuid")?
+        .as_str()
+}
+
+fn string_or_empty(value: Option<&Value>) -> &str {
+    value.and_then(Value::as_str).unwrap_or("")
+}
+
+fn verify_device_bit_intent(
+    journal: &Value,
+    accounting: &Value,
+    tx: &Value,
+    event: &Value,
+    debit_account: &str,
+) -> anyhow::Result<bool> {
+    if event.get("eventVersion").and_then(Value::as_i64) != Some(3) {
+        return Ok(false);
+    }
+    let kind = tx.get("kind").and_then(Value::as_str).unwrap_or_default();
+    let expected_path = match kind {
+        "mint" => "/api/trpc/bit.mint",
+        "transfer" => "/api/trpc/bit.transfer",
+        "sale" => "/api/trpc/bit.sale",
+        _ => bail!("unsupported Bit intent"),
+    };
+    if event.get("requestPath").and_then(Value::as_str) != Some(expected_path) {
+        bail!("Bit request path differs from transaction kind")
+    }
+    let body = event
+        .get("requestBody")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("Bit V3 event has no request body"))?;
+    let body_hash = hex::encode(Sha256::digest(body.as_bytes()));
+    if event.get("requestHash").and_then(Value::as_str) != Some(body_hash.as_str()) {
+        bail!("Bit request body hash mismatch")
+    }
+    let input = trpc_input(body)?;
+    if input.get("amount").and_then(Value::as_i64) != tx.get("amount").and_then(Value::as_i64) {
+        bail!("Bit amount differs from signed user intent")
+    }
+    if string_or_empty(input.get("memo")) != string_or_empty(tx.get("memo")) {
+        bail!("Bit memo differs from signed user intent")
+    }
+    if kind == "sale" {
+        let item_id = input
+            .get("itemId")
+            .and_then(Value::as_i64)
+            .ok_or_else(|| anyhow!("Bit sale request has no item"))?;
+        let item_workspace = journal
+            .get("items")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .find(|item| item.get("localId").and_then(Value::as_i64) == Some(item_id))
+            .and_then(|item| item.get("workspaceGuid"))
+            .and_then(Value::as_str);
+        if item_workspace != tx.get("workspaceGuid").and_then(Value::as_str) {
+            bail!("Bit workspace differs from signed user intent")
+        }
+    } else {
+        let workspace_id = input
+            .get("workspaceId")
+            .and_then(Value::as_i64)
+            .ok_or_else(|| anyhow!("Bit request has no source workspace"))?;
+        if source_guid(journal, "workspaces", "id", "guid", workspace_id)
+            != tx.get("workspaceGuid").and_then(Value::as_str)
+        {
+            bail!("Bit workspace differs from signed user intent")
+        }
+    }
+    let recipient_guid = account_owner(accounting, debit_account)
+        .ok_or_else(|| anyhow!("Bit recipient account has no owner"))?;
+    if kind != "mint" {
+        let sender_account = tx
+            .get("senderAccountGuid")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("Bit transaction has no sender account"))?;
+        if account_owner(accounting, sender_account)
+            != event.get("actorGuid").and_then(Value::as_str)
+        {
+            bail!("Bit sender differs from signed user intent")
+        }
+    }
+    let requested_recipient = if kind == "sale" {
+        input.get("sellerUserId").and_then(Value::as_i64)
+    } else {
+        input.get("recipientUserId").and_then(Value::as_i64)
+    }
+    .ok_or_else(|| anyhow!("Bit request has no recipient"))?;
+    if source_guid(journal, "users", "id", "guid", requested_recipient) != Some(recipient_guid) {
+        bail!("Bit recipient differs from signed user intent")
+    }
+    if kind == "sale" {
+        let item_id = input
+            .get("itemId")
+            .and_then(Value::as_i64)
+            .ok_or_else(|| anyhow!("Bit sale request has no item"))?;
+        let item_guid = source_guid(journal, "items", "localId", "guid", item_id);
+        if item_guid != tx.get("reference").and_then(Value::as_str)
+            || item_guid != event.get("itemGuid").and_then(Value::as_str)
+        {
+            bail!("Bit sale item differs from signed user intent")
+        }
+    } else if string_or_empty(input.get("reference")) != string_or_empty(tx.get("reference")) {
+        bail!("Bit reference differs from signed user intent")
+    }
+    Ok(true)
+}
+
 /// Проверяет переносимую бухгалтерию до импорта. Подпись mesh-журнала сама по
 /// себе удостоверяет только ноду; эта проверка связывает экономический смысл
 /// проводки с подписанным пользовательским событием Ledger.
-pub fn verify_journal_links(conn: &Connection, journal: &Value) -> anyhow::Result<()> {
+pub fn verify_journal_links_with_intents(
+    conn: &Connection,
+    journal: &Value,
+) -> anyhow::Result<(usize, usize)> {
     let accounting = journal
         .get("accounting")
         .ok_or_else(|| anyhow!("журнал не содержит бухгалтерскую летопись"))?;
@@ -282,6 +426,8 @@ pub fn verify_journal_links(conn: &Connection, journal: &Value) -> anyhow::Resul
         bail!("строка Bit-проводки ссылается на неизвестную транзакцию")
     }
 
+    let mut intents_verified = 0;
+    let mut intents_legacy = 0;
     for tx in transactions {
         let required = |name: &str| {
             tx.get(name)
@@ -364,6 +510,11 @@ pub fn verify_journal_links(conn: &Connection, journal: &Value) -> anyhow::Resul
             {
                 bail!("сумма или отправитель Bit не совпали с подписанной летописью")
             }
+            if verify_device_bit_intent(journal, accounting, tx, event, debit)? {
+                intents_verified += 1;
+            } else {
+                intents_legacy += 1;
+            }
         } else {
             let exists: i64 = conn.query_row(
                 "SELECT count(*) FROM history_entries h JOIN workspaces w ON w.id=h.workspace_id JOIN users u ON u.id=h.actor_user_id WHERE w.guid=?1 AND u.guid=?2 AND h.type=?3 AND h.to_label=?4 AND h.quantity_delta=?5",
@@ -375,7 +526,11 @@ pub fn verify_journal_links(conn: &Connection, journal: &Value) -> anyhow::Resul
             }
         }
     }
-    Ok(())
+    Ok((intents_verified, intents_legacy))
+}
+
+pub fn verify_journal_links(conn: &Connection, journal: &Value) -> anyhow::Result<()> {
+    verify_journal_links_with_intents(conn, journal).map(|_| ())
 }
 
 pub fn import(conn: &Connection, value: &Value) -> anyhow::Result<()> {
@@ -541,6 +696,9 @@ pub fn verify(conn: &Connection) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    use ed25519_dalek::{Signer, SigningKey};
+    use rand::rngs::OsRng;
     use std::path::PathBuf;
 
     fn setup() -> (Connection, PathBuf, i64, i64, i64) {
@@ -583,6 +741,47 @@ mod tests {
             tx["txHash"].as_str(),
             Some(tx["amount"].as_i64().unwrap() as f64),
             None,
+        )
+        .unwrap();
+    }
+
+    fn set_signed_body(
+        db: &Connection,
+        user: i64,
+        key: &SigningKey,
+        device: &str,
+        path: &str,
+        body: &Value,
+    ) {
+        crate::device::register(
+            db,
+            user,
+            &json!({
+                "deviceId":device,"name":"Accounting test phone",
+                "publicKey":URL_SAFE_NO_PAD.encode(key.verifying_key().to_bytes())
+            }),
+        )
+        .unwrap();
+        let request_body = body.to_string();
+        let request_hash = hex::encode(Sha256::digest(request_body.as_bytes()));
+        let timestamp = chrono::Utc::now().timestamp().to_string();
+        let nonce = uuid::Uuid::new_v4().to_string();
+        let message = format!(
+            "everyday/device-request/v1\nPOST\n{path}\n{timestamp}\n{nonce}\n{request_hash}"
+        );
+        crate::device::set_pending(
+            db,
+            user,
+            &crate::device::Proof {
+                device_id: device.into(),
+                public_key: URL_SAFE_NO_PAD.encode(key.verifying_key().to_bytes()),
+                nonce,
+                signature: URL_SAFE_NO_PAD.encode(key.sign(message.as_bytes()).to_bytes()),
+                request_hash,
+                timestamp,
+                path: path.into(),
+                request_body: Some(request_body),
+            },
         )
         .unwrap();
     }
@@ -696,6 +895,64 @@ mod tests {
             .unwrap();
         transaction["amount"] = json!(26);
         assert!(verify_journal_links(&db, &forged_amount).is_err());
+        drop(db);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn portable_bit_rejects_node_transaction_that_differs_from_device_intent() {
+        let (db, path, ws, owner, intended_recipient) = setup();
+        let actual_recipient: i64 = db
+            .query_row("SELECT MAX(id) FROM users", [], |row| row.get(0))
+            .unwrap();
+        assert_ne!(intended_recipient, actual_recipient);
+        let key = SigningKey::generate(&mut OsRng);
+        let body = json!({"0":{"json":{
+            "workspaceId":ws,"recipientUserId":intended_recipient,
+            "amount":25,"memo":"Signed recipient"
+        }}});
+        set_signed_body(
+            &db,
+            owner,
+            &key,
+            "accounting-device-0001",
+            "/api/trpc/bit.transfer",
+            &body,
+        );
+        let forged = post(
+            &db,
+            ws,
+            owner,
+            "transfer",
+            Some(owner),
+            actual_recipient,
+            25,
+            Some("Signed recipient"),
+            None,
+        )
+        .unwrap();
+        crate::ledger::append(
+            &db,
+            ws,
+            owner,
+            None,
+            "bit_transfer",
+            forged["senderAccountGuid"].as_str(),
+            forged["txHash"].as_str(),
+            Some(25.0),
+            Some("Signed recipient"),
+        )
+        .unwrap();
+        let journal = crate::sync::export_journal(&db);
+        let event = journal["history"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|event| event["type"] == "bit_transfer")
+            .unwrap();
+        assert_eq!(event["eventVersion"], 3);
+        let error = verify_journal_links(&db, &journal).unwrap_err();
+        assert!(error.to_string().contains("recipient differs"), "{error}");
         drop(db);
         let _ = std::fs::remove_file(path);
     }

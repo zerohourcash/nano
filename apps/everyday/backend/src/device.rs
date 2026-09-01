@@ -105,6 +105,10 @@ fn should_retain_request_body(path: &str, body: &[u8]) -> bool {
         ) && body.len() <= 128 * 1024)
         || (path.starts_with("/api/trpc/interorg.") && body.len() <= 64 * 1024)
         || (path == "/api/trpc/bit.offer" && body.len() <= 16 * 1024)
+        || (matches!(
+            path,
+            "/api/trpc/bit.transfer" | "/api/trpc/bit.sale" | "/api/trpc/bit.mint"
+        ) && body.len() <= 16 * 1024)
         || (path == "/api/trpc/history.writeOff"
             && body.len() <= 16 * 1024
             && is_compact_writeoff_intent(body))
@@ -604,6 +608,20 @@ mod tests {
             &vec![0; 16 * 1024 + 1]
         ));
         assert!(requires_signature("bit.offer"));
+    }
+
+    #[test]
+    fn direct_bit_operations_retain_only_bounded_signed_intents() {
+        let body =
+            br#"{"0":{"json":{"workspaceId":1,"recipientUserId":2,"amount":25,"memo":"Shift"}}}"#;
+        for path in [
+            "/api/trpc/bit.transfer",
+            "/api/trpc/bit.mint",
+            "/api/trpc/bit.sale",
+        ] {
+            assert!(should_retain_request_body(path, body), "{path}");
+            assert!(!should_retain_request_body(path, &vec![0; 16 * 1024 + 1]));
+        }
     }
 
     #[test]
