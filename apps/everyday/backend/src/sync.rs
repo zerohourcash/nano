@@ -9220,6 +9220,132 @@ mod tests {
     }
 
     #[test]
+    fn writeoff_intent_round_trips_and_rejects_trusted_node_photo_rewrite() {
+        let source_path = std::env::temp_dir().join(format!(
+            "writeoff-intent-source-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let target_path = std::env::temp_dir().join(format!(
+            "writeoff-intent-target-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let rejected_path = std::env::temp_dir().join(format!(
+            "writeoff-intent-rejected-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let source = crate::db::open(&source_path).unwrap();
+        let target = crate::db::open(&target_path).unwrap();
+        let rejected = crate::db::open(&rejected_path).unwrap();
+        let created = chrono::Utc::now().to_rfc3339();
+        let workspace_guid = uuid::Uuid::new_v4().to_string();
+        let owner_guid = uuid::Uuid::new_v4().to_string();
+        let item_guid = uuid::Uuid::new_v4().to_string();
+        source.execute("INSERT INTO workspaces(name,internal_id_prefix,created_at,guid) VALUES('Writeoff org','W-',?1,?2)",params![created,workspace_guid]).unwrap();
+        let workspace = source.last_insert_rowid();
+        crate::db::ensure_workspace_statuses(&source, workspace).unwrap();
+        source.execute("INSERT INTO users(full_name,phone,status,role_rights,created_at,guid) VALUES('Owner','+70000000995','active',?1,?2,?3)",params![crate::db::owner_rights().to_string(),created,owner_guid]).unwrap();
+        let owner = source.last_insert_rowid();
+        source
+            .execute(
+                "INSERT INTO user_workspaces(user_id,workspace_id,rights_json) VALUES(?1,?2,?3)",
+                params![owner, workspace, crate::db::owner_rights().to_string()],
+            )
+            .unwrap();
+        record_membership_version(&source, workspace, owner, true, None, true).unwrap();
+        let status: i64 = source
+            .query_row(
+                "SELECT id FROM statuses WHERE workspace_id=?1 AND slug='in-stock'",
+                [workspace],
+                |row| row.get(0),
+            )
+            .unwrap();
+        source.execute("INSERT INTO items(internal_id,title,status_id,workspace_id,quantitative,quantity,created_at,guid) VALUES('W-1','Paint',?1,?2,1,9,?3,?4)",params![status,workspace,created,item_guid]).unwrap();
+        let item = source.last_insert_rowid();
+
+        let key = SigningKey::generate(&mut OsRng);
+        let device = "writeoff-device-0001";
+        crate::device::register(&source,owner,&json!({"deviceId":device,"name":"Writeoff phone","publicKey":URL_SAFE_NO_PAD.encode(key.verifying_key().to_bytes())})).unwrap();
+        let photo = crate::content::ingest_data_url(&source, "data:image/png;base64,QUJD")
+            .unwrap()
+            .unwrap();
+        let operation_guid = uuid::Uuid::new_v4().to_string();
+        let body = json!({"json":{
+            "itemId":item,"workspaceGuid":workspace_guid,"itemGuid":item_guid,
+            "operationGuid":operation_guid,"quantity":2.0,"comment":"Damaged paint",
+            "photoUrl":photo
+        }});
+        let proof = signed_device_proof_body(&key, device, "/api/trpc/history.writeOff", &body);
+        crate::device::set_pending(&source, owner, &proof).unwrap();
+        let commitment = hex::encode(Sha256::digest(
+            serde_json::to_vec(&json!({
+                "domain":"everyday/writeoff/v1","operationGuid":operation_guid,
+                "workspaceGuid":workspace_guid,"itemGuid":item_guid,"actorGuid":owner_guid,
+                "quantityDelta":-2.0,"comment":"Damaged paint","photoUrl":photo,
+            }))
+            .unwrap(),
+        ));
+        let event = ledger::append(
+            &source,
+            workspace,
+            owner,
+            Some(item),
+            "write_off",
+            Some(&operation_guid),
+            Some(&commitment),
+            Some(-2.0),
+            Some("Damaged paint"),
+        )
+        .unwrap();
+        source
+            .execute(
+                "UPDATE history_entries SET photo_url=?1 WHERE hash=?2",
+                params![photo, event["opId"].as_str()],
+            )
+            .unwrap();
+
+        let valid = export_journal(&source);
+        assert_eq!(verify_writeoff_records(&valid).unwrap(), (1, 0));
+        let imported = apply_remote_journal(&target, &valid, "");
+        assert_eq!(imported["ok"], true, "{imported}");
+        let restored: (f64, String) = target.query_row(
+            "SELECT h.quantity_delta,h.photo_url FROM history_entries h JOIN items i ON i.id=h.item_id WHERE h.type='write_off'",
+            [], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert_eq!(restored, (-2.0, photo.clone()));
+
+        let mut forged = valid;
+        forged["history"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|entry| entry["type"] == "write_off")
+            .unwrap()["photoUrl"] = json!(format!("cas:{}", "f".repeat(64)));
+        ledger::sign_journal(&source, &mut forged).unwrap();
+        ledger::verify_journal(&forged).unwrap();
+        let result = apply_remote_journal(&rejected, &forged, "");
+        assert_eq!(result["ok"], false, "{result}");
+        assert!(result["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("списан"));
+        assert_eq!(
+            rejected
+                .query_row(
+                    "SELECT COUNT(*) FROM history_entries WHERE type='write_off'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+
+        drop((source, target, rejected));
+        for path in [source_path, target_path, rejected_path] {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    #[test]
     fn document_intent_rejects_trusted_node_snapshot_rewrite() {
         let path =
             std::env::temp_dir().join(format!("document-intent-{}.db", uuid::Uuid::new_v4()));
