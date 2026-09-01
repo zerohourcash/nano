@@ -7,6 +7,7 @@ import json
 import sqlite3
 import urllib.error
 import urllib.request
+import uuid
 
 from sync_test import Node, TOKEN, free_port, journal_from, wait_for
 
@@ -58,11 +59,26 @@ def main() -> int:
         check("две организации имеют GUID", bool(first.get("guid") and second.get("guid")), f"{first} {second}")
 
         photos = []
+        chat_files = []
         for workspace, title, byte in [(first, "Только A", b"organization-a"), (second, "Только B", b"organization-b")]:
             photo = "data:text/plain;base64," + base64.b64encode(byte).decode()
             item = node.call("items.create", {"workspaceId": workspace["id"], "title": title, "photos": [photo]})
             check(f"создан предмет {title}", isinstance(item, dict) and item.get("id") is not None, str(item)[:120])
             photos.append(item["photos"][0]["sha256"])
+            message_guid = str(uuid.uuid4())
+            chat_data = "data:text/plain;base64," + base64.b64encode(b"chat-" + byte).decode()
+            uploaded = node.call("content.ingest", {
+                "workspaceId": workspace["id"], "purpose": "chat-attachment",
+                "messageGuid": message_guid, "dataUrl": chat_data,
+            })
+            sent_message = node.call("chat.send", {
+                "workspaceId": workspace["id"], "workspaceGuid": workspace["guid"],
+                "messageGuid": message_guid, "text": f"Файл смены {title}",
+                "attachments": [{"name": "shift.txt", "url": uploaded["url"], "mime": uploaded["mime"]}],
+            })
+            check(f"чат-файл {title} связан с signed сообщением",
+                  sent_message.get("guid") == message_guid and len(uploaded.get("hash", "")) == 64)
+            chat_files.append(uploaded["hash"])
 
         full = journal_from(node)
         node.stop(cleanup=False)
@@ -91,6 +107,11 @@ def main() -> int:
         foreign_blob_status, _ = request_json(node, f"/sync/blob/{photos[1]}?offset=0", TOKEN_A)
         check("свой CAS доступен capability", own_blob_status == 200, own_blob_status)
         check("чужой CAS недоступен даже по известному hash", foreign_blob_status == 403, foreign_blob_status)
+        own_chat_status, _ = request_json(node, f"/sync/blob/{chat_files[0]}?offset=0", TOKEN_A)
+        foreign_chat_status, _ = request_json(node, f"/sync/blob/{chat_files[1]}?offset=0", TOKEN_A)
+        check("свой CAS-файл чата доступен capability", own_chat_status == 200, own_chat_status)
+        check("чужой CAS-файл чата закрыт даже при известном hash", foreign_chat_status == 403,
+              foreign_chat_status)
 
         sync_status = node.call("sync.status", None, mutation=False)
         check("панель показывает две capability", sync_status.get("workspaceScopeMode") == "capabilities"
@@ -104,12 +125,14 @@ def main() -> int:
             "MESHKEEPER_SYNC_WORKSPACES": first["guid"],
             "MESHKEEPER_UPSTREAM": node.base,
             "MESHKEEPER_SYNC_INTERVAL": "5",
+            "MESHKEEPER_CONTENT_MODE": "full",
         })
         peer_b = Node("capability-peer-b", free_port(), {
             "MESHKEEPER_SYNC_TOKEN": TOKEN_B,
             "MESHKEEPER_SYNC_WORKSPACES": second["guid"],
             "MESHKEEPER_UPSTREAM": node.base,
             "MESHKEEPER_SYNC_INTERVAL": "5",
+            "MESHKEEPER_CONTENT_MODE": "full",
         })
         check("два scoped peer запущены", peer_a.wait_ready() and peer_b.wait_ready())
 
@@ -123,6 +146,12 @@ def main() -> int:
         with sqlite3.connect(peer_a.db) as db_a, sqlite3.connect(peer_b.db) as db_b:
             check("на каждом peer ровно один workspace", db_a.execute("SELECT count(*) FROM workspaces").fetchone()[0] == 1
                   and db_b.execute("SELECT count(*) FROM workspaces").fetchone()[0] == 1)
+            blobs_a = {row[0] for row in db_a.execute("SELECT hash FROM content_blobs")}
+            blobs_b = {row[0] for row in db_b.execute("SELECT hash FROM content_blobs")}
+            check("full peer получает свой chat CAS и не получает чужой",
+                  chat_files[0] in blobs_a and chat_files[1] not in blobs_a
+                  and chat_files[1] in blobs_b and chat_files[0] not in blobs_b,
+                  f"A={blobs_a} B={blobs_b}")
     finally:
         if peer_a is not None:
             peer_a.stop()

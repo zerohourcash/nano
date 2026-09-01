@@ -1438,7 +1438,7 @@ fn filter_journal_scope(journal: &mut Value, allowed: &HashSet<String>) {
     }
 
     let mut hashes = HashSet::new();
-    for key in ["photos", "documents", "knowledge", "custody"] {
+    for key in ["photos", "documents", "knowledge", "messages", "custody"] {
         if let Some(value) = object.get(key) {
             cas_hashes(value, &mut hashes);
         }
@@ -1518,6 +1518,10 @@ pub fn content_hash_allowed(conn: &Connection, allowed: &HashSet<String>, hash: 
     let Ok(mut statement) = conn.prepare(
         "SELECT r.attachments_json FROM knowledge_revisions r
          JOIN knowledge_pages p ON p.guid=r.page_guid JOIN workspaces w ON w.id=p.workspace_id
+         WHERE w.guid IN (SELECT value FROM json_each(?1))
+         UNION ALL
+         SELECT m.attachments_json FROM chat_messages m
+         JOIN workspaces w ON w.id=m.workspace_id
          WHERE w.guid IN (SELECT value FROM json_each(?1))",
     ) else {
         return false;
@@ -8299,6 +8303,46 @@ mod tests {
                     .unwrap()
                     .unwrap();
             db.execute("INSERT INTO item_photos(item_id,url,thumb_url,is_title,guid) VALUES(?1,?2,?2,1,?3)",params![item,cas,format!("photo-{guid}")]).unwrap();
+            let chat_cas = crate::content::ingest_data_url(
+                &db,
+                &format!(
+                    "data:text/plain;base64,{}",
+                    if guid == "org-a" {
+                        "Q0hBVC1B"
+                    } else {
+                        "Q0hBVC1C"
+                    }
+                ),
+            )
+            .unwrap()
+            .unwrap();
+            let chat_guid = format!("chat-{guid}");
+            let chat_attachments = json!([{"name":"shift.txt","url":chat_cas,"mime":"text/plain"}]);
+            let chat_commitment = crate::ledger::chat_commitment(
+                &chat_guid,
+                guid,
+                &format!("user-{guid}"),
+                "Файл смены",
+                &chat_attachments,
+            );
+            let chat_event = crate::ledger::append(
+                &db,
+                workspace,
+                user,
+                None,
+                "chat_message",
+                Some(&chat_guid),
+                Some(&chat_commitment),
+                None,
+                Some("Файл смены"),
+            )
+            .unwrap();
+            db.execute(
+                "INSERT INTO chat_messages(guid,workspace_id,user_id,text,attachments_json,ledger_hash,created_at)
+                 VALUES(?1,?2,?3,'Файл смены',?4,?5,?6)",
+                params![chat_guid, workspace, user, chat_attachments.to_string(), chat_event["opId"].as_str(), now],
+            )
+            .unwrap();
         }
         let full = export_journal(&db);
         let allowed = HashSet::from(["org-a".to_string()]);
@@ -8310,19 +8354,27 @@ mod tests {
         assert_eq!(scoped["users"].as_array().unwrap().len(), 1);
         assert_eq!(scoped["items"].as_array().unwrap().len(), 1);
         assert_eq!(scoped["photos"].as_array().unwrap().len(), 1);
-        assert_eq!(scoped["contentCatalog"].as_array().unwrap().len(), 1);
-        let allowed_hash = scoped["contentCatalog"][0]["hash"].as_str().unwrap();
-        assert!(content_hash_allowed(&db, &allowed, allowed_hash));
-        let foreign_hash = full["contentCatalog"]
+        assert_eq!(scoped["contentCatalog"].as_array().unwrap().len(), 2);
+        let allowed_hashes = scoped["contentCatalog"]
             .as_array()
             .unwrap()
             .iter()
-            .find_map(|entry| {
-                let hash = entry["hash"].as_str()?;
-                (hash != allowed_hash).then_some(hash)
-            })
-            .unwrap();
-        assert!(!content_hash_allowed(&db, &allowed, foreign_hash));
+            .filter_map(|entry| entry["hash"].as_str())
+            .collect::<Vec<_>>();
+        assert!(allowed_hashes
+            .iter()
+            .all(|hash| content_hash_allowed(&db, &allowed, hash)));
+        let foreign_hashes = full["contentCatalog"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|entry| entry["hash"].as_str())
+            .filter(|hash| !allowed_hashes.contains(hash))
+            .collect::<Vec<_>>();
+        assert_eq!(foreign_hashes.len(), 2);
+        assert!(foreign_hashes
+            .iter()
+            .all(|hash| !content_hash_allowed(&db, &allowed, hash)));
         let target_path =
             std::env::temp_dir().join(format!("scope-target-{}.db", uuid::Uuid::new_v4()));
         let target = crate::db::open(&target_path).unwrap();

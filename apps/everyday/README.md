@@ -439,6 +439,7 @@ npm run sync:test    # связка «сервер + локальный узел
 npm run mesh:test    # 3 узла, разрыв/восстановление и работа без первого узла
 npm run discovery:test # LAN discovery и отбрасывание анонса с чужим токеном
 npm run adversarial:test # повторы, replay, фальсификация и полное восстановление
+npm run capability:test # независимые bearer/scope, журналы и CAS двух организаций
 npm run interorg:test # две изолированные организации, partition и opaque relay
 npm run spam:test     # реальный HTTP flooding, дубль, restart и атомарный отказ
 npm run transport:test # MKST CLI: reorder/loss/retry/corruption через subprocess
@@ -463,6 +464,10 @@ x86_64 emulator. Этот gate исполняет durable BLE spool: восст�
 
 `npm run sync:test` поднимает два узла (сервер и локальный) и проверяет обмен
 в обе стороны, вход офлайн и отказ при неверном токене. Обоим нужен Python 3.
+
+`npm run capability:test` создаёт две организации на одной исходной ноде и два
+full-peer с разными bearer. Каждый peer получает только свою летопись и chat
+CAS; прямой запрос чужого файла по известному SHA-256 получает `403`.
 
 `npm run mesh:test` поднимает три равноправных узла без upstream, проверяет
 динамические peers, недоступность и восстановление связи, транзитивную
