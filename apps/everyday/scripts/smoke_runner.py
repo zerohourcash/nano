@@ -47,7 +47,8 @@ def wait_ready(base: str, timeout: float = 25.0) -> bool:
 
 
 def main() -> int:
-    binary = BINARY if BINARY.is_file() else FALLBACK_BINARY
+    candidates = [path for path in (BINARY, FALLBACK_BINARY) if path.is_file()]
+    binary = max(candidates, key=lambda path: path.stat().st_mtime) if candidates else BINARY
     if not binary.is_file():
         print(f"Узел не собран: нет {binary}. Выполните npm run build", file=sys.stderr)
         return 2

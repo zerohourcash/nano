@@ -657,6 +657,10 @@ pub fn export_journal_since(conn: &Connection, recipient_frontier: Option<&Value
     }
     let mut organization_node_versions = Vec::new();
     if let Ok(mut statement)=conn.prepare("SELECT version_hash,node_guid,parent_hash,depth,workspace_guid,actor_guid,active,fields_json,payload_hash,ledger_hash,updated_at FROM organization_node_versions ORDER BY node_guid,depth,version_hash"){if let Ok(rows)=statement.query_map([],|r|{let fields:String=r.get(7)?;Ok(json!({"versionHash":r.get::<_,String>(0)?,"nodeGuid":r.get::<_,String>(1)?,"parentHash":r.get::<_,Option<String>>(2)?,"depth":r.get::<_,i64>(3)?,"workspaceGuid":r.get::<_,String>(4)?,"actorGuid":r.get::<_,String>(5)?,"active":r.get::<_,i64>(6)?!=0,"fields":serde_json::from_str::<Value>(&fields).unwrap_or(Value::Null),"payloadHash":r.get::<_,String>(8)?,"ledgerHash":r.get::<_,String>(9)?,"updatedAt":r.get::<_,String>(10)?}))}){organization_node_versions.extend(rows.flatten());}}
+    let mut inventory_records = Vec::new();
+    if let Ok(mut statement)=conn.prepare("SELECT record_hash,session_guid,workspace_guid,actor_guid,kind,item_guid,fields_json,payload_hash,ledger_hash,created_at FROM inventory_records ORDER BY created_at,record_hash") {
+        if let Ok(rows)=statement.query_map([],|r|{let fields:String=r.get(6)?;Ok(json!({"recordHash":r.get::<_,String>(0)?,"sessionGuid":r.get::<_,String>(1)?,"workspaceGuid":r.get::<_,String>(2)?,"actorGuid":r.get::<_,String>(3)?,"kind":r.get::<_,String>(4)?,"itemGuid":r.get::<_,Option<String>>(5)?,"fields":serde_json::from_str::<Value>(&fields).unwrap_or(Value::Null),"payloadHash":r.get::<_,String>(7)?,"ledgerHash":r.get::<_,String>(8)?,"createdAt":r.get::<_,String>(9)?}))}) { inventory_records.extend(rows.flatten()); }
+    }
     let mut users = Vec::new();
     if let Ok(mut stmt) = conn.prepare("SELECT id, full_name, position, phone, status, role_rights, checkout_policy, guid, password_hash FROM users") {
         for row in stmt.query_map([], |r| {
@@ -981,6 +985,12 @@ pub fn export_journal_since(conn: &Connection, recipient_frontier: Option<&Value
                 .and_then(Value::as_str)
                 .is_some_and(|hash| sent.contains(hash))
         });
+        inventory_records.retain(|record| {
+            record
+                .get("ledgerHash")
+                .and_then(Value::as_str)
+                .is_some_and(|hash| sent.contains(hash))
+        });
     }
     let mut messages = Vec::new();
     if let Ok(mut stmt) = conn.prepare(
@@ -1091,6 +1101,8 @@ pub fn export_journal_since(conn: &Connection, recipient_frontier: Option<&Value
         "knowledge": crate::knowledge::export(conn),
     });
     if let Some(object) = journal.as_object_mut() {
+        object.insert("inventoryMode".into(), json!("append-only-records/v1"));
+        object.insert("inventoryRecords".into(), Value::Array(inventory_records));
         object.insert("organizationNodeMode".into(), json!("portable-branches/v1"));
         object.insert(
             "organizationNodeVersions".into(),
@@ -1159,6 +1171,7 @@ fn filter_journal_scope(journal: &mut Value, allowed: &HashSet<String>) {
         "changeRequests",
         "configVersions",
         "itemStateVersions",
+        "inventoryRecords",
         "messages",
         "frontier",
     ] {
@@ -2817,6 +2830,20 @@ pub fn import_journal(conn: &Connection, journal: &Value) -> Value {
             return json!({"ok":false,"error":format!("Не удалось восстановить заявки: {error}")});
         }
     }
+    if let Some(records) = journal.get("inventoryRecords").and_then(Value::as_array) {
+        for record in records {
+            let fields = record.get("fields").cloned().unwrap_or(Value::Null);
+            let inserted=conn.execute("INSERT OR IGNORE INTO inventory_records(record_hash,session_guid,workspace_guid,actor_guid,kind,item_guid,number,expected_qty,actual_qty,checked,fields_json,payload_hash,ledger_hash,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",params![record.get("recordHash").and_then(Value::as_str),record.get("sessionGuid").and_then(Value::as_str),record.get("workspaceGuid").and_then(Value::as_str),record.get("actorGuid").and_then(Value::as_str),record.get("kind").and_then(Value::as_str),record.get("itemGuid").and_then(Value::as_str),fields.get("number").and_then(Value::as_str),fields.get("expectedQty").and_then(Value::as_f64),fields.get("actualQty").and_then(Value::as_f64),fields.get("checked").and_then(Value::as_bool).map(i64::from),fields.to_string(),record.get("payloadHash").and_then(Value::as_str),record.get("ledgerHash").and_then(Value::as_str),record.get("createdAt").and_then(Value::as_str)]).unwrap_or(0);
+            if inserted > 0 {
+                ops += 1
+            } else {
+                skipped += 1
+            }
+        }
+        if let Err(error) = rebuild_inventory_state(conn) {
+            return json!({"ok":false,"error":format!("Не удалось восстановить инвентаризацию: {error}")});
+        }
+    }
     if let Some(arr) = journal.get("messages").and_then(Value::as_array) {
         for message in arr {
             let guid = message.get("guid").and_then(Value::as_str).unwrap_or("");
@@ -3250,6 +3277,9 @@ pub fn apply_remote_journal(conn: &Connection, journal: &Value, peer_url: &str) 
     if let Err(error) = verify_item_state_versions(conn, journal) {
         return json!({"ok":false,"error":format!("Проверка master-летописи ТМЦ: {error}")});
     }
+    if let Err(error) = verify_inventory_records(conn, journal) {
+        return json!({"ok":false,"error":format!("Проверка летописи инвентаризации: {error}")});
+    }
     if let Err(error) = crate::accounting::verify_journal_links(conn, journal) {
         return json!({"ok":false,"error":format!("Проверка Bit-летописи: {error}")});
     }
@@ -3328,6 +3358,10 @@ pub fn apply_remote_journal(conn: &Connection, journal: &Value, peer_url: &str) 
     if let Err(error) = verify_stored_item_state_versions(conn) {
         let _ = conn.execute_batch("ROLLBACK TO verified_sync; RELEASE verified_sync");
         return json!({"ok":false,"error":format!("Проверка сохранённой master-летописи ТМЦ: {error}")});
+    }
+    if let Err(error) = verify_stored_inventory_records(conn) {
+        let _ = conn.execute_batch("ROLLBACK TO verified_sync; RELEASE verified_sync");
+        return json!({"ok":false,"error":format!("Проверка сохранённой инвентаризации: {error}")});
     }
     if let Err(error) = ledger::verify_chat_links(conn) {
         let _ = conn.execute_batch("ROLLBACK TO verified_sync; RELEASE verified_sync");
@@ -4393,6 +4427,271 @@ fn verify_stored_organization_node_versions(conn: &Connection) -> anyhow::Result
     Ok(snapshot["organizationNodeVersions"]
         .as_array()
         .map_or(0, Vec::len))
+}
+
+fn inventory_payload_hash(record: &Value) -> anyhow::Result<String> {
+    let payload = json!({"domain":"everyday/inventory/v1","sessionGuid":record.get("sessionGuid"),"workspaceGuid":record.get("workspaceGuid"),"actorGuid":record.get("actorGuid"),"kind":record.get("kind"),"itemGuid":record.get("itemGuid").unwrap_or(&Value::Null),"fields":record.get("fields"),"createdAt":record.get("createdAt")});
+    Ok(format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&payload)?)
+    ))
+}
+fn inventory_record_hash(payload_hash: &str, ledger_hash: &str) -> String {
+    format!(
+        "{:x}",
+        Sha256::digest(
+            format!("everyday/inventory-ledger/v1\n{payload_hash}\n{ledger_hash}").as_bytes()
+        )
+    )
+}
+
+fn verify_inventory_records(conn: &Connection, journal: &Value) -> anyhow::Result<()> {
+    if journal.get("inventoryMode").and_then(Value::as_str) != Some("append-only-records/v1") {
+        anyhow::bail!("journal does not provide portable inventory")
+    }
+    let records = journal
+        .get("inventoryRecords")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("journal has no inventory records"))?;
+    let unique: HashSet<&str> = records
+        .iter()
+        .filter_map(|r| r.get("recordHash").and_then(Value::as_str))
+        .collect();
+    if unique.len() != records.len() {
+        anyhow::bail!("duplicate inventory record")
+    }
+    let history: HashMap<&str, &Value> = journal
+        .get("history")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.get("opId").and_then(Value::as_str).map(|h| (h, e)))
+        .collect();
+    let incoming_creates: HashSet<&str> = records
+        .iter()
+        .filter(|r| {
+            matches!(
+                r.get("kind").and_then(Value::as_str),
+                Some("create" | "adopt_check" | "adopt_complete")
+            )
+        })
+        .filter_map(|r| r.get("sessionGuid").and_then(Value::as_str))
+        .collect();
+    let incoming_create_count = records
+        .iter()
+        .filter(|r| {
+            matches!(
+                r.get("kind").and_then(Value::as_str),
+                Some("create" | "adopt_check" | "adopt_complete")
+            )
+        })
+        .count();
+    if incoming_creates.len() != incoming_create_count {
+        anyhow::bail!("duplicate inventory session root")
+    }
+    for record in records {
+        let get = |key: &str| {
+            record
+                .get(key)
+                .and_then(Value::as_str)
+                .filter(|v| !v.is_empty())
+                .ok_or_else(|| anyhow::anyhow!("inventory record has no {key}"))
+        };
+        let hash = get("recordHash")?;
+        let session = get("sessionGuid")?;
+        let ws = get("workspaceGuid")?;
+        let actor = get("actorGuid")?;
+        let kind = get("kind")?;
+        let payload = get("payloadHash")?;
+        let ledger_hash = get("ledgerHash")?;
+        if !matches!(
+            kind,
+            "create" | "check" | "complete" | "adopt_check" | "adopt_complete"
+        ) || !record.get("fields").is_some_and(Value::is_object)
+        {
+            anyhow::bail!("invalid inventory record")
+        }
+        let fields = &record["fields"];
+        match kind {
+            "create" | "adopt_check" | "adopt_complete" => {
+                if fields
+                    .get("number")
+                    .and_then(Value::as_str)
+                    .is_none_or(|v| v.is_empty() || v.chars().count() > 80)
+                {
+                    anyhow::bail!("invalid inventory number")
+                }
+                let results = fields
+                    .get("results")
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| anyhow::anyhow!("inventory root has no results"))?;
+                if results.len() > 100_000
+                    || results.iter().any(|result| {
+                        result.get("itemGuid").and_then(Value::as_str).is_none()
+                            || result
+                                .get("expectedQty")
+                                .and_then(Value::as_f64)
+                                .is_none_or(|v| !v.is_finite() || v < 0.0)
+                    })
+                {
+                    anyhow::bail!("invalid inventory root results")
+                }
+            }
+            "check" => {
+                if fields.get("checked").and_then(Value::as_bool).is_none()
+                    || fields
+                        .get("actualQty")
+                        .and_then(Value::as_f64)
+                        .is_some_and(|v| !v.is_finite() || v < 0.0)
+                {
+                    anyhow::bail!("invalid inventory check")
+                }
+            }
+            "complete" => {
+                if fields
+                    .get("totalItems")
+                    .and_then(Value::as_i64)
+                    .is_none_or(|v| v < 0)
+                    || fields
+                        .get("checkedItems")
+                        .and_then(Value::as_i64)
+                        .is_none_or(|v| v < 0)
+                {
+                    anyhow::bail!("invalid inventory completion")
+                }
+            }
+            _ => unreachable!(),
+        }
+        if matches!(kind, "check" | "adopt_check")
+            && record.get("itemGuid").and_then(Value::as_str).is_none()
+        {
+            anyhow::bail!("inventory check has no item")
+        }
+        if !matches!(kind, "create" | "adopt_check" | "adopt_complete")
+            && !incoming_creates.contains(session)
+        {
+            let exists: i64 = conn.query_row(
+                "SELECT count(*) FROM inventory_records WHERE session_guid=?1 AND kind IN ('create','adopt_check','adopt_complete')",
+                [session],
+                |r| r.get(0),
+            )?;
+            if exists == 0 {
+                anyhow::bail!("inventory session root unavailable")
+            }
+        }
+        if inventory_payload_hash(record)? != payload
+            || inventory_record_hash(payload, ledger_hash) != hash
+        {
+            anyhow::bail!("inventory record hash mismatch")
+        }
+        let expected_type = format!("inventory_{kind}");
+        let validate = |event: &&Value| {
+            event.get("type").and_then(Value::as_str) == Some(expected_type.as_str())
+                && event.get("workspaceGuid").and_then(Value::as_str) == Some(ws)
+                && event.get("actorGuid").and_then(Value::as_str) == Some(actor)
+                && event.get("fromLabel").and_then(Value::as_str) == Some(session)
+                && event.get("toLabel").and_then(Value::as_str) == Some(payload)
+                && event.get("itemGuid").unwrap_or(&Value::Null)
+                    == record.get("itemGuid").unwrap_or(&Value::Null)
+                && [
+                    "requestDeviceId",
+                    "requestPublicKey",
+                    "requestNonce",
+                    "requestSignature",
+                    "requestHash",
+                    "requestTimestamp",
+                    "requestPath",
+                ]
+                .iter()
+                .all(|key| {
+                    event
+                        .get(*key)
+                        .and_then(Value::as_str)
+                        .is_some_and(|v| !v.is_empty())
+                })
+        };
+        if let Some(event) = history.get(ledger_hash) {
+            if !validate(event) {
+                anyhow::bail!("inventory ledger evidence mismatch")
+            }
+        } else {
+            let exists:i64=conn.query_row("SELECT count(*) FROM history_entries h JOIN workspaces w ON w.id=h.workspace_id JOIN users u ON u.id=h.actor_user_id WHERE h.hash=?1 AND w.guid=?2 AND u.guid=?3 AND h.type=?4 AND h.from_label=?5 AND h.to_label=?6 AND h.request_device_id IS NOT NULL AND h.request_signature IS NOT NULL",params![ledger_hash,ws,actor,expected_type,session,payload],|r|r.get(0))?;
+            if exists == 0 {
+                anyhow::bail!("inventory ledger event unavailable")
+            }
+        }
+    }
+    Ok(())
+}
+fn verify_stored_inventory_records(conn: &Connection) -> anyhow::Result<usize> {
+    let journal = export_journal(conn);
+    verify_inventory_records(conn, &journal)?;
+    Ok(journal["inventoryRecords"].as_array().map_or(0, Vec::len))
+}
+
+fn rebuild_inventory_state(conn: &Connection) -> anyhow::Result<()> {
+    let mut sessions = conn
+        .prepare("SELECT DISTINCT session_guid FROM inventory_records")?
+        .query_map([], |r| r.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    sessions.sort();
+    for session_guid in sessions {
+        let root:Option<(String,String,String,String)>=conn.query_row("SELECT workspace_guid,actor_guid,fields_json,created_at FROM inventory_records WHERE session_guid=?1 AND kind IN ('create','adopt_check','adopt_complete') ORDER BY created_at,record_hash LIMIT 1",[&session_guid],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
+        let Some((ws_guid, actor_guid, raw, created_at)) = root else {
+            continue;
+        };
+        let Some(ws) = id_by_guid(conn, "workspaces", &ws_guid) else {
+            continue;
+        };
+        let Some(actor) = id_by_guid(conn, "users", &actor_guid) else {
+            continue;
+        };
+        let fields: Value = serde_json::from_str(&raw)?;
+        let number = fields
+            .get("number")
+            .and_then(Value::as_str)
+            .unwrap_or("ИНВ-OFFLINE");
+        conn.execute("INSERT OR IGNORE INTO inventory_sessions(guid,number,workspace_id,status,started_by,created_at) VALUES(?1,?2,?3,'in_progress',?4,?5)",params![session_guid,number,ws,actor,created_at])?;
+        conn.execute(
+            "UPDATE inventory_sessions SET number=?1,workspace_id=?2,started_by=?3 WHERE guid=?4",
+            params![number, ws, actor, session_guid],
+        )?;
+        let sid = id_by_guid(conn, "inventory_sessions", &session_guid)
+            .ok_or_else(|| anyhow::anyhow!("inventory session unavailable"))?;
+        conn.execute("DELETE FROM inventory_results WHERE session_id=?1", [sid])?;
+        if let Some(results) = fields.get("results").and_then(Value::as_array) {
+            for result in results {
+                if let Some(item) = result
+                    .get("itemGuid")
+                    .and_then(Value::as_str)
+                    .and_then(|g| id_by_guid(conn, "items", g))
+                {
+                    conn.execute("INSERT OR IGNORE INTO inventory_results(session_id,item_id,expected_qty,actual_qty,checked) VALUES(?1,?2,?3,?4,?5)",params![sid,item,result.get("expectedQty").and_then(Value::as_f64),result.get("actualQty").and_then(Value::as_f64),result.get("checked").and_then(Value::as_bool).unwrap_or(false) as i64])?;
+                }
+            }
+        }
+        let mut checks=conn.prepare("SELECT item_guid,fields_json FROM inventory_records WHERE session_guid=?1 AND kind='check' ORDER BY created_at,record_hash")?.query_map([&session_guid],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?)))?.collect::<Result<Vec<_>,_>>()?;
+        for (item_guid, raw) in checks.drain(..) {
+            if let Some(item) = id_by_guid(conn, "items", &item_guid) {
+                let fields: Value = serde_json::from_str(&raw)?;
+                conn.execute("INSERT INTO inventory_results(session_id,item_id,expected_qty,actual_qty,checked) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(session_id,item_id) DO UPDATE SET actual_qty=excluded.actual_qty,checked=excluded.checked",params![sid,item,fields.get("expectedQty").and_then(Value::as_f64),fields.get("actualQty").and_then(Value::as_f64),fields.get("checked").and_then(Value::as_bool).unwrap_or(false) as i64])?;
+            }
+        }
+        let completion:Option<String>=conn.query_row("SELECT created_at FROM inventory_records WHERE session_guid=?1 AND kind IN ('complete','adopt_complete') ORDER BY created_at DESC,record_hash DESC LIMIT 1",[&session_guid],|r|r.get(0)).optional()?;
+        conn.execute(
+            "UPDATE inventory_sessions SET status=?1,completed_at=?2 WHERE id=?3",
+            params![
+                if completion.is_some() {
+                    "completed"
+                } else {
+                    "in_progress"
+                },
+                completion,
+                sid
+            ],
+        )?;
+    }
+    Ok(())
 }
 
 fn verify_config_versions(conn: &Connection, journal: &Value) -> anyhow::Result<()> {
@@ -5619,6 +5918,7 @@ pub fn integrity_audit(conn: &Connection) -> Value {
     let config_result = verify_stored_config_versions(conn);
     let item_state_result = verify_stored_item_state_versions(conn);
     let organization_node_result = verify_stored_organization_node_versions(conn);
+    let inventory_result = verify_stored_inventory_records(conn);
     let membership_result = verify_membership_records(conn, &snapshot);
 
     let count = |table: &str| -> i64 {
@@ -5648,6 +5948,7 @@ pub fn integrity_audit(conn: &Connection) -> Value {
                (SELECT COUNT(*) FROM categories WHERE guid IS NULL OR guid='') +
                (SELECT COUNT(*) FROM brands WHERE guid IS NULL OR guid='') +
                (SELECT COUNT(*) FROM statuses WHERE guid IS NULL OR guid='') +
+               (SELECT COUNT(*) FROM inventory_sessions WHERE guid IS NULL OR guid='') +
                (SELECT COUNT(*) FROM history_entries WHERE guid IS NULL OR guid='') +
                (SELECT COUNT(*) FROM chat_messages WHERE guid IS NULL OR guid='')",
             [],
@@ -5712,6 +6013,7 @@ pub fn integrity_audit(conn: &Connection) -> Value {
         .as_ref()
         .err()
         .map(ToString::to_string);
+    let inventory_error = inventory_result.as_ref().err().map(ToString::to_string);
     let membership_error = membership_result.as_ref().err().map(ToString::to_string);
     let healthy = database_check == "ok"
         && ledger_result.is_ok()
@@ -5728,6 +6030,7 @@ pub fn integrity_audit(conn: &Connection) -> Value {
         && config_result.is_ok()
         && item_state_result.is_ok()
         && organization_node_result.is_ok()
+        && inventory_result.is_ok()
         && membership_result.is_ok()
         && orphan_history == 0
         && missing_guids == 0
@@ -5749,6 +6052,7 @@ pub fn integrity_audit(conn: &Connection) -> Value {
         "configVersions":count("config_versions"),
         "itemStateVersions":count("item_state_versions"),
         "organizationNodeVersions":count("organization_node_versions"),
+        "inventoryRecords":count("inventory_records"),
     });
     let mut audit = json!({
         "healthy": healthy,
@@ -5794,6 +6098,14 @@ pub fn integrity_audit(conn: &Connection) -> Value {
         "ledgerHeads": heads,
     });
     if let Some(object) = audit.as_object_mut() {
+        object.insert(
+            "inventoryError".into(),
+            inventory_error.map(Value::String).unwrap_or(Value::Null),
+        );
+        object.insert(
+            "inventoryRecordsVerified".into(),
+            json!(inventory_result.unwrap_or(0)),
+        );
         object.insert(
             "organizationNodeError".into(),
             organization_node_error
@@ -7465,6 +7777,103 @@ mod tests {
             .as_str()
             .unwrap_or_default()
             .contains("справочников"));
+        drop((source, target, rejected));
+        for path in [source_path, target_path, rejected_path] {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    #[test]
+    fn signed_inventory_round_trip_and_tamper_rejection() {
+        let source_path =
+            std::env::temp_dir().join(format!("inventory-source-{}.db", uuid::Uuid::new_v4()));
+        let target_path =
+            std::env::temp_dir().join(format!("inventory-target-{}.db", uuid::Uuid::new_v4()));
+        let rejected_path =
+            std::env::temp_dir().join(format!("inventory-rejected-{}.db", uuid::Uuid::new_v4()));
+        let mut source = crate::db::open(&source_path).unwrap();
+        let target = crate::db::open(&target_path).unwrap();
+        let rejected = crate::db::open(&rejected_path).unwrap();
+        let created = chrono::Utc::now().to_rfc3339();
+        source.execute("INSERT INTO workspaces(name,internal_id_prefix,created_at,guid) VALUES('Inventory org','I-',?1,'inventory-workspace')",[&created]).unwrap();
+        let workspace = source.last_insert_rowid();
+        source.execute("INSERT INTO users(full_name,phone,status,role_rights,created_at,guid) VALUES('Owner','+70000000111','active',?1,?2,'inventory-owner')",params![crate::db::owner_rights().to_string(),created]).unwrap();
+        let owner = source.last_insert_rowid();
+        source
+            .execute(
+                "INSERT INTO user_workspaces(user_id,workspace_id,rights_json) VALUES(?1,?2,?3)",
+                params![owner, workspace, crate::db::owner_rights().to_string()],
+            )
+            .unwrap();
+        record_membership_version(&source, workspace, owner, true, None, true).unwrap();
+        let key = SigningKey::generate(&mut OsRng);
+        let device = "inventory-device-0001";
+        crate::device::register(&source,owner,&json!({"deviceId":device,"name":"Scanner","publicKey":URL_SAFE_NO_PAD.encode(key.verifying_key().to_bytes())})).unwrap();
+        crate::device::set_pending(
+            &source,
+            owner,
+            &signed_device_proof(&key, device, "/api/trpc/items.create"),
+        )
+        .unwrap();
+        let item=crate::api::dispatch(&mut source,"items.create",&json!({"workspaceId":workspace,"title":"Cable","internalId":"I-0001","quantitative":true,"quantity":10,"unit":"pcs"}),Some(owner)).unwrap();
+        crate::device::set_pending(
+            &source,
+            owner,
+            &signed_device_proof(&key, device, "/api/trpc/inventory.create"),
+        )
+        .unwrap();
+        let session = crate::api::dispatch(
+            &mut source,
+            "inventory.create",
+            &json!({"workspaceId":workspace}),
+            Some(owner),
+        )
+        .unwrap();
+        crate::device::set_pending(
+            &source,
+            owner,
+            &signed_device_proof(&key, device, "/api/trpc/inventory.checkItem"),
+        )
+        .unwrap();
+        crate::api::dispatch(
+            &mut source,
+            "inventory.checkItem",
+            &json!({"sessionId":session["id"],"itemId":item["id"],"checked":true,"actualQty":7}),
+            Some(owner),
+        )
+        .unwrap();
+        crate::device::set_pending(
+            &source,
+            owner,
+            &signed_device_proof(&key, device, "/api/trpc/inventory.complete"),
+        )
+        .unwrap();
+        crate::api::dispatch(
+            &mut source,
+            "inventory.complete",
+            &json!({"sessionId":session["id"]}),
+            Some(owner),
+        )
+        .unwrap();
+        let valid = export_journal(&source);
+        assert_eq!(valid["inventoryRecords"].as_array().unwrap().len(), 3);
+        let accepted = apply_remote_journal(&target, &valid, "");
+        assert_eq!(accepted["ok"], true, "{accepted}");
+        let restored:(String,f64,bool)=target.query_row("SELECT s.status,r.actual_qty,r.checked!=0 FROM inventory_sessions s JOIN inventory_results r ON r.session_id=s.id",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+        assert_eq!(restored, ("completed".into(), 7.0, true));
+        assert_eq!(verify_stored_inventory_records(&target).unwrap(), 3);
+        let mut forged = valid;
+        forged["inventoryRecords"][1]["fields"]["actualQty"] = json!(99);
+        ledger::sign_journal(&source, &mut forged).unwrap();
+        let result = apply_remote_journal(&rejected, &forged, "");
+        assert_eq!(result["ok"], false, "{result}");
+        assert!(
+            result["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("инвентаризации"),
+            "{result}"
+        );
         drop((source, target, rejected));
         for path in [source_path, target_path, rejected_path] {
             let _ = std::fs::remove_file(path);

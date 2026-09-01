@@ -89,6 +89,7 @@ const CRITICAL = [
   'history.writeOff',
   'history.replenish',
   'history.move',
+  'inventory.create',
   'inventory.checkItem',
   'inventory.complete',
   'chat.send',

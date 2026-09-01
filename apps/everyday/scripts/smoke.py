@@ -310,6 +310,8 @@ decision = owner.call("items.decideChange", {"id": owner_change.get("id"), "acce
 check("change decision is ledger-bound and applied", bool(decision.get("recordHash")) and owner.call("items.byId", {"id": item_id}, mutation=False).get("title") == "Перфоратор Bosch GBH 2-26", str(decision)[:180])
 
 print("\n== 13. Инвентаризация ==")
+unsigned_inventory = owner.call("inventory.create", {"workspaceId": ws_id}, signed=False)
+check("unsigned inventory creation rejected", unsigned_inventory.get("__http") == 403 and "DEVICE_SIGNATURE_REQUIRED" in unsigned_inventory.get("__body", ""), str(unsigned_inventory)[:160])
 inv_s = owner.call("inventory.create", {"workspaceId": ws_id, "name": "Проверка августа"})
 show("inventory.create", inv_s)
 sid = inv_s.get("id") if isinstance(inv_s, dict) else None

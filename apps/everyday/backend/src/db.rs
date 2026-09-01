@@ -149,6 +149,7 @@ fn migrate(conn: &Connection) -> Result<()> {
         "ALTER TABLE item_documents ADD COLUMN access_level TEXT NOT NULL DEFAULT 'members'",
         [],
     );
+    let _ = conn.execute("ALTER TABLE inventory_sessions ADD COLUMN guid TEXT", []);
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS content_blobs (
            hash TEXT PRIMARY KEY, mime TEXT NOT NULL, size INTEGER NOT NULL,
@@ -453,6 +454,26 @@ fn migrate(conn: &Connection) -> Result<()> {
           ON user_workspaces(user_id, workspace_id);
         CREATE UNIQUE INDEX IF NOT EXISTS inventory_result_pair_uq
           ON inventory_results(session_id, item_id);
+        CREATE UNIQUE INDEX IF NOT EXISTS inventory_sessions_guid_uq
+          ON inventory_sessions(guid) WHERE guid IS NOT NULL;
+        CREATE TABLE IF NOT EXISTS inventory_records (
+          record_hash TEXT PRIMARY KEY,
+          session_guid TEXT NOT NULL,
+          workspace_guid TEXT NOT NULL,
+          actor_guid TEXT NOT NULL,
+          kind TEXT NOT NULL CHECK(kind IN ('create','check','complete','adopt_check','adopt_complete')),
+          item_guid TEXT,
+          number TEXT,
+          expected_qty REAL,
+          actual_qty REAL,
+          checked INTEGER,
+          fields_json TEXT NOT NULL,
+          payload_hash TEXT NOT NULL,
+          ledger_hash TEXT NOT NULL UNIQUE,
+          created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS inventory_records_session_idx
+          ON inventory_records(session_guid,created_at,record_hash);
         CREATE UNIQUE INDEX IF NOT EXISTS hist_hash_uq ON history_entries(hash);
         CREATE UNIQUE INDEX IF NOT EXISTS items_source_external_uq
           ON items(workspace_id, source_system, external_id)
@@ -653,6 +674,7 @@ pub fn fill_guids(conn: &Connection) -> Result<()> {
         ("history_entries", "guid"),
         ("item_photos", "guid"),
         ("item_documents", "guid"),
+        ("inventory_sessions", "guid"),
         ("storages", "guid"),
         ("building_sites", "guid"),
         ("categories", "guid"),
@@ -870,6 +892,7 @@ fn init_schema(conn: &Connection) -> Result<()> {
         );
         CREATE TABLE IF NOT EXISTS inventory_sessions (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
+          guid TEXT,
           number TEXT NOT NULL,
           workspace_id INTEGER NOT NULL,
           status TEXT NOT NULL DEFAULT 'in_progress',

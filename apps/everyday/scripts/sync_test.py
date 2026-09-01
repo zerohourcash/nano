@@ -158,7 +158,8 @@ class Node:
 
 
 def binary() -> Path:
-    return BINARY if BINARY.is_file() else FALLBACK
+    candidates = [path for path in (BINARY, FALLBACK) if path.is_file()]
+    return max(candidates, key=lambda path: path.stat().st_mtime) if candidates else BINARY
 
 
 def titles(node: Node, workspace_id: int) -> list[str]:
@@ -520,6 +521,20 @@ def main() -> int:
             held_material.get("issuedQty") == 4 and held_material.get("stockQty") == 6,
             str(held_material)[:180],
         )
+        inventory = node.call("inventory.create", {"workspaceId": node_ws_id})
+        node.call("inventory.checkItem", {
+            "sessionId": inventory["id"], "itemId": material["id"],
+            "checked": True, "actualQty": 6,
+        })
+        inventory_done = node.call("inventory.complete", {"sessionId": inventory["id"]})
+        inventory_records = journal_from(node).get("inventoryRecords", [])
+        check(
+            "офлайн-инвентаризация записана переносимыми подписанными фактами",
+            bool(inventory_done.get("completedAt"))
+            and len(inventory_records) == 3
+            and {row.get("kind") for row in inventory_records} == {"create", "check", "complete"},
+            str({"completedAt": inventory_done.get("completedAt"), "recordHash": inventory_done.get("recordHash"), "records": inventory_records})[:1000],
+        )
         node_me = node.call("meta.currentUser", None, mutation=False)
         minted = node.call(
             "bit.mint",
@@ -566,6 +581,20 @@ def main() -> int:
         node.call("sync.pullNow", {})
         back = wait_for(lambda: "Шуруповёрт с узла" in titles(server, ws_id))
         check("предмет с узла доехал до сервера", back, str(titles(server, ws_id))[:160])
+        restored_inventory = None
+        def inventory_arrived():
+            nonlocal restored_inventory
+            rows = server.call("inventory.sessions", {"workspaceId": ws_id}, mutation=False)
+            found = next((row for row in rows if row.get("number") == inventory.get("number")), None) if isinstance(rows, list) else None
+            restored_inventory = server.call("inventory.byId", {"id": found["id"]}, mutation=False) if found else None
+            return isinstance(restored_inventory, dict) and restored_inventory.get("status") == "completed"
+        inventory_synced = wait_for(inventory_arrived, timeout=30)
+        check(
+            "полная нода восстановила сессию и результаты офлайн-инвентаризации",
+            inventory_synced
+            and any(row.get("item", {}).get("title") == "Кабель бухта с узла" and row.get("checked") for row in restored_inventory.get("results", [])),
+            str(restored_inventory)[:240],
+        )
         back_card = item_named(server, ws_id, "Шуруповёрт с узла")
         check(
             "metadata с узла доехала до сервера",

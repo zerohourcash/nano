@@ -3452,6 +3452,95 @@ fn inv_session_full(conn: &Connection, id: i64) -> Option<Value> {
     ).ok()
 }
 
+fn inventory_record_hash(payload_hash: &str, ledger_hash: &str) -> String {
+    format!(
+        "{:x}",
+        Sha256::digest(
+            format!("everyday/inventory-ledger/v1\n{payload_hash}\n{ledger_hash}").as_bytes()
+        )
+    )
+}
+
+fn record_inventory_event(
+    conn: &Connection,
+    session_id: i64,
+    actor_id: i64,
+    kind: &str,
+    item_id: Option<i64>,
+    mut fields: Value,
+) -> Result<Value, ApiError> {
+    let (session_guid, workspace_id): (Option<String>, i64) = conn.query_row(
+        "SELECT guid,workspace_id FROM inventory_sessions WHERE id=?1",
+        [session_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let session_guid = session_guid
+        .filter(|guid| !guid.is_empty())
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    conn.execute(
+        "UPDATE inventory_sessions SET guid=?1 WHERE id=?2 AND (guid IS NULL OR guid='')",
+        params![session_guid, session_id],
+    )?;
+    let roots:i64=conn.query_row("SELECT count(*) FROM inventory_records WHERE session_guid=?1 AND kind IN ('create','adopt_check','adopt_complete')",[&session_guid],|r|r.get(0))?;
+    let effective_kind = if roots == 0 && kind != "create" {
+        format!("adopt_{kind}")
+    } else {
+        kind.to_string()
+    };
+    if effective_kind.starts_with("adopt_") {
+        let number: String = conn.query_row(
+            "SELECT number FROM inventory_sessions WHERE id=?1",
+            [session_id],
+            |r| r.get(0),
+        )?;
+        let mut results = Vec::new();
+        let mut statement=conn.prepare("SELECT i.guid,r.expected_qty,r.actual_qty,r.checked FROM inventory_results r JOIN items i ON i.id=r.item_id WHERE r.session_id=?1 ORDER BY i.guid")?;
+        let rows=statement.query_map([session_id],|r|Ok(json!({"itemGuid":r.get::<_,String>(0)?,"expectedQty":r.get::<_,Option<f64>>(1)?,"actualQty":r.get::<_,Option<f64>>(2)?,"checked":r.get::<_,i64>(3)?!=0})))?;
+        results.extend(rows.flatten());
+        fields["number"] = json!(number);
+        fields["results"] = Value::Array(results);
+    }
+    let workspace_guid = ledger::guid(conn, "workspaces", workspace_id)
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    let actor_guid = ledger::guid(conn, "users", actor_id)
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    let item_guid = item_id
+        .map(|id| ledger::guid(conn, "items", id))
+        .transpose()
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    let created_at = now();
+    let payload = json!({
+        "domain":"everyday/inventory/v1", "sessionGuid":session_guid,
+        "workspaceGuid":workspace_guid, "actorGuid":actor_guid, "kind":effective_kind,
+        "itemGuid":item_guid, "fields":fields, "createdAt":created_at
+    });
+    let payload_hash = format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&payload).expect("JSON serialization"))
+    );
+    let event = ledger::append(
+        conn,
+        workspace_id,
+        actor_id,
+        item_id,
+        &format!("inventory_{effective_kind}"),
+        Some(&session_guid),
+        Some(&payload_hash),
+        None,
+        Some("Подписанная летопись инвентаризации"),
+    )
+    .map_err(|error| ApiError::internal(format!("Ошибка журнала: {error}")))?;
+    let ledger_hash = event["opId"]
+        .as_str()
+        .ok_or_else(|| ApiError::internal("Ledger не вернул hash"))?;
+    let record_hash = inventory_record_hash(&payload_hash, ledger_hash);
+    conn.execute(
+        "INSERT INTO inventory_records(record_hash,session_guid,workspace_guid,actor_guid,kind,item_guid,number,expected_qty,actual_qty,checked,fields_json,payload_hash,ledger_hash,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+        params![record_hash,session_guid,workspace_guid,actor_guid,effective_kind,item_guid,fields.get("number").and_then(Value::as_str),fields.get("expectedQty").and_then(Value::as_f64),fields.get("actualQty").and_then(Value::as_f64),fields.get("checked").and_then(Value::as_bool).map(i64::from),fields.to_string(),payload_hash,ledger_hash,created_at],
+    )?;
+    Ok(json!({"recordHash":record_hash,"ledgerHash":ledger_hash}))
+}
+
 fn inv_by_id(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
     let uid = require_user(conn, user_id)?;
     let id = i64v(input, "id").ok_or_else(|| ApiError::bad("id"))?;
@@ -3475,7 +3564,11 @@ fn inv_results(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiRes
     let s = inv_session_full(conn, sid).ok_or_else(|| ApiError::not_found("Сессия не найдена"))?;
     Ok(s.get("results").cloned().unwrap_or(json!([])))
 }
-fn inv_create(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
+fn inv_create(conn: &mut Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
+    atomic(conn, |conn| inv_create_atomic(conn, input, user_id))
+}
+
+fn inv_create_atomic(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
     let uid = require_user(conn, user_id)?;
     require_can(conn, uid, "inventory")?;
     let ws = i64v(input, "workspaceId").unwrap_or_else(|| ws_fallback(conn));
@@ -3485,7 +3578,7 @@ fn inv_create(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiResu
         |r| r.get(0),
     )?;
     let number = format!("ИНВ-{:03}", n + 1);
-    conn.execute("INSERT INTO inventory_sessions (number, workspace_id, started_by, created_at) VALUES (?1,?2,?3,?4)", params![number, ws, uid, now()])?;
+    conn.execute("INSERT INTO inventory_sessions (guid,number, workspace_id, started_by, created_at) VALUES (?1,?2,?3,?4,?5)", params![Uuid::new_v4().to_string(),number, ws, uid, now()])?;
     let sid = conn.last_insert_rowid();
     let mut sql = String::from(
         "SELECT id, quantity, quantitative FROM items WHERE workspace_id=?1 AND archived=0",
@@ -3502,9 +3595,24 @@ fn inv_create(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiResu
         let exp = if qnt != 0 { qty.unwrap_or(0.0) } else { 1.0 };
         conn.execute("INSERT INTO inventory_results (session_id, item_id, expected_qty, checked) VALUES (?1,?2,?3,0)", params![sid, id, exp])?;
     }
-    inv_session_full(conn, sid).ok_or_else(|| ApiError::bad("ошибка"))
+    let session = inv_session_full(conn, sid).ok_or_else(|| ApiError::bad("ошибка"))?;
+    let results = session["results"].as_array().cloned().unwrap_or_default().into_iter().filter_map(|result| Some(json!({"itemGuid":ledger::guid(conn,"items",result["itemId"].as_i64()?).ok()?,"expectedQty":result["expectedQty"]}))).collect::<Vec<_>>();
+    let proof = record_inventory_event(
+        conn,
+        sid,
+        uid,
+        "create",
+        None,
+        json!({"number":number,"results":results}),
+    )?;
+    let mut session = session;
+    session["recordHash"] = proof["recordHash"].clone();
+    Ok(session)
 }
-fn inv_check(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
+fn inv_check(conn: &mut Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
+    atomic(conn, |conn| inv_check_atomic(conn, input, user_id))
+}
+fn inv_check_atomic(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
     let uid = require_user(conn, user_id)?;
     require_can(conn, uid, "inventory")?;
     let sid = i64v(input, "sessionId").ok_or_else(|| ApiError::bad("sessionId"))?;
@@ -3529,7 +3637,25 @@ fn inv_check(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiResul
             params![sid, iid],
         )?;
     }
-    inv_session_full(conn, sid).ok_or_else(|| ApiError::not_found("нет"))
+    let expected: Option<f64> = conn
+        .query_row(
+            "SELECT expected_qty FROM inventory_results WHERE session_id=?1 AND item_id=?2",
+            params![sid, iid],
+            |r| r.get(0),
+        )
+        .optional()?
+        .flatten();
+    let proof = record_inventory_event(
+        conn,
+        sid,
+        uid,
+        "check",
+        Some(iid),
+        json!({"expectedQty":expected,"actualQty":f64v(input,"actualQty"),"checked":checked}),
+    )?;
+    let mut session = inv_session_full(conn, sid).ok_or_else(|| ApiError::not_found("нет"))?;
+    session["recordHash"] = proof["recordHash"].clone();
+    Ok(session)
 }
 /// Расхождения инвентаризации не затирают историю: каждое оформляется
 /// отдельной корректирующей записью журнала, а для количественных позиций
@@ -3618,23 +3744,28 @@ fn inv_complete_atomic(conn: &Connection, input: &Value, user_id: Option<i64>) -
     if changed != 1 {
         return Err(ApiError::conflict("Инвентаризация уже завершена"));
     }
-    let corrections = apply_inventory_corrections(conn, sid, ws, uid, &number)?;
-    ledger::append(
+    let checked: i64 = conn.query_row(
+        "SELECT count(*) FROM inventory_results WHERE session_id=?1 AND checked=1",
+        [sid],
+        |r| r.get(0),
+    )?;
+    let total: i64 = conn.query_row(
+        "SELECT count(*) FROM inventory_results WHERE session_id=?1",
+        [sid],
+        |r| r.get(0),
+    )?;
+    let proof = record_inventory_event(
         conn,
-        ws,
+        sid,
         uid,
+        "complete",
         None,
-        "inventory",
-        None,
-        None,
-        None,
-        Some(&format!(
-            "Инвентаризация {number} завершена. Расхождений: {corrections}"
-        )),
-    )
-    .map_err(|e| ApiError::internal(format!("Ошибка журнала: {e}")))?;
+        json!({"number":number,"checkedItems":checked,"totalItems":total}),
+    )?;
+    let corrections = apply_inventory_corrections(conn, sid, ws, uid, &number)?;
     let mut session = inv_session_full(conn, sid).ok_or_else(|| ApiError::not_found("нет"))?;
     session["corrections"] = json!(corrections);
+    session["recordHash"] = proof["recordHash"].clone();
     Ok(session)
 }
 
@@ -6346,7 +6477,7 @@ mod tests {
         assert_eq!(error.http, 409);
         let events: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM history_entries WHERE workspace_id=?1 AND type='inventory'",
+                "SELECT COUNT(*) FROM history_entries WHERE workspace_id=?1 AND type IN ('inventory_complete','inventory_adopt_complete')",
                 params![ws],
                 |r| r.get(0),
             )

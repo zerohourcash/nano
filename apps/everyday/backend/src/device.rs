@@ -40,6 +40,7 @@ pub fn requires_signature(procedure: &str) -> bool {
             | "history.writeOff"
             | "history.replenish"
             | "history.move"
+            | "inventory.create"
             | "inventory.checkItem"
             | "inventory.complete"
             | "chat.send"

@@ -60,6 +60,8 @@ export const syncRouter = createRouter({
     itemStateVersionsVerified: 0,
     organizationNodeError: null as string | null,
     organizationNodeVersionsVerified: 0,
+    inventoryError: null as string | null,
+    inventoryRecordsVerified: 0,
     membershipError: null as string | null,
     membershipVerified: true,
     snapshotError: null as string | null,
@@ -70,7 +72,7 @@ export const syncRouter = createRouter({
     missingBlobs: 0,
     missingReferencedBlobs: 0,
     pendingDownloads: 0,
-    counts: { workspaces: 0, users: 0, devices: 0, custodyEntries: 0, itemTombstones: 0, itemComments: 0, faultRecords: 0, changeRequestRecords: 0, configVersions: 0, itemStateVersions: 0, organizationNodeVersions: 0, items: 0, history: 0, messages: 0, organizationNodes: 0, blobs: 0, accountingTransactions: 0, accountingLines: 0, knowledgePages: 0, knowledgeRevisions: 0, membershipVersions: 0 },
+    counts: { workspaces: 0, users: 0, devices: 0, custodyEntries: 0, itemTombstones: 0, itemComments: 0, faultRecords: 0, changeRequestRecords: 0, configVersions: 0, itemStateVersions: 0, organizationNodeVersions: 0, inventoryRecords: 0, items: 0, history: 0, messages: 0, organizationNodes: 0, blobs: 0, accountingTransactions: 0, accountingLines: 0, knowledgePages: 0, knowledgeRevisions: 0, membershipVersions: 0 },
     ledgerHeads: [] as Array<{ workspaceGuid: string; publicKey: string; head: string; createdAt: string }>,
   })),
   peers: publicQuery.query(async () => [] as Array<{
