@@ -1,4 +1,5 @@
 import { expect, test, type Page } from '@playwright/test';
+import { readFile } from 'node:fs/promises';
 
 async function trpc<T>(
   page: Page,
@@ -79,6 +80,7 @@ async function trpc<T>(
 test('browser signs a real custody transaction and ledger retains its proof', async ({
   page,
 }) => {
+  test.setTimeout(60_000);
   await page.goto('/');
   await expect(
     page.getByRole('heading', { name: 'Новая организация' })
@@ -285,6 +287,35 @@ test('browser signs a real custody transaction and ledger retains its proof', as
   });
   await page.getByRole('button', { name: 'Завершить сверку' }).click();
   await expect(page.getByText('Итоги инвентаризации')).toBeVisible();
+  const actDownload = page.waitForEvent('download');
+  await page.getByRole('button', { name: 'Скачать подписанный акт' }).last().click();
+  const downloadedAct = await actDownload;
+  expect(downloadedAct.suggestedFilename()).toBe('ИНВ-001-signed-act.json');
+  const actPath = await downloadedAct.path();
+  expect(actPath).toBeTruthy();
+  const signedAct = JSON.parse(await readFile(actPath!, 'utf8')) as {
+    format: string;
+    act: unknown;
+    canonical: string;
+    hash: string;
+    signature: string;
+    publicKey: string;
+    signatureDomain: string;
+  };
+  expect(signedAct.format).toBe('everyday-inventory-act');
+  expect(await page.evaluate(async (document) => {
+    const decode = (value: string) => Uint8Array.from(atob(value), char => char.charCodeAt(0));
+    const bytes = decode(document.canonical);
+    const canonicalAct = JSON.parse(new TextDecoder().decode(bytes));
+    const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', bytes));
+    const hash = Array.from(digest, byte => byte.toString(16).padStart(2, '0')).join('');
+    const key = await crypto.subtle.importKey('raw', decode(document.publicKey), 'Ed25519', false, ['verify']);
+    const valid = await crypto.subtle.verify(
+      'Ed25519', key, decode(document.signature),
+      new TextEncoder().encode(`${document.signatureDomain}\n${document.hash}`)
+    );
+    return hash === document.hash && valid && JSON.stringify(canonicalAct) === JSON.stringify(document.act);
+  }, signedAct)).toBe(true);
   await trpc(page, 'transfers.returnItem', { itemId: qrItem.id });
 
   await page.goto('/knowledge');

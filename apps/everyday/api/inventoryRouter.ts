@@ -14,6 +14,17 @@ import { appendHistory } from "./queries/history";
 import { getDefaultWorkspaceId } from "./queries/catalog";
 import { requireMe } from "./auth";
 
+type InventoryAct = {
+  format: "everyday-inventory-act";
+  version: 1;
+  act: Record<string, unknown>;
+  canonical: string;
+  hash: string;
+  signature: string;
+  publicKey: string;
+  signatureDomain: "everyday/inventory-act/v1";
+};
+
 export const inventoryRouter = createRouter({
   sessions: publicQuery
     .input(z.object({ workspaceId: z.number().int().positive().optional() }).optional())
@@ -36,6 +47,12 @@ export const inventoryRouter = createRouter({
       const session = await findInventorySessionById(input.sessionId);
       if (!session) throw new TRPCError({ code: "NOT_FOUND", message: "Сессия не найдена" });
       return session.results;
+    }),
+
+  act: publicQuery
+    .input(z.object({ id: z.number().int().positive() }))
+    .query(async (): Promise<InventoryAct> => {
+      throw new TRPCError({ code: "PRECONDITION_FAILED", message: "Проверяемый акт формирует автономный Rust-узел" });
     }),
 
   create: publicQuery

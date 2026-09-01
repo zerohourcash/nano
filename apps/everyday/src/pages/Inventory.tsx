@@ -575,6 +575,7 @@ function SessionView({
 }) {
   const utils = trpc.useUtils()
   const detailQ = trpc.inventory.byId.useQuery({ id: sessionId })
+  const actQ = trpc.inventory.act.useQuery({ id: sessionId }, { enabled: false })
   const storagesQ = trpc.admin.storages.list.useQuery()
   const sitesQ = trpc.admin.buildingSites.list.useQuery()
 
@@ -706,6 +707,22 @@ function SessionView({
     else complete.mutate({ sessionId })
   }
 
+  const downloadAct = async () => {
+    const result = await actQ.refetch()
+    if (!result.data) {
+      showToast(result.error?.message ?? 'Не удалось сформировать акт', 'error')
+      return
+    }
+    const blob = new Blob([JSON.stringify(result.data, null, 2)], { type: 'application/json' })
+    const url = URL.createObjectURL(blob)
+    const link = document.createElement('a')
+    link.href = url
+    link.download = `${session?.number ?? 'inventory'}-signed-act.json`
+    link.click()
+    URL.revokeObjectURL(url)
+    showToast(`Проверяемый акт ${session?.number ?? ''} скачан`)
+  }
+
   if (detailQ.isLoading) {
     return (
       <div className="space-y-4">
@@ -793,11 +810,12 @@ function SessionView({
               ) : (
                 <button
                   type="button"
-                  onClick={() => showToast(`Акт инвентаризации ${session.number} сформирован (PDF, демо)`)}
+                  onClick={() => void downloadAct()}
+                  disabled={actQ.isFetching}
                   className="inline-flex h-10 items-center gap-2 rounded-xl border border-brand-100 bg-surface px-5 text-sm font-semibold text-ink-900 transition-colors hover:bg-brand-50"
                 >
                   <FileDown size={16} />
-                  Сформировать акт
+                  Скачать подписанный акт
                 </button>
               )}
             </div>
@@ -936,7 +954,7 @@ function SessionView({
         stats={stats}
         onAct={() => {
           setSummaryOpen(false)
-          showToast(`Акт инвентаризации ${session.number} сформирован (PDF, демо)`)
+          void downloadAct()
         }}
         onBack={() => {
           setSummaryOpen(false)
@@ -1300,7 +1318,7 @@ function SummaryModal({
                 className="inline-flex h-10 items-center justify-center gap-2 rounded-xl bg-accent px-5 text-sm font-semibold text-white transition-all hover:bg-accent-hover active:scale-[0.97]"
               >
                 <FileDown size={16} />
-                Сформировать акт
+                Скачать подписанный акт
               </button>
             </div>
           </motion.div>

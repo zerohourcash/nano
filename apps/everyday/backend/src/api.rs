@@ -4,6 +4,8 @@ use argon2::{
     password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
     Argon2,
 };
+use base64::{engine::general_purpose::STANDARD as B64, Engine};
+use ed25519_dalek::Signer;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -112,6 +114,7 @@ pub fn is_mutation(procedure: &str) -> bool {
             | "inventory.sessions"
             | "inventory.byId"
             | "inventory.results"
+            | "inventory.act"
             | "notifications.list"
             | "notifications.unreadCount"
             | "reports.byUsers"
@@ -1098,6 +1101,7 @@ fn dispatch_inner(
         "inventory.sessions" => inv_sessions(conn, input),
         "inventory.byId" => inv_by_id(conn, input, user_id),
         "inventory.results" => inv_results(conn, input, user_id),
+        "inventory.act" => inv_act(conn, input, user_id),
         "inventory.create" => inv_create(conn, input, user_id),
         "inventory.checkItem" => inv_check(conn, input, user_id),
         "inventory.complete" => inv_complete(conn, input, user_id),
@@ -3721,6 +3725,74 @@ fn inv_results(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiRes
     require_member(conn, uid, ws)?;
     let s = inv_session_full(conn, sid).ok_or_else(|| ApiError::not_found("Сессия не найдена"))?;
     Ok(s.get("results").cloned().unwrap_or(json!([])))
+}
+
+fn inv_act(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
+    let uid = require_user(conn, user_id)?;
+    let id = i64v(input, "id").ok_or_else(|| ApiError::bad("id"))?;
+    let (session_guid, number, ws, status, created_at, completed_at, scope_type, scope_ref_id, block_transfers):
+        (String,String,i64,String,String,Option<String>,String,Option<i64>,bool) = conn.query_row(
+        "SELECT guid,number,workspace_id,status,created_at,completed_at,scope_type,scope_ref_id,block_transfers FROM inventory_sessions WHERE id=?1",
+        [id],
+        |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?,row.get(8)?)),
+    ).map_err(|_| ApiError::not_found("Инвентаризация не найдена"))?;
+    require_member(conn, uid, ws)?;
+    if status != "completed" {
+        return Err(ApiError::conflict(
+            "Акт доступен после завершения инвентаризации",
+        ));
+    }
+    let workspace_guid = ledger::guid(conn, "workspaces", ws)
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    let scope_ref_guid = match (scope_type.as_str(), scope_ref_id) {
+        ("storage", Some(value)) => ledger::guid(conn, "storages", value).ok(),
+        ("site", Some(value)) => ledger::guid(conn, "building_sites", value).ok(),
+        _ => None,
+    };
+    let mut statement = conn.prepare(
+        "SELECT i.guid,i.internal_id,i.title,r.expected_qty,r.actual_qty,r.checked
+         FROM inventory_results r JOIN items i ON i.id=r.item_id
+         WHERE r.session_id=?1 ORDER BY i.guid",
+    )?;
+    let items: Vec<Value> = statement
+        .query_map([id], |row| {
+            let expected = row.get::<_, Option<f64>>(3)?.map(|value| value.to_string());
+            let actual = row.get::<_, Option<f64>>(4)?.map(|value| value.to_string());
+            Ok(json!({
+                "itemGuid":row.get::<_,String>(0)?,"internalId":row.get::<_,String>(1)?,"title":row.get::<_,String>(2)?,
+                "expectedQty":expected,"actualQty":actual,"checked":row.get::<_,bool>(5)?
+            }))
+        })?
+        .flatten()
+        .collect();
+    let mut statement = conn.prepare(
+        "SELECT record_hash,ledger_hash,kind,actor_guid,item_guid,payload_hash,created_at
+         FROM inventory_records WHERE session_guid=?1 ORDER BY created_at,record_hash",
+    )?;
+    let records: Vec<Value> = statement.query_map([&session_guid], |row| Ok(json!({
+        "recordHash":row.get::<_,String>(0)?,"ledgerHash":row.get::<_,String>(1)?,"kind":row.get::<_,String>(2)?,
+        "actorGuid":row.get::<_,String>(3)?,"itemGuid":row.get::<_,Option<String>>(4)?,"payloadHash":row.get::<_,String>(5)?,"createdAt":row.get::<_,String>(6)?
+    })))?.flatten().collect();
+    let act = json!({
+        "domain":"everyday/inventory-act/v1","workspaceGuid":workspace_guid,
+        "sessionGuid":session_guid,"number":number,"status":status,
+        "createdAt":created_at,"completedAt":completed_at,"scopeType":scope_type,
+        "scopeRefGuid":scope_ref_guid,"blockTransfers":block_transfers,
+        "items":items,"records":records
+    });
+    let canonical =
+        serde_json::to_vec(&act).map_err(|error| ApiError::internal(error.to_string()))?;
+    let hash = format!("{:x}", Sha256::digest(&canonical));
+    let transcript = format!("everyday/inventory-act/v1\n{hash}");
+    let signing_key =
+        ledger::signing_key(conn).map_err(|error| ApiError::internal(error.to_string()))?;
+    Ok(json!({
+        "format":"everyday-inventory-act","version":1,"act":act,
+        "canonical":B64.encode(&canonical),"hash":hash,
+        "signature":B64.encode(signing_key.sign(transcript.as_bytes()).to_bytes()),
+        "publicKey":B64.encode(signing_key.verifying_key().as_bytes()),
+        "signatureDomain":"everyday/inventory-act/v1"
+    }))
 }
 fn inv_create(conn: &mut Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
     atomic(conn, |conn| inv_create_atomic(conn, input, user_id))
@@ -7277,6 +7349,39 @@ mod tests {
             Some(users[0]),
         )
         .unwrap();
+        let act = dispatch(
+            &mut conn,
+            "inventory.act",
+            &json!({"id":session["id"]}),
+            Some(users[0]),
+        )
+        .unwrap();
+        assert_eq!(act["format"], "everyday-inventory-act");
+        let canonical = B64.decode(act["canonical"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&canonical).unwrap(),
+            act["act"]
+        );
+        let expected_hash = format!("{:x}", Sha256::digest(&canonical));
+        assert_eq!(act["hash"], expected_hash);
+        let public_key: [u8; 32] = B64
+            .decode(act["publicKey"].as_str().unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let signature: [u8; 64] = B64
+            .decode(act["signature"].as_str().unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap();
+        use ed25519_dalek::Verifier as _;
+        ed25519_dalek::VerifyingKey::from_bytes(&public_key)
+            .unwrap()
+            .verify(
+                format!("everyday/inventory-act/v1\n{expected_hash}").as_bytes(),
+                &ed25519_dalek::Signature::from_bytes(&signature),
+            )
+            .unwrap();
         dispatch(
             &mut conn,
             "transfers.take",

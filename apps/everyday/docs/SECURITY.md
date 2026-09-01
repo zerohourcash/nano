@@ -163,6 +163,13 @@ capability, затем применяют только её scope. Неверн�
   Тест отдельно создаёт новый валидно node-signed event с повторно приложенным
   device-proof, но `actualQty=99` вместо подписанного `7`; импорт его отклоняет
   как semantic substitution.
+- Завершённая сверка экспортируется как `everyday-inventory-act` v1. Поле
+  `canonical` содержит base64 точных JSON-байтов (количества представлены
+  каноническими десятичными строками), `hash` — их SHA-256. Нода подписывает
+  transcript `everyday/inventory-act/v1\n{hash}` ключом Ed25519 и прикладывает
+  public key. Проверяющий обязан декодировать `canonical`, сопоставить его с
+  `act`, пересчитать hash и лишь затем проверить подпись; перечисленные в акте
+  Ledger/record hashes связывают его с пользовательскими device-proof.
 - «Удаление» ТМЦ реализовано как delete-wins `itemTombstoneMode=monotonic/v1`.
   Tombstone коммитит GUID организации, карточки и автора, Ledger hash и время;
   связанное `item_archive` обязано иметь полный device-proof. Проверка проходит
