@@ -1,10 +1,48 @@
 import { useMemo, useState } from 'react'
-import { Ban, Check, Clipboard, KeyRound, Plus, Send, ShieldCheck } from 'lucide-react'
+import { Ban, Check, Clipboard, Download, KeyRound, Paperclip, Plus, Send, ShieldCheck, X } from 'lucide-react'
 import { trpc } from '@/providers/trpc'
 import { useStore } from '@/lib/store'
 import InviteQrBlock from '@/components/InviteQrBlock'
 import { decodeCard, encodeCard } from '@/lib/interorg-card'
 import { SectionHeader, btnPrimaryCls, btnSecondaryCls, cardCls, inputCls, useToast } from './ui'
+
+const MAX_INTERORG_FILE_BYTES = 24 * 1024
+
+type InterorgFileBody = {
+  name: string
+  mime: string
+  size: number
+  sha256: string
+  dataBase64: string
+  text?: string
+}
+
+function isFileBody(body: unknown): body is InterorgFileBody {
+  if (!body || typeof body !== 'object') return false
+  const value = body as Partial<InterorgFileBody>
+  return typeof value.name === 'string' && typeof value.mime === 'string' &&
+    value.name.length > 0 && value.name.length <= 180 &&
+    typeof value.size === 'number' && Number.isInteger(value.size) &&
+    value.size > 0 && value.size <= MAX_INTERORG_FILE_BYTES &&
+    typeof value.sha256 === 'string' && /^[a-f0-9]{64}$/i.test(value.sha256) &&
+    typeof value.dataBase64 === 'string' && value.dataBase64.length <= 32_768 &&
+    /^[A-Za-z0-9+/]*={0,2}$/.test(value.dataBase64)
+}
+
+async function downloadFile(body: InterorgFileBody) {
+  const raw = atob(body.dataBase64)
+  const bytes = Uint8Array.from(raw, (char) => char.charCodeAt(0))
+  if (bytes.length !== body.size) throw new Error('Размер вложения не совпадает с подписанными метаданными')
+  const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', bytes))
+  const sha256 = [...digest].map((byte) => byte.toString(16).padStart(2, '0')).join('')
+  if (sha256 !== body.sha256.toLowerCase()) throw new Error('SHA-256 вложения не совпадает')
+  const url = URL.createObjectURL(new Blob([bytes], { type: body.mime }))
+  const link = document.createElement('a')
+  link.href = url
+  link.download = body.name
+  link.click()
+  setTimeout(() => URL.revokeObjectURL(url), 0)
+}
 
 export default function InterorgSection() {
   const { workspace } = useStore()
@@ -25,6 +63,7 @@ export default function InterorgSection() {
   const [selected, setSelected] = useState('')
   const [kind, setKind] = useState('message.notice')
   const [message, setMessage] = useState('')
+  const [file, setFile] = useState<File | null>(null)
 
   const ensure = trpc.interorg.ensureIdentity.useMutation({
     onSuccess: () => { void identityQ.refetch(); toast('Адрес организации создан') },
@@ -49,7 +88,7 @@ export default function InterorgSection() {
     onError: (error) => toast(error.message, 'error'),
   })
   const send = trpc.interorg.send.useMutation({
-    onSuccess: () => { setMessage(''); void outboxQ.refetch(); toast('Транзакция подписана и поставлена в mesh-очередь') },
+    onSuccess: () => { setMessage(''); setFile(null); void outboxQ.refetch(); toast('Транзакция подписана и поставлена в mesh-очередь') },
     onError: (error) => toast(error.message, 'error'),
   })
   const accept = trpc.interorg.accept.useMutation({
@@ -82,6 +121,49 @@ export default function InterorgSection() {
       })
     } catch (error) {
       toast(error instanceof Error ? error.message : 'Некорректная визитка', 'error')
+    }
+  }
+
+  const sendTransaction = async () => {
+    try {
+      let body: Record<string, unknown> = { text: message.trim() }
+      let transactionKind = kind.trim()
+      if (file) {
+        if (file.size === 0 || file.size > MAX_INTERORG_FILE_BYTES) {
+          throw new Error('Межорганизационный файл должен быть от 1 байта до 24 КиБ')
+        }
+        const bytes = new Uint8Array(await file.arrayBuffer())
+        const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', bytes))
+        const sha256 = [...digest].map((byte) => byte.toString(16).padStart(2, '0')).join('')
+        let binary = ''
+        for (const byte of bytes) binary += String.fromCharCode(byte)
+        body = {
+          name: file.name,
+          mime: file.type || 'application/octet-stream',
+          size: file.size,
+          sha256,
+          dataBase64: btoa(binary),
+          ...(message.trim() ? { text: message.trim() } : {}),
+        }
+        transactionKind = 'message.file'
+      }
+      send.mutate({
+        workspaceId,
+        contactGuid: selected,
+        transactionId: crypto.randomUUID(),
+        kind: transactionKind,
+        body,
+      })
+    } catch (error) {
+      toast(error instanceof Error ? error.message : 'Не удалось подготовить файл', 'error')
+    }
+  }
+
+  const downloadAttachment = async (body: InterorgFileBody) => {
+    try {
+      await downloadFile(body)
+    } catch (error) {
+      toast(error instanceof Error ? error.message : 'Файл повреждён', 'error')
     }
   }
 
@@ -178,7 +260,19 @@ export default function InterorgSection() {
           <input className={inputCls} value={kind} onChange={(event) => setKind(event.target.value)} placeholder="Тип: invoice.offer" />
         </div>
         <textarea className="mt-3 min-h-28 w-full rounded-xl border border-brand-100 bg-surface p-4 text-sm outline-none focus:border-brand-600 focus:ring-[3px] focus:ring-[#5E629B22]" value={message} onChange={(event) => setMessage(event.target.value)} placeholder="Текст сообщения или условия сделки" />
-        <button className={`${btnPrimaryCls} mt-3`} disabled={!selected || !kind.trim() || !message.trim() || send.isPending} onClick={() => send.mutate({ workspaceId, contactGuid: selected, transactionId: crypto.randomUUID(), kind: kind.trim(), body: { text: message.trim() } })}>
+        <div className="mt-3 flex flex-wrap items-center gap-3">
+          <label className={btnSecondaryCls}>
+            <Paperclip size={16} /> Приложить до 24 КиБ
+            <input
+              className="sr-only"
+              type="file"
+              data-testid="interorg-file-input"
+              onChange={(event) => setFile(event.target.files?.[0] ?? null)}
+            />
+          </label>
+          {file && <span className="inline-flex max-w-full items-center gap-2 text-sm text-ink-600"><span className="truncate">{file.name} · {file.size} Б</span><button type="button" aria-label="Убрать файл" onClick={() => setFile(null)}><X size={15} /></button></span>}
+        </div>
+        <button className={`${btnPrimaryCls} mt-3`} disabled={!selected || (!file && (!kind.trim() || !message.trim())) || send.isPending} onClick={() => void sendTransaction()}>
           <Send size={17} /> Подписать и отправить
         </button>
       </section>
@@ -190,7 +284,8 @@ export default function InterorgSection() {
             <article key={item.envelopeId} className="flex flex-col gap-3 p-5 sm:flex-row sm:items-center sm:justify-between" data-testid="interorg-inbox-item">
               <div className="min-w-0">
                 <div className="flex items-center gap-2"><span className="font-semibold text-ink-900">{item.contact.name}</span><span className="rounded-full bg-brand-50 px-2 py-0.5 text-xs text-brand-700">{item.kind}</span></div>
-                <p className="mt-1 whitespace-pre-wrap text-sm text-ink-700">{typeof item.body === 'object' && item.body && 'text' in item.body ? String((item.body as { text: unknown }).text) : JSON.stringify(item.body)}</p>
+                <p className="mt-1 whitespace-pre-wrap text-sm text-ink-700">{typeof item.body === 'object' && item.body && 'text' in item.body ? String((item.body as { text: unknown }).text) : isFileBody(item.body) ? '' : JSON.stringify(item.body)}</p>
+                {isFileBody(item.body) && <button type="button" className={`${btnSecondaryCls} mt-2`} data-testid="interorg-file-download" onClick={() => void downloadAttachment(item.body as InterorgFileBody)}><Download size={16} /> {item.body.name} · {item.body.size} Б</button>}
               </div>
               {item.accepted ? <span className="inline-flex items-center gap-1 text-sm font-semibold text-teal"><Check size={16} /> Принято</span> : <button className={btnSecondaryCls} onClick={() => accept.mutate({ workspaceId, envelopeId: item.envelopeId })}><Check size={16} /> Принять</button>}
             </article>

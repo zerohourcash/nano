@@ -20,6 +20,7 @@ use x25519_dalek::{PublicKey as XPublicKey, StaticSecret};
 
 const VERSION: u8 = 1;
 const MAX_CIPHERTEXT: usize = 64 * 1024;
+pub const MAX_INLINE_FILE_BYTES: usize = 24 * 1024;
 const MAX_TTL_HOURS: i64 = 168;
 const MAX_RELAY_ENVELOPES: i64 = 4096;
 const MAX_PER_SENDER: i64 = 128;
@@ -98,6 +99,71 @@ pub struct Payload {
     pub kind: String,
     pub transaction_id: String,
     pub body: serde_json::Value,
+}
+
+fn validate_application_payload(kind: &str, body: &serde_json::Value) -> Result<()> {
+    if kind != "message.file" {
+        return Ok(());
+    }
+    let object = body
+        .as_object()
+        .context("file transaction body must be an object")?;
+    if object.keys().any(|key| {
+        !matches!(
+            key.as_str(),
+            "name" | "mime" | "size" | "sha256" | "dataBase64" | "text"
+        )
+    }) {
+        bail!("file transaction contains unknown fields");
+    }
+    let name = object
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .context("file name missing")?;
+    let mime = object
+        .get("mime")
+        .and_then(serde_json::Value::as_str)
+        .context("file MIME missing")?;
+    let size = object
+        .get("size")
+        .and_then(serde_json::Value::as_u64)
+        .context("file size missing")? as usize;
+    let expected = object
+        .get("sha256")
+        .and_then(serde_json::Value::as_str)
+        .context("file SHA-256 missing")?;
+    let encoded = object
+        .get("dataBase64")
+        .and_then(serde_json::Value::as_str)
+        .context("file bytes missing")?;
+    if name.trim().is_empty()
+        || name.chars().count() > 180
+        || name.chars().any(char::is_control)
+        || name.contains(['/', '\\'])
+        || matches!(name, "." | "..")
+        || mime.is_empty()
+        || mime.len() > 120
+        || mime.chars().any(char::is_control)
+        || size == 0
+        || size > MAX_INLINE_FILE_BYTES
+        || expected.len() != 64
+    {
+        bail!("invalid interorg file metadata");
+    }
+    if object
+        .get("text")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|text| text.chars().count() > 4_000)
+    {
+        bail!("interorg file message is too long");
+    }
+    let bytes = B64
+        .decode(encoded)
+        .context("invalid interorg file encoding")?;
+    if bytes.len() != size || hex::encode(Sha256::digest(&bytes)) != expected.to_ascii_lowercase() {
+        bail!("interorg file integrity mismatch");
+    }
+    Ok(())
 }
 
 pub fn init_schema(conn: &Connection) -> Result<()> {
@@ -353,6 +419,7 @@ pub fn send_to_contact(
     if kind.is_empty() || kind.len() > 80 || uuid::Uuid::parse_str(transaction_id).is_err() {
         bail!("invalid interorg transaction");
     }
+    validate_application_payload(kind, &body)?;
     let sender_workspace: String = conn.query_row(
         "SELECT guid FROM workspaces WHERE id=?1",
         [workspace_id],
@@ -652,6 +719,13 @@ pub fn receive_local(conn: &Connection, work_bits: u8) -> Result<usize> {
                 }
             };
             if payload.sender_workspace != remote_workspace {
+                conn.execute(
+                    "UPDATE interorg_envelopes SET delivered=2 WHERE id=?1",
+                    [&envelope.id],
+                )?;
+                continue;
+            }
+            if validate_application_payload(&payload.kind, &payload.body).is_err() {
                 conn.execute(
                     "UPDATE interorg_envelopes SET delivered=2 WHERE id=?1",
                     [&envelope.id],
@@ -1077,6 +1151,52 @@ mod tests {
         .is_err());
         let wrong = StaticSecret::random_from_rng(OsRng);
         assert!(open(&envelope, wrong.as_bytes(), 8).is_err());
+    }
+
+    #[test]
+    fn inline_file_is_bounded_hashed_and_hidden_from_relays() {
+        let bytes = b"signed shift report\0with private details";
+        let body = serde_json::json!({
+            "name":"shift-report.bin",
+            "mime":"application/octet-stream",
+            "size":bytes.len(),
+            "sha256":hex::encode(Sha256::digest(bytes)),
+            "dataBase64":B64.encode(bytes),
+            "text":"Отчёт смены"
+        });
+        validate_application_payload("message.file", &body).unwrap();
+
+        let recipient = StaticSecret::random_from_rng(OsRng);
+        let sender = SigningKey::generate(&mut OsRng);
+        let payload = Payload {
+            sender_workspace: "org-a".into(),
+            recipient_workspace: "org-b".into(),
+            kind: "message.file".into(),
+            transaction_id: uuid::Uuid::new_v4().to_string(),
+            body: body.clone(),
+        };
+        let envelope = seal(
+            &payload,
+            XPublicKey::from(&recipient).as_bytes(),
+            &sender,
+            24,
+            8,
+        )
+        .unwrap();
+        let wire = serde_json::to_string(&envelope).unwrap();
+        assert!(!wire.contains("shift-report"));
+        assert!(!wire.contains(&B64.encode(bytes)));
+        assert_eq!(open(&envelope, recipient.as_bytes(), 8).unwrap(), payload);
+
+        let mut wrong_hash = body.clone();
+        wrong_hash["sha256"] = serde_json::json!("0".repeat(64));
+        assert!(validate_application_payload("message.file", &wrong_hash).is_err());
+        let oversized = vec![0_u8; MAX_INLINE_FILE_BYTES + 1];
+        let too_large = serde_json::json!({
+            "name":"large.bin","mime":"application/octet-stream","size":oversized.len(),
+            "sha256":hex::encode(Sha256::digest(&oversized)),"dataBase64":B64.encode(oversized)
+        });
+        assert!(validate_application_payload("message.file", &too_large).is_err());
     }
 
     #[test]

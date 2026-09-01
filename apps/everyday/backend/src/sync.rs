@@ -7581,7 +7581,15 @@ pub fn node_keys(conn: &Connection) -> Value {
     let mut pending = Vec::new();
     if let Ok(mut s)=conn.prepare("SELECT public_key,peer_url,node_name,first_seen,last_seen FROM pending_node_keys ORDER BY last_seen DESC") {if let Ok(rows)=s.query_map([],|r|Ok(json!({"publicKey":r.get::<_,String>(0)?,"peerUrl":r.get::<_,Option<String>>(1)?,"nodeName":r.get::<_,Option<String>>(2)?,"firstSeen":r.get::<_,String>(3)?,"lastSeen":r.get::<_,String>(4)?}))){pending.extend(rows.flatten())}}
     let mut revoked = Vec::new();
-    if let Ok(mut s)=conn.prepare("SELECT public_key,revoked_at FROM revoked_node_keys ORDER BY revoked_at DESC") {if let Ok(rows)=s.query_map([],|r|Ok(json!({"publicKey":r.get::<_,String>(0)?,"revokedAt":r.get::<_,String>(1)?}))){revoked.extend(rows.flatten())}}
+    if let Ok(mut s) =
+        conn.prepare("SELECT public_key,revoked_at FROM revoked_node_keys ORDER BY revoked_at DESC")
+    {
+        if let Ok(rows) = s.query_map([], |r| {
+            Ok(json!({"publicKey":r.get::<_,String>(0)?,"revokedAt":r.get::<_,String>(1)?}))
+        }) {
+            revoked.extend(rows.flatten())
+        }
+    }
     json!({"strict":strict_node_trust(),"trusted":trusted,"pending":pending,"revoked":revoked})
 }
 

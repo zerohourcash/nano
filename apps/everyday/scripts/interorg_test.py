@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import base64
+import hashlib
 import sqlite3
 import time
 import urllib.error
@@ -222,6 +224,49 @@ def main() -> int:
               wait_for(replay_quarantined, timeout=20)
               and len(inbox_b()) == 1
               and inbox_b()[0]["body"]["text"] == text)
+
+        file_bytes = b"Everyday encrypted interorg attachment\x00private shift report"
+        file_tx = str(uuid.uuid4())
+        file_name = "shift-private.bin"
+        file_body = {
+            "name": file_name,
+            "mime": "application/octet-stream",
+            "size": len(file_bytes),
+            "sha256": hashlib.sha256(file_bytes).hexdigest(),
+            "dataBase64": base64.b64encode(file_bytes).decode("ascii"),
+            "text": "Закрытое вложение смены",
+        }
+        file_sent = a.call("interorg.send", {
+            "workspaceId": ws_a["id"], "contactGuid": contact_b["guid"],
+            "transactionId": file_tx, "kind": "message.file", "body": file_body,
+        })
+        with sqlite3.connect(a.db) as database:
+            file_wire = database.execute(
+                "SELECT envelope_json FROM interorg_envelopes WHERE id=?",
+                (file_sent["envelopeId"],),
+            ).fetchone()[0]
+        check("relay не видит имя, MIME и байты межорганизационного файла",
+              file_name not in file_wire
+              and file_body["dataBase64"] not in file_wire
+              and file_body["mime"] not in file_wire)
+
+        def received_file():
+            return next((row for row in inbox_b() if row["transactionId"] == file_tx), None)
+
+        check("небольшой файл доставлен после разрыва как подписанная адресная транзакция",
+              wait_for(lambda: received_file() is not None, timeout=20), str(inbox_b()))
+        received = received_file()
+        check("получатель восстановил точные байты и SHA-256 вложения",
+              received is not None
+              and received["kind"] == "message.file"
+              and base64.b64decode(received["body"]["dataBase64"]) == file_bytes
+              and received["body"]["sha256"] == hashlib.sha256(file_bytes).hexdigest(),
+              str(received))
+        file_audit = b.call("sync.audit", None, mutation=False)
+        check("полный аудит повторно проверил AEAD-конверт с файлом",
+              file_audit.get("healthy") is True
+              and file_audit.get("interorgInboxVerified", 0) == 2,
+              str(file_audit.get("interorgInboxError")))
 
         revoked = b.call("interorg.revokeContact", {
             "workspaceId": ws_b["id"], "guid": contact_a["guid"],

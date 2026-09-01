@@ -644,6 +644,15 @@ test('browser signs a real custody transaction and ledger retains its proof', as
   await page.getByRole('button', { name: 'Сеть организаций' }).first().click();
   const outgoingInterorg = page.getByTestId('interorg-outbox-item').filter({ hasText: interorgTransactionId });
   await expect(outgoingInterorg).toContainText('Ожидает квитанцию');
+  await page.getByLabel('Контрагент').selectOption(e2eContact.guid);
+  await page.getByPlaceholder('Текст сообщения или условия сделки').fill('Закрытый файл E2E');
+  await page.getByTestId('interorg-file-input').setInputFiles({
+    name: 'shift-e2e.txt',
+    mimeType: 'text/plain',
+    buffer: Buffer.from('encrypted interorg file from Playwright'),
+  });
+  await page.getByRole('button', { name: 'Подписать и отправить' }).click();
+  await expect(page.getByTestId('interorg-outbox-item').filter({ hasText: 'message.file' })).toContainText('Ожидает квитанцию');
   await page.getByRole('button', { name: 'Отозвать ключи' }).click();
   await expect(page.getByTestId('interorg-contact')).toContainText('отозван');
   await page.getByRole('button', { name: 'Пространства', exact: true }).click();
