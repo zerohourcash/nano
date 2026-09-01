@@ -2358,6 +2358,8 @@ fn verify_stored_device_bindings(conn: &Connection) -> anyhow::Result<usize> {
 struct MembershipLedgerEvidence {
     operation: String,
     actor_guid: String,
+    from_label: Option<String>,
+    to_label: Option<String>,
     has_device_proof: bool,
 }
 
@@ -2384,6 +2386,14 @@ fn membership_ledger_evidence(
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_owned(),
+            from_label: event
+                .get("fromLabel")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            to_label: event
+                .get("toLabel")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
             has_device_proof: [
                 "requestDeviceId",
                 "requestPublicKey",
@@ -2398,7 +2408,7 @@ fn membership_ledger_evidence(
         });
     }
     conn.query_row(
-        "SELECT h.type,u.guid,
+        "SELECT h.type,u.guid,h.from_label,h.to_label,
                 h.request_device_id IS NOT NULL AND h.request_device_id!='' AND
                 h.request_public_key IS NOT NULL AND h.request_public_key!='' AND
                 h.request_nonce IS NOT NULL AND h.request_nonce!='' AND
@@ -2412,7 +2422,9 @@ fn membership_ledger_evidence(
             Ok(MembershipLedgerEvidence {
                 operation: row.get(0)?,
                 actor_guid: row.get(1)?,
-                has_device_proof: row.get::<_, i64>(2)? != 0,
+                from_label: row.get(2)?,
+                to_label: row.get(3)?,
+                has_device_proof: row.get::<_, i64>(4)? != 0,
             })
         },
     )
@@ -2493,11 +2505,39 @@ fn verify_membership_records(conn: &Connection, journal: &Value) -> anyhow::Resu
             if !expected {
                 anyhow::bail!("membership references incompatible ledger operation");
             }
-            if evidence.operation == "membership_join" {
-                if evidence.actor_guid != user {
-                    anyhow::bail!("membership join actor does not match user");
+            match evidence.operation.as_str() {
+                "membership_create" => {
+                    if evidence.from_label.is_some() || evidence.to_label.as_deref() != Some(user) {
+                        anyhow::bail!("membership creation target does not match version user");
+                    }
                 }
-            } else if !evidence.has_device_proof {
+                "membership_update" => {
+                    if evidence.from_label.as_deref() != Some(user)
+                        || evidence.to_label.as_deref() != Some(user)
+                    {
+                        anyhow::bail!("membership event target does not match version user");
+                    }
+                }
+                "membership_remove" => {
+                    if evidence.from_label.as_deref() != Some(user) || evidence.to_label.is_some() {
+                        anyhow::bail!("membership removal target does not match version user");
+                    }
+                }
+                "membership_join" => {
+                    if evidence.actor_guid != user {
+                        anyhow::bail!("membership join actor does not match user");
+                    }
+                }
+                "workspace_create" => {
+                    if evidence.actor_guid != user
+                        || evidence.to_label.as_deref() != Some(workspace)
+                    {
+                        anyhow::bail!("workspace creation does not bind owner membership");
+                    }
+                }
+                _ => unreachable!("operation was checked above"),
+            }
+            if evidence.operation != "membership_join" && !evidence.has_device_proof {
                 anyhow::bail!("administrative membership event has no device proof");
             }
         }
@@ -3703,6 +3743,100 @@ mod tests {
                 .unwrap(),
             0,
             "invalid journal must not bootstrap the remote key"
+        );
+        drop((source, target));
+        for path in [source_path, target_path] {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    #[test]
+    fn membership_event_for_another_user_cannot_authorize_role_change() {
+        let source_path = std::env::temp_dir().join(format!(
+            "membership-target-source-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let target_path = std::env::temp_dir().join(format!(
+            "membership-target-target-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let source = crate::db::open(&source_path).unwrap();
+        let target = crate::db::open(&target_path).unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        source.execute("INSERT INTO workspaces(name,internal_id_prefix,created_at,guid) VALUES('Org','O-',?1,'target-workspace')",[&now]).unwrap();
+        let workspace = source.last_insert_rowid();
+        let mut users = Vec::new();
+        for (name, phone, guid) in [
+            ("Owner", "+70000000301", "target-owner"),
+            ("Alice", "+70000000302", "target-alice"),
+            ("Bob", "+70000000303", "target-bob"),
+        ] {
+            source.execute(
+                "INSERT INTO users(full_name,phone,status,created_at,guid) VALUES(?1,?2,'active',?3,?4)",
+                params![name,phone,now,guid],
+            ).unwrap();
+            let user = source.last_insert_rowid();
+            source.execute(
+                "INSERT INTO user_workspaces(user_id,workspace_id,rights_json) VALUES(?1,?2,?3)",
+                params![user, workspace, crate::db::default_rights().to_string()],
+            ).unwrap();
+            record_membership_version(&source, workspace, user, true, None, true).unwrap();
+            users.push(user);
+        }
+        let owner = users[0];
+        let bob = users[2];
+        let key = SigningKey::generate(&mut OsRng);
+        let device_id = "membership-target-device-0001";
+        crate::device::register(
+            &source,
+            owner,
+            &json!({
+                "deviceId":device_id,"name":"Телефон владельца",
+                "publicKey":URL_SAFE_NO_PAD.encode(key.verifying_key().to_bytes())
+            }),
+        )
+        .unwrap();
+        let proof = signed_device_proof(&key, device_id, "/api/trpc/admin.users.update");
+        crate::device::set_pending(&source, owner, &proof).unwrap();
+        let event = ledger::append(
+            &source,
+            workspace,
+            owner,
+            None,
+            "membership_update",
+            Some("target-alice"),
+            Some("target-alice"),
+            None,
+            Some("Valid signature, wrong membership target"),
+        )
+        .unwrap();
+        source
+            .execute(
+                "UPDATE user_workspaces SET role_name='owner' WHERE workspace_id=?1 AND user_id=?2",
+                params![workspace, bob],
+            )
+            .unwrap();
+        record_membership_version(&source, workspace, bob, true, event["opId"].as_str(), false)
+            .unwrap();
+
+        let journal = export_journal(&source);
+        let remote_key = journal["journalPublicKey"].as_str().unwrap();
+        let result = apply_remote_journal(&target, &journal, "");
+        assert_eq!(result["ok"], false);
+        assert!(result["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("target does not match"));
+        assert_eq!(
+            target
+                .query_row(
+                    "SELECT COUNT(*) FROM trusted_node_keys WHERE public_key=?1",
+                    [remote_key],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0,
+            "wrong-target journal must fail before trust bootstrap"
         );
         drop((source, target));
         for path in [source_path, target_path] {
