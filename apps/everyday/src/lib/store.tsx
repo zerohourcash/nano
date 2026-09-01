@@ -6,6 +6,7 @@ interface Workspace {
   id: number
   name: string
   internalIdPrefix?: string
+  guid?: string | null
 }
 
 interface User {

@@ -24,8 +24,9 @@ export const syncRouter = createRouter({
     bytesSent: 0,
     bytesReceived: 0,
     syncSuccesses: 0,
-    workspaceScopeMode: "all" as "all" | "restricted",
+    workspaceScopeMode: "all" as "disabled" | "all" | "restricted" | "capabilities",
     workspaceScope: [] as string[],
+    capabilityCount: 1,
   })),
   audit: publicQuery.query(async () => ({
     healthy: true,
@@ -80,7 +81,7 @@ export const syncRouter = createRouter({
     }>,
   })),
   clearDiagnostics: publicQuery.input(z.object({}).optional()).mutation(async () => ({ ok: true, removed: 0 })),
-  exportBundle: publicQuery.query(async () => ({
+  exportBundle: publicQuery.input(z.object({ workspaceGuid: z.string().max(128).optional() }).optional()).query(async () => ({
     format: "everyday-sync-bundle" as const,
     version: 2 as const,
     createdAt: "",

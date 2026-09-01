@@ -435,6 +435,10 @@ pub fn transfer_json(conn: &Connection, id: i64) -> Option<Value> {
 }
 
 pub fn workspace_json(conn: &Connection, id: i64) -> Option<Value> {
+    let _ = conn.execute(
+        "UPDATE workspaces SET guid=?1 WHERE id=?2 AND (guid IS NULL OR guid='')",
+        params![uuid::Uuid::new_v4().to_string(), id],
+    );
     conn.query_row(
         "SELECT id, name, timezone, internal_id_prefix, comment, created_at, sync_url, require_writeoff_photo, guid FROM workspaces WHERE id=?1",
         params![id],

@@ -316,17 +316,23 @@ async fn health() -> impl IntoResponse {
         "node": "meshkeeper-node",
         "journal": "signed-account-chains",
         "role": node_role(),
-        "sync": if sync_token().is_some() { "enabled" } else { "disabled" },
+        "sync": if sync_capabilities().is_ok_and(|values| !values.is_empty()) { "enabled" } else { "disabled" },
     }))
 }
 
 /// Роль узла определяется конфигурацией, отдельного переключателя не нужно:
 /// есть upstream — это локальный узел, нет upstream, но есть токен — сервер.
 fn node_role() -> &'static str {
-    match (upstream_url(), sync_token()) {
-        (Some(_), _) => "node",
-        (None, Some(_)) => "server",
-        (None, None) => "standalone",
+    let capabilities = sync_capabilities().unwrap_or_default();
+    if capabilities
+        .iter()
+        .any(|capability| !capability.peers.is_empty())
+    {
+        "node"
+    } else if !capabilities.is_empty() {
+        "server"
+    } else {
+        "standalone"
     }
 }
 
@@ -382,23 +388,194 @@ pub(crate) fn sync_workspace_scope() -> Option<HashSet<String>> {
     Some(values)
 }
 
-fn sync_authorized(headers: &HeaderMap) -> bool {
-    let Some(secret) = sync_token() else {
-        return false;
-    };
-    let expected = format!("Bearer {secret}");
+#[derive(Clone, Debug)]
+struct SyncCapability {
+    token: String,
+    workspace_scope: Option<HashSet<String>>,
+    peers: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SyncCapabilityConfig {
+    token: String,
+    #[serde(default)]
+    workspaces: Vec<String>,
+    #[serde(default)]
+    peers: Vec<String>,
+}
+
+/// Multiple isolated organization capabilities. When the JSON variable is
+/// present, malformed/empty configuration is fail-closed and never falls back
+/// to the legacy all-database token.
+fn parse_sync_capabilities(raw: &str) -> Result<Vec<SyncCapability>, String> {
+    let entries: Vec<SyncCapabilityConfig> = serde_json::from_str(raw)
+        .map_err(|error| format!("MESHKEEPER_SYNC_CAPABILITIES: {error}"))?;
+    if entries.is_empty() {
+        return Err("MESHKEEPER_SYNC_CAPABILITIES не должен быть пустым".into());
+    }
+    let mut tokens = HashSet::new();
+    let mut out = Vec::with_capacity(entries.len());
+    for entry in entries {
+        if entry.token.chars().count() < 32 || entry.token.chars().count() > 256 {
+            return Err("каждый capability token должен содержать 32–256 символов".into());
+        }
+        if !tokens.insert(entry.token.clone()) {
+            return Err("capability token повторяется".into());
+        }
+        if entry.workspaces.is_empty() || entry.workspaces.len() > 100 {
+            return Err("каждая capability должна разрешать 1–100 организаций".into());
+        }
+        let workspace_scope: HashSet<String> = entry
+            .workspaces
+            .into_iter()
+            .map(|value| value.trim().to_owned())
+            .collect();
+        if workspace_scope
+            .iter()
+            .any(|guid| guid.is_empty() || guid.len() > 128)
+        {
+            return Err("некорректный workspace GUID в capability".into());
+        }
+        if entry.peers.len() > sync::MAX_PEERS as usize {
+            return Err(format!(
+                "capability содержит более {} peers",
+                sync::MAX_PEERS
+            ));
+        }
+        let mut peers = Vec::new();
+        for peer in entry.peers {
+            let peer = peer.trim().trim_end_matches('/').to_owned();
+            validate_peer_url(&peer).map_err(|error| format!("capability peer: {error}"))?;
+            if !peers.contains(&peer) {
+                peers.push(peer);
+            }
+        }
+        out.push(SyncCapability {
+            token: entry.token,
+            workspace_scope: Some(workspace_scope),
+            peers,
+        });
+    }
+    Ok(out)
+}
+
+fn sync_capabilities() -> Result<Vec<SyncCapability>, String> {
+    if let Ok(raw) = std::env::var("MESHKEEPER_SYNC_CAPABILITIES") {
+        return parse_sync_capabilities(&raw);
+    }
+    let mut peers = Vec::new();
+    if let Some(peer) = upstream_url() {
+        validate_peer_url(&peer)?;
+        peers.push(peer);
+    }
+    Ok(sync_token()
+        .map(|token| SyncCapability {
+            token,
+            workspace_scope: sync_workspace_scope(),
+            peers,
+        })
+        .into_iter()
+        .collect())
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .fold(0u8, |difference, (a, b)| difference | (a ^ b))
+            == 0
+}
+
+fn authorized_capability(headers: &HeaderMap) -> Option<SyncCapability> {
     let got = headers
         .get("authorization")
-        .and_then(|v| v.to_str().ok())
+        .and_then(|value| value.to_str().ok())
         .unwrap_or_default();
-    // Постоянное по времени сравнение: длина токена не секрет, содержимое — да.
-    got.len() == expected.len()
-        && got
-            .as_bytes()
-            .iter()
-            .zip(expected.as_bytes())
-            .fold(0u8, |acc, (a, b)| acc | (a ^ b))
-            == 0
+    find_bearer_capability(sync_capabilities().ok()?, got)
+}
+
+fn find_bearer_capability(capabilities: Vec<SyncCapability>, got: &str) -> Option<SyncCapability> {
+    capabilities.into_iter().find(|capability| {
+        constant_time_eq(
+            got.as_bytes(),
+            format!("Bearer {}", capability.token).as_bytes(),
+        )
+    })
+}
+
+pub(crate) fn sync_capability_summary() -> (String, Vec<String>, usize) {
+    let capabilities = sync_capabilities().unwrap_or_default();
+    if capabilities.is_empty() {
+        return ("disabled".into(), Vec::new(), 0);
+    }
+    if capabilities.len() == 1 && capabilities[0].workspace_scope.is_none() {
+        return ("all".into(), Vec::new(), 1);
+    }
+    let mut workspaces: Vec<String> = capabilities
+        .iter()
+        .flat_map(|capability| {
+            capability
+                .workspace_scope
+                .iter()
+                .flat_map(|scope| scope.iter().cloned())
+        })
+        .collect();
+    workspaces.sort();
+    workspaces.dedup();
+    (
+        if capabilities.len() > 1 {
+            "capabilities"
+        } else {
+            "restricted"
+        }
+        .into(),
+        workspaces,
+        capabilities.len(),
+    )
+}
+
+pub(crate) fn sync_bundle_export_capability(
+    workspace_guid: Option<&str>,
+) -> Result<(String, Option<HashSet<String>>), String> {
+    let capabilities = sync_capabilities()?;
+    if capabilities.len() == 1 {
+        let capability = capabilities.into_iter().next().unwrap();
+        if let (Some(guid), Some(scope)) = (workspace_guid, capability.workspace_scope.as_ref()) {
+            if !scope.contains(guid) {
+                return Err("capability не разрешает выбранную организацию".into());
+            }
+        }
+        return Ok((capability.token, capability.workspace_scope));
+    }
+    let guid =
+        workspace_guid.ok_or_else(|| "Выберите организацию для offline bundle".to_string())?;
+    let mut matching = capabilities.into_iter().filter(|capability| {
+        capability
+            .workspace_scope
+            .as_ref()
+            .is_some_and(|scope| scope.contains(guid))
+    });
+    let capability = matching
+        .next()
+        .ok_or_else(|| "Для организации не настроена capability".to_string())?;
+    if matching.next().is_some() {
+        return Err("Для организации настроено несколько capability; выбор неоднозначен".into());
+    }
+    Ok((capability.token, capability.workspace_scope))
+}
+
+pub(crate) fn sync_bundle_import_capabilities() -> Vec<(String, Option<HashSet<String>>)> {
+    sync_capabilities()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|capability| (capability.token, capability.workspace_scope))
+        .collect()
+}
+
+fn sync_authorized(headers: &HeaderMap) -> bool {
+    authorized_capability(headers).is_some()
 }
 
 fn blob_capability(secret: &str, hash: &str) -> String {
@@ -408,25 +585,20 @@ fn blob_capability(secret: &str, hash: &str) -> String {
     format!("cas1:{hash}:{}", hex::encode(mac.finalize().into_bytes()))
 }
 
-fn blob_authorized(headers: &HeaderMap, hash: &str) -> bool {
-    if sync_authorized(headers) {
-        return true;
+fn blob_authorized(headers: &HeaderMap, hash: &str) -> Option<SyncCapability> {
+    if let Some(capability) = authorized_capability(headers) {
+        return Some(capability);
     }
-    let Some(secret) = sync_token() else {
-        return false;
-    };
-    let expected = format!("Bearer {}", blob_capability(&secret, hash));
     let got = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .unwrap_or_default();
-    got.len() == expected.len()
-        && got
-            .as_bytes()
-            .iter()
-            .zip(expected.as_bytes())
-            .fold(0u8, |acc, (a, b)| acc | (a ^ b))
-            == 0
+    sync_capabilities().ok()?.into_iter().find(|capability| {
+        constant_time_eq(
+            got.as_bytes(),
+            format!("Bearer {}", blob_capability(&capability.token, hash)).as_bytes(),
+        )
+    })
 }
 
 async fn sync_hello(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl IntoResponse {
@@ -445,18 +617,18 @@ async fn sync_journal_get(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    if !sync_authorized(&headers) {
+    let Some(capability) = authorized_capability(&headers) else {
         return (
             StatusCode::UNAUTHORIZED,
             Json(json!({"error":"sync disabled"})),
         )
             .into_response();
-    }
+    };
     let db = state.db.lock();
     Json(sync::export_journal_scoped(
         &db,
         None,
-        sync_workspace_scope().as_ref(),
+        capability.workspace_scope.as_ref(),
     ))
     .into_response()
 }
@@ -466,15 +638,16 @@ async fn sync_journal_post(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
-    if !sync_authorized(&headers) {
+    let Some(capability) = authorized_capability(&headers) else {
         return (
             StatusCode::UNAUTHORIZED,
             Json(json!({"error":"sync disabled"})),
         )
             .into_response();
-    }
+    };
     let db = state.db.lock();
-    if sync_workspace_scope()
+    if capability
+        .workspace_scope
         .as_ref()
         .is_some_and(|scope| !sync::journal_within_scope(&body, scope))
     {
@@ -496,19 +669,19 @@ async fn sync_journal_pull(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
-    if !sync_authorized(&headers) {
+    let Some(capability) = authorized_capability(&headers) else {
         return (
             StatusCode::UNAUTHORIZED,
             Json(json!({"error":"sync disabled"})),
         )
             .into_response();
-    }
+    };
     let requested = body.get("frontier").unwrap_or(&Value::Null);
     let db = state.db.lock();
     Json(sync::export_journal_scoped(
         &db,
         Some(requested),
-        sync_workspace_scope().as_ref(),
+        capability.workspace_scope.as_ref(),
     ))
     .into_response()
 }
@@ -524,15 +697,16 @@ async fn sync_blob_get(
     Query(query): Query<BlobQuery>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    if !blob_authorized(&headers, &hash) {
+    let Some(capability) = blob_authorized(&headers, &hash) else {
         return (
             StatusCode::UNAUTHORIZED,
             Json(json!({"error":"sync disabled"})),
         )
             .into_response();
-    }
+    };
     let db = state.db.lock();
-    if sync_workspace_scope()
+    if capability
+        .workspace_scope
         .as_ref()
         .is_some_and(|scope| !sync::content_hash_allowed(&db, scope, &hash))
     {
@@ -633,7 +807,11 @@ async fn sync_missing_blobs(
 /// Работает офлайн-first: если сервер недоступен, узел продолжает работать на
 /// своей базе, ошибка попадает в «Админка → Офлайн-узлы», а следующая попытка
 /// произойдёт на следующем тике.
-async fn peer_loop(state: Arc<AppState>, upstream: Option<String>, token: String) {
+async fn peer_loop(
+    state: Arc<AppState>,
+    capability: SyncCapability,
+    include_discovered_peers: bool,
+) {
     let client = match reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(20))
         .build()
@@ -655,18 +833,20 @@ async fn peer_loop(state: Arc<AppState>, upstream: Option<String>, token: String
         let asked_now = sync::take_sync_request();
         if asked_now || waited >= interval {
             let mut peers = {
-                let db = state.db.lock();
-                sync::peer_urls(&db)
+                if include_discovered_peers {
+                    let db = state.db.lock();
+                    sync::peer_urls(&db)
+                } else {
+                    Vec::new()
+                }
             };
-            if let Some(url) = upstream.as_ref() {
-                peers.push(url.clone());
-            }
+            peers.extend(capability.peers.iter().cloned());
             peers.sort();
             peers.dedup();
             let local_urls = [sync::local_http_base(), sync::guess_lan_base()];
             peers.retain(|peer| !local_urls.iter().any(|local| local == peer));
             for peer in peers {
-                sync_once(&client, &state, &peer, &token).await;
+                sync_once(&client, &state, &peer, &capability).await;
             }
             waited = 0;
         }
@@ -675,7 +855,13 @@ async fn peer_loop(state: Arc<AppState>, upstream: Option<String>, token: String
     }
 }
 
-async fn sync_once(client: &reqwest::Client, state: &Arc<AppState>, upstream: &str, token: &str) {
+async fn sync_once(
+    client: &reqwest::Client,
+    state: &Arc<AppState>,
+    upstream: &str,
+    capability: &SyncCapability,
+) {
+    let token = &capability.token;
     {
         let db = state.db.lock();
         sync::ensure_node(&db);
@@ -707,7 +893,8 @@ async fn sync_once(client: &reqwest::Client, state: &Arc<AppState>, upstream: &s
         Ok(resp) if resp.status().is_success() => match resp.bytes().await {
             Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
                 Ok(journal) => {
-                    if sync_workspace_scope()
+                    if capability
+                        .workspace_scope
                         .as_ref()
                         .is_some_and(|scope| !sync::journal_within_scope(&journal, scope))
                     {
@@ -781,7 +968,7 @@ async fn sync_once(client: &reqwest::Client, state: &Arc<AppState>, upstream: &s
         sync::export_journal_scoped(
             &db,
             (used_frontier_protocol && remote_frontier.is_array()).then_some(&remote_frontier),
-            sync_workspace_scope().as_ref(),
+            capability.workspace_scope.as_ref(),
         )
     };
     let mine_bytes = match serde_json::to_vec(&mine) {
@@ -881,6 +1068,10 @@ pub async fn run() -> anyhow::Result<()> {
         .filter(|value| !value.is_empty())
         .map(str::to_string)
         .collect();
+    let multi_capability_mode = std::env::var("MESHKEEPER_SYNC_CAPABILITIES").is_ok();
+    if multi_capability_mode && (!bootstrap_peers.is_empty() || upstream_url().is_some()) {
+        anyhow::bail!("MESHKEEPER_SYNC_CAPABILITIES задаёт peers внутри JSON; MESHKEEPER_PEERS/UPSTREAM неоднозначны");
+    }
     if !bootstrap_peers.is_empty() && sync_token().is_none() {
         anyhow::bail!("MESHKEEPER_PEERS требует MESHKEEPER_SYNC_TOKEN не короче 32 символов");
     }
@@ -896,34 +1087,49 @@ pub async fn run() -> anyhow::Result<()> {
     let state = Arc::new(AppState {
         db: Mutex::new(conn),
     });
-    let upstream = upstream_url();
-    if let Some(url) = upstream.as_deref() {
-        if let Err(message) = validate_peer_url(url) {
-            anyhow::bail!(message);
-        }
+    let capabilities = sync_capabilities().map_err(anyhow::Error::msg)?;
+    if capabilities.is_empty() && upstream_url().is_some() {
+        anyhow::bail!("MESHKEEPER_UPSTREAM требует MESHKEEPER_SYNC_TOKEN не короче 32 символов");
     }
     if let Ok(url) = std::env::var("MESHKEEPER_ADVERTISE_URL") {
         if let Err(message) = validate_peer_url(url.trim()) {
             anyhow::bail!("MESHKEEPER_ADVERTISE_URL: {message}");
         }
     }
-    match (upstream, sync_token()) {
-        (upstream, Some(token)) => {
-            tokio::spawn(peer_loop(state.clone(), upstream, token.clone()));
+    if capabilities.is_empty() {
+        eprintln!("Автономный режим: обмен с сервером выключен");
+    } else {
+        for capability in capabilities.iter().cloned() {
+            for peer in &capability.peers {
+                let db = state.db.lock();
+                let result = sync::add_peer(&db, peer, Some("capability"), None);
+                if result.get("ok").and_then(Value::as_bool) == Some(false) {
+                    anyhow::bail!("capability peer: {}", result["error"]);
+                }
+            }
+            tokio::spawn(peer_loop(state.clone(), capability, !multi_capability_mode));
+        }
+        if capabilities.len() == 1 {
             if let Ok(bind) = std::env::var("MESHKEEPER_DISCOVERY_BIND") {
                 let bind = bind.trim().to_owned();
                 if !bind.is_empty() {
                     let target = std::env::var("MESHKEEPER_DISCOVERY_TARGET")
                         .unwrap_or_else(|_| "255.255.255.255:8767".into());
-                    tokio::spawn(discovery::run(state.clone(), token, bind, target));
+                    tokio::spawn(discovery::run(
+                        state.clone(),
+                        capabilities[0].token.clone(),
+                        bind,
+                        target,
+                    ));
                 }
             }
-            eprintln!("Режим mesh: принимаю и инициирую обмен через /sync/journal");
+        } else if std::env::var("MESHKEEPER_DISCOVERY_BIND").is_ok() {
+            eprintln!("UDP discovery выключен для нескольких capability; используйте их peers");
         }
-        (Some(_), None) => {
-            anyhow::bail!("MESHKEEPER_UPSTREAM требует MESHKEEPER_SYNC_TOKEN не короче 32 символов")
-        }
-        (None, None) => eprintln!("Автономный режим: обмен с сервером выключен"),
+        eprintln!(
+            "Режим mesh: {} capability, обмен через /sync/journal",
+            capabilities.len()
+        );
     }
     let web_root = std::env::var("MESHKEEPER_WEB_ROOT")
         .map(PathBuf::from)
@@ -985,6 +1191,64 @@ pub async fn run() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod capability_tests {
+    use super::*;
+
+    #[test]
+    fn parses_multiple_disjoint_capabilities_fail_closed() {
+        let token_a = "a".repeat(32);
+        let token_b = "b".repeat(32);
+        let raw = serde_json::json!([
+            {"token":token_a,"workspaces":["org-a"]},
+            {"token":token_b,"workspaces":["org-b","org-c"]}
+        ])
+        .to_string();
+        let parsed = parse_sync_capabilities(&raw).unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(
+            parsed[0].workspace_scope.as_ref().unwrap(),
+            &HashSet::from(["org-a".to_string()])
+        );
+        assert!(parsed[1]
+            .workspace_scope
+            .as_ref()
+            .unwrap()
+            .contains("org-c"));
+        assert!(parsed
+            .iter()
+            .all(|capability| capability.workspace_scope.is_some()));
+        let matched = find_bearer_capability(parsed, &format!("Bearer {token_b}")).unwrap();
+        assert_eq!(matched.workspace_scope.unwrap(), HashSet::from(["org-b".to_string(), "org-c".to_string()]));
+
+        assert!(parse_sync_capabilities("[]").is_err());
+        assert!(parse_sync_capabilities(
+            &serde_json::json!([{"token":"x".repeat(32),"workspaces":[]}]).to_string()
+        )
+        .is_err());
+        assert!(parse_sync_capabilities(
+            &serde_json::json!([
+                {"token":"x".repeat(32),"workspaces":["a"]},
+                {"token":"x".repeat(32),"workspaces":["b"]}
+            ])
+            .to_string()
+        )
+        .is_err());
+        assert!(parse_sync_capabilities(
+            &serde_json::json!([{"token":"x".repeat(32),"workspaces":["a"],"unexpected":true}])
+                .to_string()
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn capability_token_comparison_is_exact() {
+        assert!(constant_time_eq(b"same-token", b"same-token"));
+        assert!(!constant_time_eq(b"same-token", b"same-tokee"));
+        assert!(!constant_time_eq(b"short", b"longer"));
+    }
 }
 
 #[cfg(target_os = "android")]

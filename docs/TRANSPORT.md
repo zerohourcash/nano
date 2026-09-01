@@ -125,6 +125,12 @@ Bluetooth/Wi‑Fi Direct `content://` поток читается в отдел�
 Любой узел можно переключить в `full`; metadata-узел способен gossip-передать
 адрес настоящего провайдера, не сохраняя blob у себя.
 
+Один процесс может обслуживать несколько независимых capability через
+`MESHKEEPER_SYNC_CAPABILITIES`. Bearer определяет workspace scope до построения
+ответа; один peer-loop никогда не переиспользует токен или frontier другой
+организации. Для нескольких capability UDP discovery намеренно выключен, пока
+адаптер не сможет анонсировать несколько HMAC-доменов через один socket.
+
 ## Контракт будущего потокового адаптера
 
 BLE GATT, Bluetooth Mesh, Wi‑Fi Direct, WebRTC, LoRa или последовательный порт

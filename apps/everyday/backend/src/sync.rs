@@ -1971,12 +1971,7 @@ pub fn status(conn: &Connection) -> Value {
     } else {
         "server"
     };
-    let configured_scope = crate::sync_workspace_scope();
-    let mut workspace_scope: Vec<String> = configured_scope
-        .as_ref()
-        .map(|values| values.iter().cloned().collect())
-        .unwrap_or_default();
-    workspace_scope.sort();
+    let (scope_mode, workspace_scope, capability_count) = crate::sync_capability_summary();
     json!({
         "nodeId": id,
         "name": name,
@@ -1991,8 +1986,9 @@ pub fn status(conn: &Connection) -> Value {
         ,"bytesSent": metric(conn, "sync_bytes_sent")
         ,"bytesReceived": metric(conn, "sync_bytes_received")
         ,"syncSuccesses": metric(conn, "sync_successes")
-        ,"workspaceScopeMode": if configured_scope.is_some() { "restricted" } else { "all" }
+        ,"workspaceScopeMode": scope_mode
         ,"workspaceScope": workspace_scope
+        ,"capabilityCount": capability_count
     })
 }
 

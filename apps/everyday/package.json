@@ -25,6 +25,7 @@
     "mesh:test": "npm run node:test:build && python3 scripts/mesh_test.py",
     "discovery:test": "npm run node:test:build && python3 scripts/discovery_test.py",
     "adversarial:test": "npm run node:test:build && python3 scripts/adversarial_sync_test.py",
+    "capability:test": "npm run node:test:build && python3 scripts/capability_test.py",
     "scale:test": "npm run node:test:build && python3 scripts/scale_test.py",
     "import:facekit": "node scripts/import-facekit-snapshot.mjs",
     "pwa:icons": "python3 scripts/generate-pwa-icons.py",

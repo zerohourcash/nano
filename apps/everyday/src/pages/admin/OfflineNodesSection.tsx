@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import { Database, GitBranch, Network, Radio, RefreshCw, ShieldAlert, ShieldCheck, Download, Upload, Trash2 } from 'lucide-react'
 import { trpc } from '@/providers/trpc'
 import { cn } from '@/lib/utils'
+import { useStore } from '@/lib/store'
 import { SectionHeader, btnPrimaryCls, btnSecondaryCls, cardCls, inputCls, useToast } from './ui'
 
 function fmtMoment(iso: string): string {
@@ -19,6 +20,7 @@ function fmtBytes(value: number): string {
 }
 
 export default function OfflineNodesSection() {
+  const { workspace } = useStore()
   const toast = useToast()
   const utils = trpc.useUtils()
   const statusQ = trpc.sync.status.useQuery(undefined, { refetchInterval: 8000 })
@@ -27,7 +29,10 @@ export default function OfflineNodesSection() {
   const keysQ = trpc.sync.nodeKeys.useQuery(undefined, { refetchInterval: 8000 })
   const diagnosticsQ = trpc.sync.diagnostics.useQuery(undefined, { refetchInterval: 8000 })
   const contentQ = trpc.content.status.useQuery(undefined, { refetchInterval: 8000 })
-  const bundleQ = trpc.sync.exportBundle.useQuery(undefined, { enabled: false })
+  const bundleQ = trpc.sync.exportBundle.useQuery(
+    { workspaceGuid: workspace?.guid ?? undefined },
+    { enabled: false },
+  )
   const [peerUrl, setPeerUrl] = useState('')
   const [password, setPassword] = useState('')
   const addPeer = trpc.sync.addPeer.useMutation({
@@ -203,9 +208,13 @@ export default function OfflineNodesSection() {
             Трафик: <b>{Math.round(((st?.bytesSent ?? 0) + (st?.bytesReceived ?? 0)) / 1024)} КБ</b>
           </div>
           <div className="sm:col-span-2">
-            Scope организаций: <b>{st?.workspaceScopeMode === 'restricted' ? `${st.workspaceScope.length} разрешено` : 'вся база (доверенная нода)'}</b>
+            Scope организаций: <b>{st?.workspaceScopeMode === 'capabilities'
+              ? `${st.capabilityCount} capability · ${st.workspaceScope.length} организаций`
+              : st?.workspaceScopeMode === 'restricted'
+                ? `${st.workspaceScope.length} разрешено`
+                : st?.workspaceScopeMode === 'disabled' ? 'обмен выключен' : 'вся база (доверенная нода)'}</b>
           </div>
-          {st?.workspaceScopeMode === 'restricted' && (
+          {(st?.workspaceScopeMode === 'restricted' || st?.workspaceScopeMode === 'capabilities') && (
             <div className="sm:col-span-2 break-all font-mono-num text-[11px] text-ink-500">
               {st.workspaceScope.length ? st.workspaceScope.join(', ') : 'Ни одна организация не разрешена: синхронизация закрыта'}
             </div>

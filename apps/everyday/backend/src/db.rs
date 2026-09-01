@@ -759,13 +759,13 @@ fn seed_if_empty(conn: &Connection) -> Result<()> {
     eprintln!("Заполнение демо-данных…");
     let ts = now();
     conn.execute(
-        "INSERT INTO workspaces (name, timezone, internal_id_prefix, comment, created_at) VALUES (?1,?2,?3,?4,?5)",
-        params!["ООО «СтройМонтаж»", "Europe/Moscow", "ВН-", "Основное рабочее пространство", ts],
+        "INSERT INTO workspaces (name, timezone, internal_id_prefix, comment, created_at, guid) VALUES (?1,?2,?3,?4,?5,?6)",
+        params!["ООО «СтройМонтаж»", "Europe/Moscow", "ВН-", "Основное рабочее пространство", ts, uuid::Uuid::new_v4().to_string()],
     )?;
     let ws1 = conn.last_insert_rowid();
     conn.execute(
-        "INSERT INTO workspaces (name, timezone, internal_id_prefix, comment, created_at) VALUES (?1,?2,?3,?4,?5)",
-        params!["ИП «РемСервис»", "Europe/Moscow", "РС-", "Второе пространство", ts],
+        "INSERT INTO workspaces (name, timezone, internal_id_prefix, comment, created_at, guid) VALUES (?1,?2,?3,?4,?5,?6)",
+        params!["ИП «РемСервис»", "Europe/Moscow", "РС-", "Второе пространство", ts, uuid::Uuid::new_v4().to_string()],
     )?;
 
     let people = [

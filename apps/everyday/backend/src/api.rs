@@ -844,10 +844,11 @@ fn dispatch_inner(
         "sync.diagnostics" => Ok(crate::diagnostics::list(conn)),
         "sync.clearDiagnostics" => Ok(crate::diagnostics::clear_resolved(conn)),
         "sync.exportBundle" => {
-            let token = crate::sync_token();
-            let scope = crate::sync_workspace_scope();
+            let workspace_guid = s(input, "workspaceGuid");
+            let (token, scope) = crate::sync_bundle_export_capability(workspace_guid.as_deref())
+                .map_err(ApiError::bad)?;
             let result =
-                crate::sync::export_transport_bundle_scoped(conn, token.as_deref(), scope.as_ref());
+                crate::sync::export_transport_bundle_scoped(conn, Some(&token), scope.as_ref());
             if result.get("ok").and_then(Value::as_bool) == Some(false) {
                 crate::diagnostics::record(
                     conn,
@@ -874,14 +875,22 @@ fn dispatch_inner(
             let bundle = input
                 .get("bundle")
                 .ok_or_else(|| ApiError::bad("Нет transport bundle"))?;
-            let token = crate::sync_token();
-            let scope = crate::sync_workspace_scope();
-            let result = crate::sync::import_transport_bundle_scoped(
-                conn,
-                bundle,
-                token.as_deref(),
-                scope.as_ref(),
-            );
+            let capabilities = crate::sync_bundle_import_capabilities();
+            let mut result =
+                json!({"ok":false,"error":"Ни одна capability не расшифровала transport bundle"});
+            for (token, scope) in capabilities {
+                let candidate = crate::sync::import_transport_bundle_scoped(
+                    conn,
+                    bundle,
+                    Some(&token),
+                    scope.as_ref(),
+                );
+                if candidate.get("ok").and_then(Value::as_bool) == Some(true) {
+                    result = candidate;
+                    break;
+                }
+                result = candidate;
+            }
             if result.get("ok").and_then(Value::as_bool) == Some(false) {
                 crate::diagnostics::record(
                     conn,
@@ -1336,8 +1345,8 @@ fn auth_register(conn: &Connection, input: &Value) -> ApiResult {
     }
     let sync_url = s(input, "syncUrl");
     conn.execute(
-        "INSERT INTO workspaces (name, timezone, internal_id_prefix, comment, created_at, sync_url) VALUES (?1,?2,'ВН-',?3,?4,?5)",
-        params![ws_name, "Europe/Moscow", "Создано при регистрации", now(), sync_url],
+        "INSERT INTO workspaces (name, timezone, internal_id_prefix, comment, created_at, sync_url, guid) VALUES (?1,?2,'ВН-',?3,?4,?5,?6)",
+        params![ws_name, "Europe/Moscow", "Создано при регистрации", now(), sync_url, Uuid::new_v4().to_string()],
     ).map_err(|e| ApiError::bad(e.to_string()))?;
     let ws = conn.last_insert_rowid();
     if let Some(url) = sync_url {
@@ -3719,8 +3728,8 @@ fn admin_user_invite(conn: &Connection, input: &Value, user_id: Option<i64>) -> 
 fn ws_create(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
     let uid = require_user(conn, user_id)?;
     conn.execute(
-        "INSERT INTO workspaces (name, timezone, internal_id_prefix, comment, created_at, sync_url) VALUES (?1,?2,?3,?4,?5,?6)",
-        params![s(input,"name").unwrap_or("Группа".into()), s(input,"timezone").unwrap_or("Europe/Moscow".into()), s(input,"internalIdPrefix").unwrap_or("ВН-".into()), s(input,"comment"), now(), s(input,"syncUrl")],
+        "INSERT INTO workspaces (name, timezone, internal_id_prefix, comment, created_at, sync_url, guid) VALUES (?1,?2,?3,?4,?5,?6,?7)",
+        params![s(input,"name").unwrap_or("Группа".into()), s(input,"timezone").unwrap_or("Europe/Moscow".into()), s(input,"internalIdPrefix").unwrap_or("ВН-".into()), s(input,"comment"), now(), s(input,"syncUrl"), Uuid::new_v4().to_string()],
     )?;
     let id = conn.last_insert_rowid();
     conn.execute(
