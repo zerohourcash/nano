@@ -3,7 +3,10 @@ package ru.meshkeeper.app;
 import android.Manifest;
 import android.annotation.SuppressLint;
 import android.app.Activity;
+import android.content.BroadcastReceiver;
+import android.content.Context;
 import android.content.Intent;
+import android.content.IntentFilter;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.net.Uri;
@@ -64,10 +67,18 @@ public class MainActivity extends AppCompatActivity {
     private PermissionRequest pendingWebPermission;
     private ValueCallback<Uri[]> fileCallback;
     private volatile String pendingSyncBundle;
-    private BleMeshTransport bleTransport;
+    private volatile boolean pendingBundleFromBle;
     private byte[] pendingBleSend;
     private boolean pendingBleEnable;
     private static final int MAX_SYNC_BUNDLE_BYTES = 30 * 1024 * 1024;
+    private final BroadcastReceiver bleStatusReceiver = new BroadcastReceiver() {
+        @Override public void onReceive(Context context, Intent intent) {
+            if (!NodeService.ACTION_BLE_STATUS.equals(intent.getAction())) return;
+            dispatchBleStatus(
+                    intent.getStringExtra(NodeService.EXTRA_BLE_MESSAGE),
+                    intent.getBooleanExtra(NodeService.EXTRA_BLE_ERROR, false));
+        }
+    };
 
     private final ActivityResultLauncher<ScanOptions> qrLauncher = registerForActivityResult(
             new ScanContract(),
@@ -161,6 +172,7 @@ public class MainActivity extends AppCompatActivity {
             public void onPageFinished(WebView view, String url) {
                 view.evaluateJavascript(
                         "window.__meshkeeperNodeMode='android-rust';", null);
+                dispatchStoredBleState();
             }
         });
         web.setWebChromeClient(new WebChromeClient() {
@@ -206,6 +218,8 @@ public class MainActivity extends AppCompatActivity {
         showSetupHint();
         askNotify();
         captureIncomingBundle(getIntent());
+        ContextCompat.registerReceiver(this, bleStatusReceiver,
+                new IntentFilter(NodeService.ACTION_BLE_STATUS), ContextCompat.RECEIVER_NOT_EXPORTED);
     }
 
     private void grantWebCamera(PermissionRequest request) {
@@ -259,12 +273,47 @@ public class MainActivity extends AppCompatActivity {
         public String takePendingSyncBundle() {
             String bundle = pendingSyncBundle;
             pendingSyncBundle = null;
-            return bundle == null ? "" : bundle;
+            if (bundle != null) {
+                pendingBundleFromBle = false;
+                return bundle;
+            }
+            try {
+                String incoming = BleBundleSpool.takeIncoming(MainActivity.this);
+                pendingBundleFromBle = !incoming.isEmpty();
+                return incoming;
+            } catch (Exception error) {
+                runOnUiThread(() -> dispatchBleStatus(
+                        "Не удалось открыть принятый BLE-пакет: " + error.getMessage(), true));
+                return "";
+            }
+        }
+
+        @android.webkit.JavascriptInterface
+        public void acknowledgePendingSyncBundle(boolean accepted) {
+            if (!pendingBundleFromBle) return;
+            pendingBundleFromBle = false;
+            try {
+                BleBundleSpool.acknowledgeIncoming(MainActivity.this, accepted);
+                if (accepted && BleBundleSpool.pendingIncoming(MainActivity.this) > 0) {
+                    runOnUiThread(() -> web.evaluateJavascript(
+                            "window.dispatchEvent(new Event('meshkeeper-native-bundle'));", null));
+                }
+            } catch (Exception error) {
+                runOnUiThread(() -> dispatchBleStatus(
+                        "Не удалось подтвердить BLE-пакет: " + error.getMessage(), true));
+            }
         }
 
         @android.webkit.JavascriptInterface
         public void enableBleTransport() {
             runOnUiThread(() -> enableBle(false, null));
+        }
+
+        @android.webkit.JavascriptInterface
+        public void disableBleTransport() {
+            runOnUiThread(() -> ContextCompat.startForegroundService(MainActivity.this,
+                    new Intent(MainActivity.this, NodeService.class)
+                            .setAction(NodeService.ACTION_DISABLE_BLE)));
         }
 
         @android.webkit.JavascriptInterface
@@ -296,41 +345,34 @@ public class MainActivity extends AppCompatActivity {
             requestBlePermissions();
             return;
         }
-        BleMeshTransport transport = bleTransport();
-        transport.enableReceiver();
-        if (send) transport.send(bundle);
-    }
-
-    private BleMeshTransport bleTransport() {
-        if (bleTransport == null) {
-            bleTransport = new BleMeshTransport(this, new BleMeshTransport.Listener() {
-                @Override public void onBundle(byte[] bundle) {
-                    runOnUiThread(() -> acceptBleBundle(bundle));
-                }
-                @Override public void onStatus(String message, boolean error) {
-                    runOnUiThread(() -> {
-                        Toast.makeText(MainActivity.this, message,
-                                error ? Toast.LENGTH_LONG : Toast.LENGTH_SHORT).show();
-                        web.evaluateJavascript("window.dispatchEvent(new CustomEvent('meshkeeper-ble-status',{detail:{message:"
-                                + org.json.JSONObject.quote(message) + ",error:" + error + "}}));", null);
-                    });
-                }
-            });
-        }
-        return bleTransport;
-    }
-
-    private void acceptBleBundle(byte[] bytes) {
         try {
-            if (bytes == null || bytes.length > MAX_SYNC_BUNDLE_BYTES) throw new IllegalArgumentException("лимит 30 МБ");
-            String json = new String(bytes, StandardCharsets.UTF_8);
-            org.json.JSONObject parsed = new org.json.JSONObject(json);
-            if (!"everyday-sync-bundle".equals(parsed.optString("format"))) throw new IllegalArgumentException("неверный формат");
-            pendingSyncBundle = json;
-            Toast.makeText(this, "BLE-пакет получен — проверяем подписи", Toast.LENGTH_LONG).show();
-            web.evaluateJavascript("window.dispatchEvent(new Event('meshkeeper-native-bundle'));", null);
+            if (send) BleBundleSpool.putOutgoing(this, bundle);
+            Intent service = new Intent(this, NodeService.class)
+                    .setAction(send ? NodeService.ACTION_SEND_BLE : NodeService.ACTION_ENABLE_BLE);
+            ContextCompat.startForegroundService(this, service);
         } catch (Exception error) {
-            Toast.makeText(this, "BLE-пакет отклонён: " + error.getMessage(), Toast.LENGTH_LONG).show();
+            dispatchBleStatus("Не удалось запустить BLE: " + error.getMessage(), true);
+        }
+    }
+
+    private void dispatchStoredBleState() {
+        SharedPreferences preferences = getSharedPreferences(PREFS, MODE_PRIVATE);
+        String message = preferences.getString(NodeService.EXTRA_BLE_MESSAGE, "");
+        if (!message.isEmpty()) {
+            dispatchBleStatus(message, preferences.getBoolean(NodeService.EXTRA_BLE_ERROR, false));
+        }
+        if (BleBundleSpool.pendingIncoming(this) > 0) {
+            web.evaluateJavascript("window.dispatchEvent(new Event('meshkeeper-native-bundle'));", null);
+        }
+    }
+
+    private void dispatchBleStatus(String message, boolean error) {
+        if (message == null || message.isEmpty()) return;
+        Toast.makeText(this, message, error ? Toast.LENGTH_LONG : Toast.LENGTH_SHORT).show();
+        web.evaluateJavascript("window.dispatchEvent(new CustomEvent('meshkeeper-ble-status',{detail:{message:"
+                + org.json.JSONObject.quote(message) + ",error:" + error + "}}));", null);
+        if (BleBundleSpool.pendingIncoming(this) > 0) {
+            web.evaluateJavascript("window.dispatchEvent(new Event('meshkeeper-native-bundle'));", null);
         }
     }
 
@@ -634,7 +676,7 @@ public class MainActivity extends AppCompatActivity {
 
     @Override
     protected void onDestroy() {
-        if (bleTransport != null) bleTransport.stop();
+        unregisterReceiver(bleStatusReceiver);
         super.onDestroy();
     }
 

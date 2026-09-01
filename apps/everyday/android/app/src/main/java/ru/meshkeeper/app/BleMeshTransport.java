@@ -38,6 +38,7 @@ import java.util.UUID;
 final class BleMeshTransport {
     interface Listener {
         void onBundle(byte[] bundle);
+        void onOutgoingDelivered();
         void onStatus(String message, boolean error);
     }
 
@@ -328,6 +329,7 @@ final class BleMeshTransport {
                 retryPlans.remove(address);
             }
             listener.onStatus("BLE-пакет передан соседней ноде", false);
+            listener.onOutgoingDelivered();
             gatt.disconnect();
             return;
         }

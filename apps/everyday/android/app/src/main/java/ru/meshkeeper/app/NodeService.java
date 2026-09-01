@@ -5,6 +5,7 @@ import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.app.Service;
+import android.content.Context;
 import android.content.Intent;
 import android.content.pm.ServiceInfo;
 import android.net.ConnectivityManager;
@@ -22,20 +23,48 @@ import java.util.Collections;
 
 public class NodeService extends Service {
     public static final String EXTRA_RELAY = "relay";
+    public static final String ACTION_ENABLE_BLE = "ru.meshkeeper.app.ENABLE_BLE";
+    public static final String ACTION_SEND_BLE = "ru.meshkeeper.app.SEND_BLE";
+    public static final String ACTION_DISABLE_BLE = "ru.meshkeeper.app.DISABLE_BLE";
+    public static final String ACTION_BLE_STATUS = "ru.meshkeeper.app.BLE_STATUS";
+    public static final String EXTRA_BLE_MESSAGE = "ble_message";
+    public static final String EXTRA_BLE_ERROR = "ble_error";
+    private static final String PREF_BLE_ENABLED = "ble_enabled";
     private static final String TAG = "MeshKeeperRustNode";
     private Thread nodeThread;
     private ConnectivityManager connectivityManager;
     private ConnectivityManager.NetworkCallback networkCallback;
+    private BleMeshTransport bleTransport;
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
+        String action = intent == null ? null : intent.getAction();
+        boolean disableBle = ACTION_DISABLE_BLE.equals(action);
+        boolean requestedBle = ACTION_ENABLE_BLE.equals(action) || ACTION_SEND_BLE.equals(action);
+        boolean bleEnabled = !disableBle && (requestedBle || getSharedPreferences("meshkeeper", MODE_PRIVATE)
+                .getBoolean(PREF_BLE_ENABLED, false));
         Notification n = notification();
         if (Build.VERSION.SDK_INT >= 34) {
-            startForeground(7, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC);
+            int type = ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC;
+            if (bleEnabled) type |= ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE;
+            startForeground(7, n, type);
         } else {
             startForeground(7, n);
         }
         watchNetworkChanges();
+        if (disableBle) {
+            getSharedPreferences("meshkeeper", MODE_PRIVATE).edit()
+                    .putBoolean(PREF_BLE_ENABLED, false).apply();
+            if (bleTransport != null) bleTransport.stop();
+            bleTransport = null;
+            publishBleStatus("BLE mesh выключен; очередь сохранена", false);
+        } else if (requestedBle) {
+            getSharedPreferences("meshkeeper", MODE_PRIVATE).edit()
+                    .putBoolean(PREF_BLE_ENABLED, true).apply();
+        }
+        if (bleEnabled) {
+            enableBle(ACTION_SEND_BLE.equals(action) || intent == null);
+        }
         String relay = intent == null ? null : intent.getStringExtra(EXTRA_RELAY);
         if (relay == null) relay = getSharedPreferences("meshkeeper", MODE_PRIVATE).getString("relay", "");
         String workspaceScope = getSharedPreferences("meshkeeper", MODE_PRIVATE).getString("workspace_scope", "");
@@ -147,8 +176,60 @@ public class NodeService extends Service {
         RustNode.updateAdvertiseUrl("http://" + lan + ":" + RustNode.SYNC_PORT);
     }
 
+    private void enableBle(boolean sendPending) {
+        try {
+            if (bleTransport == null) {
+                bleTransport = new BleMeshTransport(this, new BleMeshTransport.Listener() {
+                    @Override public void onBundle(byte[] bundle) {
+                        try {
+                            BleBundleSpool.putIncoming(NodeService.this, bundle);
+                            publishBleStatus("BLE-пакет принят и ожидает криптографической проверки", false);
+                        } catch (Exception error) {
+                            publishBleStatus("Не удалось сохранить BLE-пакет: " + error.getMessage(), true);
+                        }
+                    }
+
+                    @Override public void onOutgoingDelivered() {
+                        try {
+                            BleBundleSpool.removeOutgoing(NodeService.this);
+                        } catch (Exception error) {
+                            publishBleStatus("Доставка завершена, но BLE spool не очищен: "
+                                    + error.getMessage(), true);
+                        }
+                    }
+
+                    @Override public void onStatus(String message, boolean error) {
+                        publishBleStatus(message, error);
+                    }
+                });
+            }
+            bleTransport.enableReceiver();
+            if (sendPending) {
+                byte[] bundle = BleBundleSpool.peekOutgoing(this);
+                if (bundle != null) bleTransport.send(bundle);
+            }
+        } catch (Exception error) {
+            publishBleStatus("BLE foreground transport: " + error.getMessage(), true);
+        }
+    }
+
+    private void publishBleStatus(String message, boolean error) {
+        Log.println(error ? Log.WARN : Log.INFO, TAG, message);
+        getSharedPreferences("meshkeeper", Context.MODE_PRIVATE).edit()
+                .putString(EXTRA_BLE_MESSAGE, message)
+                .putBoolean(EXTRA_BLE_ERROR, error)
+                .apply();
+        Intent update = new Intent(ACTION_BLE_STATUS)
+                .setPackage(getPackageName())
+                .putExtra(EXTRA_BLE_MESSAGE, message)
+                .putExtra(EXTRA_BLE_ERROR, error);
+        sendBroadcast(update);
+    }
+
     @Override
     public void onDestroy() {
+        if (bleTransport != null) bleTransport.stop();
+        bleTransport = null;
         if (connectivityManager != null && networkCallback != null) {
             try {
                 connectivityManager.unregisterNetworkCallback(networkCallback);

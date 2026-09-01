@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { Database, GitBranch, Network, Radio, RefreshCw, ShieldAlert, ShieldCheck, Download, Upload, Trash2 } from 'lucide-react'
 import { trpc } from '@/providers/trpc'
 import { cn } from '@/lib/utils'
@@ -19,6 +19,13 @@ function fmtBytes(value: number): string {
   return `${(value / 1024 / 1024 / 1024).toFixed(1)} ГБ`
 }
 
+function acknowledgeNativeBundle(accepted: boolean) {
+  const bridge = (window as Window & {
+    MeshKeeperNative?: { acknowledgePendingSyncBundle?: (accepted: boolean) => void }
+  }).MeshKeeperNative
+  bridge?.acknowledgePendingSyncBundle?.(accepted)
+}
+
 export default function OfflineNodesSection() {
   const { workspace } = useStore()
   const toast = useToast()
@@ -35,9 +42,10 @@ export default function OfflineNodesSection() {
   )
   const [peerUrl, setPeerUrl] = useState('')
   const [password, setPassword] = useState('')
+  const nativeImportPending = useRef(false)
   const [bleStatus, setBleStatus] = useState<{ message: string; error: boolean } | null>(null)
   const nativeBle = typeof window !== 'undefined' && Boolean((window as Window & {
-    MeshKeeperNative?: { enableBleTransport?: () => void; sendSyncBundleOverBle?: (json: string) => void }
+    MeshKeeperNative?: { enableBleTransport?: () => void; disableBleTransport?: () => void; sendSyncBundleOverBle?: (json: string) => void }
   }).MeshKeeperNative?.enableBleTransport)
   const addPeer = trpc.sync.addPeer.useMutation({
     onSuccess: () => {
@@ -102,14 +110,27 @@ export default function OfflineNodesSection() {
 
   useEffect(() => {
     const consumeNativeBundle = () => {
+      if (nativeImportPending.current) return
       const bridge = (window as Window & {
         MeshKeeperNative?: { takePendingSyncBundle?: () => string }
       }).MeshKeeperNative
       const raw = bridge?.takePendingSyncBundle?.()
       if (!raw) return
+      nativeImportPending.current = true
       try {
-        importBundle.mutate({ bundle: JSON.parse(raw) })
+        importBundle.mutate({ bundle: JSON.parse(raw) }, {
+          onSuccess: () => {
+            nativeImportPending.current = false
+            acknowledgeNativeBundle(true)
+          },
+          onError: () => {
+            nativeImportPending.current = false
+            acknowledgeNativeBundle(false)
+          },
+        })
       } catch {
+        nativeImportPending.current = false
+        acknowledgeNativeBundle(false)
         toast('Android передал некорректный пакет Everyday', 'error')
       }
     }
@@ -520,6 +541,12 @@ export default function OfflineNodesSection() {
                 bridge?.enableBleTransport?.()
               }}>
                 <Radio size={16} /> Включить BLE-приём
+              </button>
+              <button className={btnSecondaryCls} onClick={() => {
+                const bridge = (window as Window & { MeshKeeperNative?: { disableBleTransport?: () => void } }).MeshKeeperNative
+                bridge?.disableBleTransport?.()
+              }}>
+                <Radio size={16} /> Выключить BLE
               </button>
               <button className={btnPrimaryCls} disabled={bundleQ.isFetching} onClick={() => void sendTransportBundleOverBle()}>
                 <Radio size={16} /> Передать по BLE

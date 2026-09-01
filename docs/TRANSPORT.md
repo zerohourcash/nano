@@ -168,6 +168,17 @@ bounded inbox, а собранный bundle возвращает в обычны
 Radio-код не имеет API записи SQLite. Ошибка адаптера передаётся через
 подписанную device-proof операцию в локальную bounded-диагностику; одинаковые
 ошибки дедуплицируются, успешный статус помечает проблему закрытой.
+
+После явного включения BLE принадлежит Android foreground `NodeService`, а не
+Activity. Исходящий и до четырёх входящих ciphertext-bundle хранятся в
+`noBackupFilesDir` с лимитом 30 МиБ на пакет и 64 МиБ на входящую очередь.
+Публикация использует `fsync` и recoverable `.previous`; UI забирает входящий
+пакет по схеме `claim → verify/import → ack`: удаление происходит только после
+успешной криптографической проверки, а отказ возвращает ciphertext в очередь.
+Поэтому закрытие Activity не
+останавливает радио и не даёт transport layer обходить проверку прав/подписей.
+Пользователь может явно выключить BLE: foreground Rust-узел продолжит локальную
+работу, scan/advertising остановятся, а недоставленный ciphertext не удаляется.
 Android APK экспортирует это ядро через JNI-методы `fragmentTransport`,
 `missingTransportRanges` и `assembleTransport`: Java/Kotlin radio layer не
 реализует framing повторно и получает payload только после нативной проверки.

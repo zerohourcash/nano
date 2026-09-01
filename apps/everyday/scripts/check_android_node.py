@@ -13,6 +13,7 @@ manifest = (android / "src/main/AndroidManifest.xml").read_text(encoding="utf-8"
 layout = (android / "src/main/res/layout/activity_main.xml").read_text(encoding="utf-8")
 stream_inbox = (android / "src/main/java/ru/meshkeeper/app/StreamTransportInbox.java").read_text(encoding="utf-8")
 ble_transport = (android / "src/main/java/ru/meshkeeper/app/BleMeshTransport.java").read_text(encoding="utf-8")
+ble_spool = (android / "src/main/java/ru/meshkeeper/app/BleBundleSpool.java").read_text(encoding="utf-8")
 
 required = {
     "Rust JNI symbol": "Java_ru_meshkeeper_app_RustNode_startNode" in lib,
@@ -38,7 +39,28 @@ required = {
         "android.permission.BLUETOOTH_ADVERTISE",
     )),
     "BLE cannot mutate SQLite directly": "sqlite" not in ble_transport.lower()
+        and "sqlite" not in ble_spool.lower()
         and "pendingSyncBundle" in activity,
+    "foreground service owns BLE lifecycle": "new BleMeshTransport(this" in service
+        and "bleTransport.stop()" in service
+        and "new BleMeshTransport(this" not in activity
+        and "ACTION_SEND_BLE" in activity
+        and "ACTION_DISABLE_BLE" in service
+        and "disableBleTransport" in activity,
+    "crash-safe bounded BLE spool": "getNoBackupFilesDir()" in ble_spool
+        and "MAX_BUNDLE_BYTES" in ble_spool
+        and "MAX_INCOMING = 4" in ble_spool
+        and "MAX_INCOMING_BYTES" in ble_spool
+        and "getFD().sync()" in ble_spool
+        and "Os.fsync" in ble_spool
+        and 'OUTGOING + ".previous"' in ble_spool
+        and "BleBundleSpool.takeIncoming" in activity
+        and "BleBundleSpool.acknowledgeIncoming" in activity
+        and "acknowledgePendingSyncBundle" in activity,
+    "connected-device foreground declaration": "FOREGROUND_SERVICE_CONNECTED_DEVICE" in manifest
+        and 'foregroundServiceType="dataSync|connectedDevice"' in manifest,
+    "BLE spool instrumentation regression": (android / "src/androidTest/java/ru/meshkeeper/app/BleBundleSpoolTest.java").is_file()
+        and "testInstrumentationRunner" in gradle,
     "Android backup and device transfer disabled": "dataExtractionRules" in manifest
         and (android / "src/main/res/xml/data_extraction_rules.xml").is_file(),
     "private UI bind": 'MESHKEEPER_BIND", "127.0.0.1:8765' in lib,

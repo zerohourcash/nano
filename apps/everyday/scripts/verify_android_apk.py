@@ -38,8 +38,12 @@ def main() -> None:
         )
         if b"sendSyncBundleOverBle" not in web_scripts:
             raise SystemExit("APK web application does not expose the BLE transfer UI")
+        if b"disableBleTransport" not in web_scripts:
+            raise SystemExit("APK web application cannot stop the foreground BLE transport")
         if b"sync.reportTransportStatus" not in web_scripts:
             raise SystemExit("APK web application does not persist BLE transport diagnostics")
+        if b"acknowledgePendingSyncBundle" not in web_scripts:
+            raise SystemExit("APK web application does not acknowledge durable BLE imports")
         for abi in ABIS:
             member = f"lib/{abi}/libmeshkeeper_node.so"
             if member not in names:
