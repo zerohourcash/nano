@@ -160,9 +160,18 @@ pub struct CompletedTransfer {
 
 #[derive(Default)]
 pub struct Assembler {
-    metadata: Option<(PayloadKind, [u8; 16], usize, usize, [u8; 32])>,
+    metadata: Option<TransferMetadata>,
     frames: Vec<Option<Vec<u8>>>,
     received_bytes: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TransferMetadata {
+    kind: PayloadKind,
+    transfer_id: [u8; 16],
+    total_bytes: usize,
+    frame_count: usize,
+    digest: [u8; 32],
 }
 
 impl Assembler {
@@ -170,13 +179,13 @@ impl Assembler {
     /// conflicting retry or a second transfer is rejected without mutation.
     pub fn accept(&mut self, encoded: &[u8]) -> anyhow::Result<Option<CompletedTransfer>> {
         let frame = parse_frame(encoded)?;
-        let metadata = (
-            frame.kind,
-            frame.transfer_id,
-            frame.total_bytes,
-            frame.frame_count,
-            frame.digest,
-        );
+        let metadata = TransferMetadata {
+            kind: frame.kind,
+            transfer_id: frame.transfer_id,
+            total_bytes: frame.total_bytes,
+            frame_count: frame.frame_count,
+            digest: frame.digest,
+        };
         if let Some(existing) = self.metadata {
             ensure!(
                 existing == metadata,

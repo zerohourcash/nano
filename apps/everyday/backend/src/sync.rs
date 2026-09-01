@@ -52,6 +52,15 @@ fn metric(conn: &Connection, key: &str) -> u64 {
         .unwrap_or(0)
 }
 
+fn next_journal_sequence(conn: &Connection) -> u64 {
+    let next = kv_get(conn, "sync_journal_sequence")
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0)
+        .saturating_add(1);
+    kv_set(conn, "sync_journal_sequence", &next.to_string());
+    next
+}
+
 pub fn ensure_node(conn: &Connection) -> (String, String) {
     if let (Some(id), Some(name)) = (kv_get(conn, "node_id"), kv_get(conn, "node_name")) {
         return (id, name);
@@ -433,11 +442,13 @@ pub fn export_journal_since(conn: &Connection, recipient_frontier: Option<&Value
         }
     }
     let mut journal = json!({
-        "v": 1,
+        "v": 2,
         "nodeId": node_id,
         "nodeName": name,
         "nodeUrl": guess_lan_base(),
         "exportedAt": chrono::Utc::now().to_rfc3339(),
+        "journalSequence": next_journal_sequence(conn),
+        "journalScope": "*",
         "historyMode": if recipient_frontier.is_some() { "delta" } else { "full" },
         "frontier": frontier(conn),
         "workspaces": workspaces,
@@ -671,6 +682,10 @@ pub fn export_journal_scoped(
     let mut journal = export_journal_since(conn, recipient_frontier);
     if let Some(allowed) = allowed {
         filter_journal_scope(&mut journal, allowed);
+        let mut scope = allowed.iter().cloned().collect::<Vec<_>>();
+        scope.sort();
+        journal["journalScope"] =
+            Value::String(hex::encode(Sha256::digest(scope.join("\n").as_bytes())));
         if let Err(error) = ledger::sign_journal(conn, &mut journal) {
             return json!({"ok":false,"error":format!("Не удалось подписать scoped-журнал: {error}")});
         }
@@ -1723,6 +1738,15 @@ pub fn apply_remote_journal(conn: &Connection, journal: &Value, peer_url: &str) 
     if let Err(error) = enforce_node_trust(conn, journal, peer_url) {
         return json!({"ok":false,"error":format!("Ключ mesh-ноды не разрешён: {error}")});
     }
+    let receipt = match journal_receipt(conn, journal) {
+        Ok(receipt) => receipt,
+        Err(error) => {
+            return json!({"ok":false,"error":format!("Защита от rollback/replay: {error}")});
+        }
+    };
+    if receipt.duplicate {
+        return json!({"ok":true,"duplicate":true,"ops":0,"skipped":0});
+    }
     if let Err(error) = conn.execute_batch("SAVEPOINT verified_sync") {
         return json!({"ok":false,"error":error.to_string()});
     }
@@ -1759,6 +1783,10 @@ pub fn apply_remote_journal(conn: &Connection, journal: &Value, peer_url: &str) 
         let _ = conn.execute_batch("ROLLBACK TO verified_sync; RELEASE verified_sync");
         return json!({"ok":false,"error":format!("Проверка базы знаний: {error}")});
     }
+    if let Err(error) = store_journal_receipt(conn, &receipt) {
+        let _ = conn.execute_batch("ROLLBACK TO verified_sync; RELEASE verified_sync");
+        return json!({"ok":false,"error":format!("Не удалось сохранить anti-rollback квитанцию: {error}")});
+    }
     if let Err(error) = conn.execute_batch("RELEASE verified_sync") {
         return json!({"ok":false,"error":error.to_string()});
     }
@@ -1776,6 +1804,86 @@ pub fn apply_remote_journal(conn: &Connection, journal: &Value, peer_url: &str) 
         resolve_peer_error(conn, peer_url);
     }
     result
+}
+
+struct JournalReceipt {
+    public_key: String,
+    scope: String,
+    sequence: i64,
+    journal_hash: String,
+    duplicate: bool,
+}
+
+fn journal_receipt(conn: &Connection, journal: &Value) -> anyhow::Result<JournalReceipt> {
+    if journal.get("v").and_then(Value::as_i64) != Some(2) {
+        anyhow::bail!("journal v2 обязателен; legacy snapshot не имеет монотонного номера");
+    }
+    let public_key = journal
+        .get("journalPublicKey")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("нет ключа журнала"))?
+        .to_owned();
+    let journal_hash = journal
+        .get("journalHash")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("нет hash журнала"))?
+        .to_owned();
+    let sequence = journal
+        .get("journalSequence")
+        .and_then(Value::as_i64)
+        .filter(|value| *value > 0)
+        .ok_or_else(|| anyhow::anyhow!("неверный journalSequence"))?;
+    let scope = journal
+        .get("journalScope")
+        .and_then(Value::as_str)
+        .filter(|value| {
+            *value == "*"
+                || (value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        })
+        .ok_or_else(|| anyhow::anyhow!("неверный journalScope"))?
+        .to_ascii_lowercase();
+    let previous: Option<(i64, String)> = conn
+        .query_row(
+            "SELECT sequence,journal_hash FROM accepted_node_journals WHERE public_key=?1 AND scope=?2",
+            params![public_key, scope],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let duplicate = match previous {
+        Some((accepted, _)) if sequence < accepted => {
+            anyhow::bail!("устаревший журнал {sequence}; уже принят {accepted}")
+        }
+        Some((accepted, hash)) if sequence == accepted && hash != journal_hash => {
+            anyhow::bail!("эквивокация: разные журналы с номером {sequence}")
+        }
+        Some((accepted, _)) if sequence == accepted => true,
+        _ => false,
+    };
+    Ok(JournalReceipt {
+        public_key,
+        scope,
+        sequence,
+        journal_hash,
+        duplicate,
+    })
+}
+
+fn store_journal_receipt(conn: &Connection, receipt: &JournalReceipt) -> anyhow::Result<()> {
+    conn.execute(
+        "INSERT INTO accepted_node_journals(public_key,scope,sequence,journal_hash,accepted_at)
+         VALUES(?1,?2,?3,?4,?5)
+         ON CONFLICT(public_key,scope) DO UPDATE SET
+           sequence=excluded.sequence,journal_hash=excluded.journal_hash,accepted_at=excluded.accepted_at
+         WHERE excluded.sequence > accepted_node_journals.sequence",
+        params![
+            receipt.public_key,
+            receipt.scope,
+            receipt.sequence,
+            receipt.journal_hash,
+            chrono::Utc::now().to_rfc3339()
+        ],
+    )?;
+    Ok(())
 }
 
 fn enforce_node_trust(conn: &Connection, journal: &Value, peer_url: &str) -> anyhow::Result<()> {
@@ -2417,6 +2525,90 @@ mod tests {
             .any(|entry| entry["publicKey"] == key));
         drop((source, target, bootstrap));
         for path in [source_path, target_path, bootstrap_path] {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    #[test]
+    fn signed_journal_sequence_rejects_rollback_replay_and_equivocation() {
+        let source_path =
+            std::env::temp_dir().join(format!("sequence-source-{}.db", uuid::Uuid::new_v4()));
+        let target_path =
+            std::env::temp_dir().join(format!("sequence-target-{}.db", uuid::Uuid::new_v4()));
+        let source = crate::db::open(&source_path).unwrap();
+        let target = crate::db::open(&target_path).unwrap();
+        source.execute(
+            "INSERT INTO workspaces(name,internal_id_prefix,created_at,guid) VALUES('Version one','V-',?1,'sequence-workspace')",
+            [chrono::Utc::now().to_rfc3339()],
+        ).unwrap();
+        let workspace = source.last_insert_rowid();
+        let now = chrono::Utc::now().to_rfc3339();
+        source
+            .execute(
+                "INSERT INTO organization_nodes(guid,workspace_id,kind,name,created_at,updated_at)
+             VALUES('sequence-section',?1,'warehouse','Warehouse one',?2,?2)",
+                params![workspace, now],
+            )
+            .unwrap();
+
+        let first = export_journal(&source);
+        assert_eq!(first["v"], 2);
+        assert_eq!(first["journalSequence"], 1);
+        assert_eq!(apply_remote_journal(&target, &first, "")["ok"], true);
+
+        source
+            .execute(
+                "UPDATE organization_nodes SET name='Warehouse two',updated_at=?1
+                 WHERE guid='sequence-section'",
+                [chrono::Utc::now().to_rfc3339()],
+            )
+            .unwrap();
+        let second = export_journal(&source);
+        assert_eq!(second["journalSequence"], 2);
+        assert_eq!(apply_remote_journal(&target, &second, "")["ok"], true);
+        let duplicate = apply_remote_journal(&target, &second, "");
+        assert_eq!(duplicate["ok"], true);
+        assert_eq!(duplicate["duplicate"], true);
+
+        let rollback = apply_remote_journal(&target, &first, "");
+        assert_eq!(rollback["ok"], false);
+        assert!(rollback["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("устаревший"));
+        assert_eq!(
+            target
+                .query_row(
+                    "SELECT name FROM organization_nodes WHERE guid='sequence-section'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "Warehouse two"
+        );
+
+        let mut equivocation = second.clone();
+        equivocation["nodeName"] = json!("Alternate signed view");
+        ledger::sign_journal(&source, &mut equivocation).unwrap();
+        let rejected = apply_remote_journal(&target, &equivocation, "");
+        assert_eq!(rejected["ok"], false);
+        assert!(rejected["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("эквивокация"));
+
+        let receipt: (i64, String) = target
+            .query_row(
+                "SELECT sequence,journal_hash FROM accepted_node_journals",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(receipt.0, 2);
+        assert_eq!(receipt.1, second["journalHash"]);
+
+        drop((source, target));
+        for path in [source_path, target_path] {
             let _ = std::fs::remove_file(path);
         }
     }

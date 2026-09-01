@@ -166,6 +166,14 @@ fn migrate(conn: &Connection) -> Result<()> {
          CREATE TABLE IF NOT EXISTS pending_node_keys(
            public_key TEXT PRIMARY KEY, peer_url TEXT, node_name TEXT,
            first_seen TEXT NOT NULL, last_seen TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS accepted_node_journals(
+           public_key TEXT NOT NULL,
+           scope TEXT NOT NULL,
+           sequence INTEGER NOT NULL CHECK(sequence > 0),
+           journal_hash TEXT NOT NULL,
+           accepted_at TEXT NOT NULL,
+           PRIMARY KEY(public_key,scope)
          );",
     )?;
     if let Ok(public_key) = ledger::node_public_key(conn) {

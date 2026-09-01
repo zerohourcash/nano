@@ -84,7 +84,13 @@ def main() -> int:
 
         first = submit(target, signed)
         second = submit(target, signed)
-        check("двойная отправка принята идемпотентно", first.get("ok") is True and second.get("ok") is True)
+        check(
+            "двойная отправка принята идемпотентно",
+            first.get("ok") is True
+            and second.get("ok") is True
+            and second.get("duplicate") is True,
+            second,
+        )
         check(
             "повтор не размножил операции и чат",
             len(journal(target).get("history", [])) == len(signed.get("history", []))
@@ -155,13 +161,16 @@ def main() -> int:
         source.call("transfers.returnItem", {"itemId": tool["id"]})
         newest = journal(source)
         submit(target, newest)
-        submit(target, old)
+        rollback = submit(target, old)
         target.call("auth.login", {"phone": OWNER_PHONE, "password": OWNER_PASSWORD})
         target_ws = target.call("meta.workspaces", None, mutation=False)[0]["id"]
         check(
-            "replay старого snapshot не откатывает новое состояние",
-            (item_named(target, target_ws, "Контрольная дрель") or {}).get("status", {}).get("slug")
+            "replay старого snapshot криптографически отклонён до изменения состояния",
+            rollback.get("ok") is False
+            and "rollback/replay" in rollback.get("error", "")
+            and (item_named(target, target_ws, "Контрольная дрель") or {}).get("status", {}).get("slug")
             == "in-stock",
+            rollback,
         )
         check(
             "после replay сохранена новая история без дублей",
