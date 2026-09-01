@@ -38,5 +38,17 @@ public final class RustNode {
     /** Updates the LAN endpoint announced by the already running Rust node. */
     public static native void updateAdvertiseUrl(String advertiseUrl);
 
+    /** Opaque encrypted bundle/CAS framing for BLE GATT, LoRa or serial links. */
+    public static native byte[][] fragmentTransport(byte[] payload, int mtu, int kind);
+
+    /** Bounded structural and chunk-tag verification before a radio inbox retains a frame. */
+    public static native void validateTransportFrame(byte[] frame);
+
+    /** Returns inclusive missing sequence ranges as JSON, for example [[2,4],[9,9]]. */
+    public static native String missingTransportRanges(byte[][] receivedFrames);
+
+    /** Reassembles and verifies all frames; throws while frames are missing or invalid. */
+    public static native byte[] assembleTransport(byte[][] receivedFrames);
+
     public static String localOrigin() { return "http://localhost:" + UI_PORT; }
 }

@@ -11,11 +11,22 @@ secrets = (android / "src/main/java/ru/meshkeeper/app/SecretStore.java").read_te
 gradle = (android / "build.gradle").read_text(encoding="utf-8")
 manifest = (android / "src/main/AndroidManifest.xml").read_text(encoding="utf-8")
 layout = (android / "src/main/res/layout/activity_main.xml").read_text(encoding="utf-8")
+stream_inbox = (android / "src/main/java/ru/meshkeeper/app/StreamTransportInbox.java").read_text(encoding="utf-8")
 
 required = {
     "Rust JNI symbol": "Java_ru_meshkeeper_app_RustNode_startNode" in lib,
     "node key migration JNI": "Java_ru_meshkeeper_app_RustNode_provisionNodeKey" in lib,
     "dynamic LAN address JNI": "Java_ru_meshkeeper_app_RustNode_updateAdvertiseUrl" in lib,
+    "stream transport JNI": all(name in lib for name in (
+        "Java_ru_meshkeeper_app_RustNode_fragmentTransport",
+        "Java_ru_meshkeeper_app_RustNode_validateTransportFrame",
+        "Java_ru_meshkeeper_app_RustNode_missingTransportRanges",
+        "Java_ru_meshkeeper_app_RustNode_assembleTransport",
+    )),
+    "bounded Android stream inbox": "MAX_TRANSFER_BYTES" in stream_inbox
+        and "RustNode.validateTransportFrame" in stream_inbox
+        and "RustNode.assembleTransport" in stream_inbox
+        and "Конфликтующий повтор" in stream_inbox,
     "private UI bind": 'MESHKEEPER_BIND", "127.0.0.1:8765' in lib,
     "sync-only LAN bind": 'MESHKEEPER_SYNC_BIND", "0.0.0.0:8766' in lib,
     "foreground Rust launch": "RustNode.startNode" in service,

@@ -104,6 +104,12 @@ fn parse_frame(bytes: &[u8]) -> anyhow::Result<Frame<'_>> {
     })
 }
 
+/// Performs bounded structural and per-chunk verification without allocating
+/// an assembly buffer. Platform radio layers call this before retaining bytes.
+pub fn validate_frame(bytes: &[u8]) -> anyhow::Result<()> {
+    parse_frame(bytes).map(|_| ())
+}
+
 /// Splits opaque encrypted data into independently verifiable MTU-sized frames.
 pub fn fragment(kind: PayloadKind, payload: &[u8], mtu: usize) -> anyhow::Result<Vec<Vec<u8>>> {
     ensure!(

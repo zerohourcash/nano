@@ -1257,14 +1257,53 @@ mod capability_tests {
 
 #[cfg(target_os = "android")]
 mod android_jni {
-    use jni::objects::{JClass, JString};
-    use jni::sys::{jint, jstring};
+    use jni::objects::{JByteArray, JClass, JObject, JObjectArray, JString};
+    use jni::sys::{jbyteArray, jint, jobjectArray, jstring};
     use jni::JNIEnv;
 
     fn string(env: &mut JNIEnv<'_>, value: JString<'_>) -> Result<String, String> {
         env.get_string(&value)
             .map(|value| value.into())
             .map_err(|error| error.to_string())
+    }
+
+    fn java_frames(env: &mut JNIEnv<'_>, frames: JObjectArray<'_>) -> Result<Vec<Vec<u8>>, String> {
+        let count = env
+            .get_array_length(&frames)
+            .map_err(|error| error.to_string())?;
+        if count < 0 || count as usize > crate::stream_transport::MAX_FRAMES {
+            return Err("invalid transport frame array length".into());
+        }
+        let mut values = Vec::with_capacity(count as usize);
+        for index in 0..count {
+            let object = env
+                .get_object_array_element(&frames, index)
+                .map_err(|error| error.to_string())?;
+            if object.is_null() {
+                return Err("transport frame must not be null".into());
+            }
+            values.push(
+                env.convert_byte_array(JByteArray::from(object))
+                    .map_err(|error| error.to_string())?,
+            );
+        }
+        Ok(values)
+    }
+
+    fn assemble_frames(
+        frames: Vec<Vec<u8>>,
+    ) -> Result<(crate::stream_transport::Assembler, Option<Vec<u8>>), String> {
+        let mut assembler = crate::stream_transport::Assembler::default();
+        let mut completed = None;
+        for frame in frames {
+            if let Some(value) = assembler
+                .accept(&frame)
+                .map_err(|error| error.to_string())?
+            {
+                completed = Some(value.bytes);
+            }
+        }
+        Ok((assembler, completed))
     }
 
     /// Блокирующий entrypoint вызывается NodeService на выделенном thread.
@@ -1396,6 +1435,109 @@ mod android_jni {
                 advertise_url.trim().trim_end_matches('/'),
             );
             crate::sync::request_sync_now();
+        }
+    }
+
+    #[no_mangle]
+    pub extern "system" fn Java_ru_meshkeeper_app_RustNode_fragmentTransport(
+        mut env: JNIEnv<'_>,
+        _class: JClass<'_>,
+        payload: JByteArray<'_>,
+        mtu: jint,
+        kind: jint,
+    ) -> jobjectArray {
+        let result = (|| -> Result<_, String> {
+            let payload = env
+                .convert_byte_array(payload)
+                .map_err(|error| error.to_string())?;
+            let kind = crate::stream_transport::PayloadKind::try_from(kind as u8)
+                .map_err(|error| error.to_string())?;
+            let frames = crate::stream_transport::fragment(kind, &payload, mtu as usize)
+                .map_err(|error| error.to_string())?;
+            let array = env
+                .new_object_array(frames.len() as i32, "[B", JObject::null())
+                .map_err(|error| error.to_string())?;
+            for (index, frame) in frames.iter().enumerate() {
+                let bytes = env
+                    .byte_array_from_slice(frame)
+                    .map_err(|error| error.to_string())?;
+                env.set_object_array_element(&array, index as i32, bytes)
+                    .map_err(|error| error.to_string())?;
+            }
+            Ok(array.into_raw())
+        })();
+        match result {
+            Ok(array) => array,
+            Err(message) => {
+                let _ = env.throw_new("java/lang/IllegalArgumentException", message);
+                std::ptr::null_mut()
+            }
+        }
+    }
+
+    #[no_mangle]
+    pub extern "system" fn Java_ru_meshkeeper_app_RustNode_validateTransportFrame(
+        mut env: JNIEnv<'_>,
+        _class: JClass<'_>,
+        frame: JByteArray<'_>,
+    ) {
+        let result = env
+            .convert_byte_array(frame)
+            .map_err(|error| error.to_string())
+            .and_then(|bytes| {
+                crate::stream_transport::validate_frame(&bytes).map_err(|e| e.to_string())
+            });
+        if let Err(message) = result {
+            let _ = env.throw_new("java/lang/IllegalArgumentException", message);
+        }
+    }
+
+    #[no_mangle]
+    pub extern "system" fn Java_ru_meshkeeper_app_RustNode_missingTransportRanges(
+        mut env: JNIEnv<'_>,
+        _class: JClass<'_>,
+        frames: JObjectArray<'_>,
+    ) -> jstring {
+        let result = java_frames(&mut env, frames)
+            .and_then(assemble_frames)
+            .and_then(|(assembler, _)| {
+                serde_json::to_string(&assembler.missing_ranges()).map_err(|e| e.to_string())
+            });
+        match result.and_then(|value| env.new_string(value).map_err(|error| error.to_string())) {
+            Ok(value) => value.into_raw(),
+            Err(message) => {
+                let _ = env.throw_new("java/lang/IllegalArgumentException", message);
+                std::ptr::null_mut()
+            }
+        }
+    }
+
+    #[no_mangle]
+    pub extern "system" fn Java_ru_meshkeeper_app_RustNode_assembleTransport(
+        mut env: JNIEnv<'_>,
+        _class: JClass<'_>,
+        frames: JObjectArray<'_>,
+    ) -> jbyteArray {
+        let result = java_frames(&mut env, frames)
+            .and_then(assemble_frames)
+            .and_then(|(assembler, completed)| {
+                completed.ok_or_else(|| {
+                    format!(
+                        "transport frames are missing: {:?}",
+                        assembler.missing_ranges()
+                    )
+                })
+            })
+            .and_then(|bytes| {
+                env.byte_array_from_slice(&bytes)
+                    .map_err(|error| error.to_string())
+            });
+        match result {
+            Ok(value) => value.into_raw(),
+            Err(message) => {
+                let _ = env.throw_new("java/lang/IllegalArgumentException", message);
+                std::ptr::null_mut()
+            }
         }
     }
 }

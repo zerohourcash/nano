@@ -13,6 +13,10 @@ JNI_SYMBOLS = (
     "Java_ru_meshkeeper_app_RustNode_startNode",
     "Java_ru_meshkeeper_app_RustNode_provisionNodeKey",
     "Java_ru_meshkeeper_app_RustNode_updateAdvertiseUrl",
+    "Java_ru_meshkeeper_app_RustNode_fragmentTransport",
+    "Java_ru_meshkeeper_app_RustNode_validateTransportFrame",
+    "Java_ru_meshkeeper_app_RustNode_missingTransportRanges",
+    "Java_ru_meshkeeper_app_RustNode_assembleTransport",
 )
 
 

@@ -161,6 +161,12 @@ bundle importer независимо проверяет XChaCha20-Poly1305 и Ed
 
 Это готовое ядро протокола, но не заявление о доступе к BLE radio: Android/iOS
 GATT service и конкретная маршрутизация Bluetooth Mesh остаются platform layer.
+Android APK экспортирует это ядро через JNI-методы `fragmentTransport`,
+`missingTransportRanges` и `assembleTransport`: Java/Kotlin radio layer не
+реализует framing повторно и получает payload только после нативной проверки.
+`StreamTransportInbox` дополнительно ограничивает память до входа в JNI,
+отклоняет смешивание transfers и конфликтующие sequence, а в памяти хранит
+только кадры, чей chunk tag уже проверен Rust-кодом.
 
 ## Реальный статус платформ
 
