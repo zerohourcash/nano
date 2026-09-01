@@ -1381,6 +1381,8 @@ fn auth_register(conn: &Connection, input: &Value) -> ApiResult {
         "INSERT INTO user_workspaces (user_id, workspace_id, rights_json) VALUES (?1,?2,?3)",
         params![uid, ws, db::owner_rights().to_string()],
     )?;
+    crate::sync::record_membership_version(conn, ws, uid, true, None, true)
+        .map_err(|error| ApiError::internal(format!("Ошибка версии членства: {error}")))?;
     seed_workspace_defaults(conn, ws, uid)?;
     Ok(jsn::user_public(conn, uid).unwrap())
 }
@@ -1459,6 +1461,40 @@ fn consume_invite(conn: &Connection, token: &str, user_id: i64) -> ApiResult {
             "INSERT INTO user_workspaces (user_id, workspace_id, rights_json) VALUES (?1,?2,?3)",
             params![user_id, ws, db::rights_for_role(&invite.role).to_string()],
         )?;
+        conn.execute(
+            "UPDATE users SET status='active' WHERE id=?1 AND status='disabled'",
+            [user_id],
+        )?;
+        let workspace_guid = ledger::guid(conn, "workspaces", ws)
+            .map_err(|error| ApiError::internal(format!("Ошибка GUID: {error}")))?;
+        let previous: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM membership_versions WHERE workspace_guid=?1 AND user_guid=(SELECT guid FROM users WHERE id=?2)",
+                params![workspace_guid,user_id],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        let event = ledger::append(
+            conn,
+            ws,
+            user_id,
+            None,
+            "membership_join",
+            None,
+            Some(&invite.role),
+            None,
+            Some("Вступление по capability-приглашению"),
+        )
+        .map_err(|error| ApiError::internal(format!("Ошибка журнала: {error}")))?;
+        crate::sync::record_membership_version(
+            conn,
+            ws,
+            user_id,
+            true,
+            event["opId"].as_str(),
+            previous == 0,
+        )
+        .map_err(|error| ApiError::internal(format!("Ошибка версии членства: {error}")))?;
     }
     conn.execute(
         "UPDATE invites SET used_count=used_count+1 WHERE id=?1",
@@ -3654,7 +3690,7 @@ fn admin_user_create_atomic(conn: &Connection, input: &Value, actor: Option<i64>
     )?;
     let user_guid = ledger::guid(conn, "users", uid)
         .map_err(|error| ApiError::internal(format!("Ошибка GUID: {error}")))?;
-    ledger::append(
+    let event = ledger::append(
         conn,
         ws,
         actor,
@@ -3666,6 +3702,8 @@ fn admin_user_create_atomic(conn: &Connection, input: &Value, actor: Option<i64>
         Some(&format!("Добавлен участник: {name}")),
     )
     .map_err(|error| ApiError::internal(format!("Ошибка журнала: {error}")))?;
+    crate::sync::record_membership_version(conn, ws, uid, true, event["opId"].as_str(), true)
+        .map_err(|error| ApiError::internal(format!("Ошибка версии членства: {error}")))?;
     jsn::user_public(conn, uid).ok_or_else(|| ApiError::bad("ошибка"))
 }
 fn admin_user_update(conn: &mut Connection, input: &Value, actor: Option<i64>) -> ApiResult {
@@ -3704,7 +3742,7 @@ fn admin_user_update_atomic(conn: &Connection, input: &Value, actor: Option<i64>
     let updated = jsn::user_public(conn, id).ok_or_else(|| ApiError::not_found("нет"))?;
     let target_guid = ledger::guid(conn, "users", id)
         .map_err(|error| ApiError::internal(format!("Ошибка GUID: {error}")))?;
-    ledger::append(
+    let event = ledger::append(
         conn,
         ws,
         actor,
@@ -3722,6 +3760,8 @@ fn admin_user_update_atomic(conn: &Connection, input: &Value, actor: Option<i64>
         )),
     )
     .map_err(|error| ApiError::internal(format!("Ошибка журнала: {error}")))?;
+    crate::sync::record_membership_version(conn, ws, id, true, event["opId"].as_str(), false)
+        .map_err(|error| ApiError::internal(format!("Ошибка версии членства: {error}")))?;
     Ok(updated)
 }
 /// Исключение участника. Историю и подписанные блоки трогать нельзя (ТЗ §7—8):
@@ -3755,6 +3795,25 @@ fn admin_user_remove_atomic(conn: &Connection, input: &Value, actor: Option<i64>
     let ws = i64v(input, "workspaceId").unwrap_or_else(|| ws_fallback(conn));
     let target_guid = ledger::guid(conn, "users", id)
         .map_err(|error| ApiError::internal(format!("Ошибка GUID: {error}")))?;
+    let removal_comment = if traces == 0 {
+        "Участник исключён; учётная запись не имеет операционных следов"
+    } else {
+        "Участник исключён из организации; история сохранена"
+    };
+    let event = ledger::append(
+        conn,
+        ws,
+        uid,
+        None,
+        "membership_remove",
+        Some(&target_guid),
+        None,
+        None,
+        Some(removal_comment),
+    )
+    .map_err(|error| ApiError::internal(format!("Ошибка журнала: {error}")))?;
+    crate::sync::record_membership_version(conn, ws, id, false, event["opId"].as_str(), false)
+        .map_err(|error| ApiError::internal(format!("Ошибка tombstone членства: {error}")))?;
     conn.execute(
         "DELETE FROM user_workspaces WHERE user_id=?1 AND workspace_id=?2",
         params![id, ws],
@@ -3775,33 +3834,9 @@ fn admin_user_remove_atomic(conn: &Connection, input: &Value, actor: Option<i64>
         )?;
     }
     if traces == 0 && other_workspaces == 0 {
-        ledger::append(
-            conn,
-            ws,
-            uid,
-            None,
-            "membership_remove",
-            Some(&target_guid),
-            None,
-            None,
-            Some("Участник исключён; учётная запись удалена без операционных следов"),
-        )
-        .map_err(|error| ApiError::internal(format!("Ошибка журнала: {error}")))?;
         conn.execute("DELETE FROM users WHERE id=?1", params![id])?;
         return Ok(json!({"ok": true, "deleted": true}));
     }
-    ledger::append(
-        conn,
-        ws,
-        uid,
-        None,
-        "membership_remove",
-        Some(&target_guid),
-        None,
-        None,
-        Some("Участник исключён из организации; история сохранена"),
-    )
-    .map_err(|error| ApiError::internal(format!("Ошибка журнала: {error}")))?;
     Ok(json!({
         "ok": true,
         "deleted": false,
@@ -3846,7 +3881,7 @@ fn ws_create_atomic(conn: &Connection, input: &Value, user_id: Option<i64>) -> A
         crate::sync::add_peer(conn, &url, Some("relay"), None);
     }
     let workspace = jsn::workspace_json(conn, id).ok_or_else(|| ApiError::bad("ошибка"))?;
-    ledger::append(
+    let event = ledger::append(
         conn,
         id,
         uid,
@@ -3861,6 +3896,8 @@ fn ws_create_atomic(conn: &Connection, input: &Value, user_id: Option<i64>) -> A
         )),
     )
     .map_err(|error| ApiError::internal(format!("Ошибка журнала: {error}")))?;
+    crate::sync::record_membership_version(conn, id, uid, true, event["opId"].as_str(), true)
+        .map_err(|error| ApiError::internal(format!("Ошибка версии членства: {error}")))?;
     Ok(workspace)
 }
 fn ws_update(conn: &mut Connection, input: &Value, actor: Option<i64>) -> ApiResult {

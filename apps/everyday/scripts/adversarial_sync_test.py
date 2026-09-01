@@ -147,6 +147,8 @@ def main() -> int:
         check(
             "восстановленная нода сама доказывает целостность и полноту связей",
             restored_audit.get("healthy") is True
+            and restored_audit.get("membershipVerified") is True
+            and restored_audit.get("counts", {}).get("membershipVersions", 0) >= 1
             and restored_audit.get("ledgerVerified") == len(signed.get("history", []))
             and restored_audit.get("counts", {}).get("history") == len(signed.get("history", []))
             and restored_audit.get("orphanHistory") == 0
@@ -345,6 +347,61 @@ def main() -> int:
             and (source_owner_balance, source_member_balance) == (20, 80)
             and (target_owner_balance, target_member_balance) == (20, 80),
             f"source={statuses_source}/{source_owner_balance}/{source_member_balance} target={statuses_target}/{target_owner_balance}/{target_member_balance}",
+        )
+
+        # Один администратор меняет роль, а второй в той же исходной
+        # версии отзывает членство. При равной Lamport-revision tombstone
+        # всегда сильнее active-ветки, независимо от порядка доставки.
+        left_role = source.call(
+            "admin.users.update",
+            {
+                "workspaceId": ws,
+                "id": member["id"],
+                "organizationRole": "Аудитор офлайн",
+                "personnelNumber": "LEFT-ROLE",
+            },
+        )
+        right_revoke = target.call(
+            "admin.users.remove",
+            {"workspaceId": target_ws, "id": target_member["id"]},
+        )
+        check(
+            "изолированные role-update и revoke локально приняты",
+            left_role.get("id") == member["id"]
+            and right_revoke.get("ok") is True,
+            f"left={left_role} right={right_revoke}",
+        )
+        left_membership_journal = journal(source)
+        right_membership_journal = journal(target)
+        submit(source, right_membership_journal)
+        submit(target, left_membership_journal)
+        submit(source, journal(target))
+        source_people = source.call(
+            "admin.users.list", {"workspaceId": ws}, mutation=False
+        )
+        target_people = target.call(
+            "admin.users.list", {"workspaceId": target_ws}, mutation=False
+        )
+        target_member_guid = target_member.get("guid")
+        source_membership = next(
+            row
+            for row in journal(source).get("memberships", [])
+            if row.get("userGuid") == target_member_guid
+        )
+        target_membership = next(
+            row
+            for row in journal(target).get("memberships", [])
+            if row.get("userGuid") == target_member_guid
+        )
+        check(
+            "concurrent revoke побеждает role-update и tombstone сходится",
+            all(row.get("fullName") != "Второй кладовщик" for row in source_people)
+            and all(row.get("fullName") != "Второй кладовщик" for row in target_people)
+            and source_membership.get("active") is False
+            and target_membership.get("active") is False
+            and source_membership.get("revision") == target_membership.get("revision") == 2
+            and source_membership.get("versionHash") == target_membership.get("versionHash"),
+            f"source={source_membership} target={target_membership}",
         )
     finally:
         source.stop()

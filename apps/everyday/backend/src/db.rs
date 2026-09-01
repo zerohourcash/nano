@@ -226,6 +226,22 @@ fn migrate(conn: &Connection) -> Result<()> {
         "ALTER TABLE user_workspaces ADD COLUMN personnel_number TEXT",
         [],
     );
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS membership_versions(
+           workspace_guid TEXT NOT NULL,
+           user_guid TEXT NOT NULL,
+           revision INTEGER NOT NULL CHECK(revision > 0),
+           active INTEGER NOT NULL CHECK(active IN (0,1)),
+           rights_json TEXT,
+           position TEXT,
+           role_name TEXT,
+           personnel_number TEXT,
+           ledger_hash TEXT,
+           version_hash TEXT NOT NULL,
+           updated_at TEXT NOT NULL,
+           PRIMARY KEY(workspace_guid,user_guid)
+         );",
+    )?;
     conn.execute(
         "UPDATE user_workspaces SET rights_json=(SELECT role_rights FROM users WHERE users.id=user_workspaces.user_id) WHERE rights_json IS NULL",
         [],

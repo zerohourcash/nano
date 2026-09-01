@@ -61,6 +61,139 @@ fn next_journal_sequence(conn: &Connection) -> u64 {
     next
 }
 
+#[derive(Clone, Debug, Default)]
+struct MembershipFields {
+    rights: Option<String>,
+    position: Option<String>,
+    role_name: Option<String>,
+    personnel_number: Option<String>,
+}
+
+impl MembershipFields {
+    fn from_json(value: &Value) -> Self {
+        Self {
+            rights: value
+                .get("rights")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            position: value
+                .get("position")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            role_name: value
+                .get("roleName")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            personnel_number: value
+                .get("personnelNumber")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+        }
+    }
+}
+
+struct StoredMembershipVersion {
+    revision: i64,
+    version_hash: String,
+    ledger_hash: Option<String>,
+    updated_at: String,
+    fields: MembershipFields,
+}
+
+fn membership_version_hash(
+    workspace_guid: &str,
+    user_guid: &str,
+    revision: i64,
+    active: bool,
+    fields: &MembershipFields,
+    ledger_hash: Option<&str>,
+) -> String {
+    let canonical = json!([
+        "everyday/membership/v1",
+        workspace_guid,
+        user_guid,
+        revision,
+        active,
+        fields.rights,
+        fields.position,
+        fields.role_name,
+        fields.personnel_number,
+        ledger_hash
+    ]);
+    hex::encode(Sha256::digest(
+        serde_json::to_vec(&canonical).unwrap_or_default(),
+    ))
+}
+
+pub fn record_membership_version(
+    conn: &Connection,
+    workspace_id: i64,
+    user_id: i64,
+    active: bool,
+    ledger_hash: Option<&str>,
+    newly_created: bool,
+) -> anyhow::Result<Value> {
+    let workspace_guid = ledger::guid(conn, "workspaces", workspace_id)?;
+    let user_guid = ledger::guid(conn, "users", user_id)?;
+    let previous: Option<i64> = conn
+        .query_row(
+            "SELECT revision FROM membership_versions WHERE workspace_guid=?1 AND user_guid=?2",
+            params![workspace_guid, user_guid],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let revision = previous
+        .unwrap_or(if newly_created { 0 } else { 1 })
+        .saturating_add(1);
+    let membership: Option<MembershipFields> = if active {
+        conn.query_row(
+            "SELECT rights_json,position,role_name,personnel_number FROM user_workspaces
+             WHERE workspace_id=?1 AND user_id=?2",
+            params![workspace_id, user_id],
+            |row| {
+                Ok(MembershipFields {
+                    rights: row.get(0)?,
+                    position: row.get(1)?,
+                    role_name: row.get(2)?,
+                    personnel_number: row.get(3)?,
+                })
+            },
+        )
+        .optional()?
+    } else {
+        None
+    };
+    if active && membership.is_none() {
+        anyhow::bail!("active membership is missing");
+    }
+    let fields = membership.unwrap_or_default();
+    let version_hash = membership_version_hash(
+        &workspace_guid,
+        &user_guid,
+        revision,
+        active,
+        &fields,
+        ledger_hash,
+    );
+    let updated_at = chrono::Utc::now().to_rfc3339();
+    conn.execute(
+        "INSERT INTO membership_versions(workspace_guid,user_guid,revision,active,rights_json,position,role_name,personnel_number,ledger_hash,version_hash,updated_at)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)
+         ON CONFLICT(workspace_guid,user_guid) DO UPDATE SET revision=excluded.revision,
+           active=excluded.active,rights_json=excluded.rights_json,position=excluded.position,
+           role_name=excluded.role_name,personnel_number=excluded.personnel_number,
+           ledger_hash=excluded.ledger_hash,version_hash=excluded.version_hash,updated_at=excluded.updated_at",
+        params![workspace_guid,user_guid,revision,i64::from(active),fields.rights,fields.position,fields.role_name,
+            fields.personnel_number,ledger_hash,version_hash,updated_at],
+    )?;
+    Ok(json!({
+        "workspaceGuid":workspace_guid,"userGuid":user_guid,"revision":revision,
+        "active":active,"rights":fields.rights,"position":fields.position,"roleName":fields.role_name,
+        "personnelNumber":fields.personnel_number,"ledgerHash":ledger_hash,
+        "versionHash":version_hash,"updatedAt":updated_at
+    }))
+}
+
 pub fn ensure_node(conn: &Connection) -> (String, String) {
     if let (Some(id), Some(name)) = (kv_get(conn, "node_id"), kv_get(conn, "node_name")) {
         return (id, name);
@@ -357,22 +490,79 @@ pub fn export_journal_since(conn: &Connection, recipient_frontier: Option<&Value
     if let Ok(mut stmt) =
         conn.prepare("SELECT user_id,workspace_id,rights_json,position,role_name,personnel_number FROM user_workspaces")
     {
-        for row in stmt
-            .query_map([], |r| {
-                Ok(json!({
-                    "userGuid": guid_of(conn, "users", r.get::<_, i64>(0)?),
-                    "workspaceGuid": guid_of(conn, "workspaces", r.get::<_, i64>(1)?),
-                    "rights": r.get::<_, Option<String>>(2)?,
-                    "position": r.get::<_, Option<String>>(3)?,
-                    "roleName": r.get::<_, Option<String>>(4)?,
-                    "personnelNumber": r.get::<_, Option<String>>(5)?,
-                }))
+        let rows: Vec<_> = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                ))
             })
             .into_iter()
             .flatten()
             .flatten()
-        {
-            memberships.push(row);
+            .collect();
+        for (user, workspace, rights, position, role_name, personnel_number) in rows {
+            let user_guid = guid_of(conn, "users", user);
+            let workspace_guid = guid_of(conn, "workspaces", workspace);
+            let version: Option<StoredMembershipVersion> = conn
+                .query_row(
+                    "SELECT revision,version_hash,ledger_hash,updated_at,rights_json,position,role_name,personnel_number FROM membership_versions
+                     WHERE workspace_guid=?1 AND user_guid=?2 AND active=1",
+                    params![workspace_guid, user_guid],
+                    |row| Ok(StoredMembershipVersion {
+                        revision: row.get(0)?,
+                        version_hash: row.get(1)?,
+                        ledger_hash: row.get(2)?,
+                        updated_at: row.get(3)?,
+                        fields: MembershipFields {
+                            rights: row.get(4)?, position: row.get(5)?,
+                            role_name: row.get(6)?, personnel_number: row.get(7)?,
+                        },
+                    }),
+                )
+                .optional()
+                .ok()
+                .flatten();
+            let version = version.unwrap_or_else(|| {
+                let fields = MembershipFields { rights, position, role_name, personnel_number };
+                StoredMembershipVersion {
+                    revision: 1,
+                    version_hash: membership_version_hash(
+                        &workspace_guid, &user_guid, 1, true, &fields, None,
+                    ),
+                    ledger_hash: None,
+                    updated_at: "1970-01-01T00:00:00Z".to_string(),
+                    fields,
+                }
+            });
+            memberships.push(json!({
+                "userGuid":user_guid,"workspaceGuid":workspace_guid,"revision":version.revision,
+                "active":true,"rights":version.fields.rights,"position":version.fields.position,
+                "roleName":version.fields.role_name,"personnelNumber":version.fields.personnel_number,
+                "ledgerHash":version.ledger_hash,"versionHash":version.version_hash,
+                "updatedAt":version.updated_at,
+            }));
+        }
+    }
+    if let Ok(mut statement) = conn.prepare(
+        "SELECT workspace_guid,user_guid,revision,rights_json,position,role_name,personnel_number,
+                ledger_hash,version_hash,updated_at FROM membership_versions WHERE active=0",
+    ) {
+        if let Ok(rows) = statement.query_map([], |row| {
+            Ok(json!({
+                "workspaceGuid":row.get::<_,String>(0)?,"userGuid":row.get::<_,String>(1)?,
+                "revision":row.get::<_,i64>(2)?,"active":false,
+                "rights":row.get::<_,Option<String>>(3)?,"position":row.get::<_,Option<String>>(4)?,
+                "roleName":row.get::<_,Option<String>>(5)?,"personnelNumber":row.get::<_,Option<String>>(6)?,
+                "ledgerHash":row.get::<_,Option<String>>(7)?,"versionHash":row.get::<_,String>(8)?,
+                "updatedAt":row.get::<_,String>(9)?,
+            }))
+        }) {
+            memberships.extend(rows.flatten());
         }
     }
     let mut messages = Vec::new();
@@ -449,6 +639,7 @@ pub fn export_journal_since(conn: &Connection, recipient_frontier: Option<&Value
         "exportedAt": chrono::Utc::now().to_rfc3339(),
         "journalSequence": next_journal_sequence(conn),
         "journalScope": "*",
+        "membershipMode": "versioned-tombstones/v1",
         "historyMode": if recipient_frontier.is_some() { "delta" } else { "full" },
         "frontier": frontier(conn),
         "workspaces": workspaces,
@@ -1505,44 +1696,7 @@ pub fn import_journal(conn: &Connection, journal: &Value) -> Value {
     }
     if let Some(arr) = journal.get("memberships").and_then(|v| v.as_array()) {
         for m in arr {
-            let Some(user) = m
-                .get("userGuid")
-                .and_then(|v| v.as_str())
-                .and_then(|g| id_by_guid(conn, "users", g))
-            else {
-                continue;
-            };
-            let Some(ws) = m
-                .get("workspaceGuid")
-                .and_then(|v| v.as_str())
-                .and_then(|g| id_by_guid(conn, "workspaces", g))
-            else {
-                continue;
-            };
-            let exists: i64 = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM user_workspaces WHERE user_id=?1 AND workspace_id=?2",
-                    params![user, ws],
-                    |r| r.get(0),
-                )
-                .unwrap_or(0);
-            if exists == 0 {
-                let rights = m
-                    .get("rights")
-                    .and_then(|v| v.as_str())
-                    .filter(|v| !v.is_empty())
-                    .map(|v| v.to_string())
-                    .unwrap_or_else(|| crate::db::default_rights().to_string());
-                let _ = conn.execute(
-                    "INSERT INTO user_workspaces (user_id,workspace_id,rights_json,position,role_name,personnel_number) VALUES (?1,?2,?3,?4,?5,?6)",
-                    params![user,ws,rights,m.get("position").and_then(Value::as_str),m.get("roleName").and_then(Value::as_str),m.get("personnelNumber").and_then(Value::as_str)],
-                );
-            } else {
-                let _ = conn.execute(
-                    "UPDATE user_workspaces SET position=COALESCE(?1,position),role_name=COALESCE(?2,role_name),personnel_number=COALESCE(?3,personnel_number) WHERE user_id=?4 AND workspace_id=?5",
-                    params![m.get("position").and_then(Value::as_str),m.get("roleName").and_then(Value::as_str),m.get("personnelNumber").and_then(Value::as_str),user,ws],
-                );
-            }
+            merge_membership_record(conn, m);
         }
     }
     json!({
@@ -1555,6 +1709,111 @@ pub fn import_journal(conn: &Connection, journal: &Value) -> Value {
         "conflicts": conflicts
         ,"messages": messages
     })
+}
+
+fn merge_membership_record(conn: &Connection, record: &Value) {
+    let Some(workspace_guid) = record.get("workspaceGuid").and_then(Value::as_str) else {
+        return;
+    };
+    let Some(user_guid) = record.get("userGuid").and_then(Value::as_str) else {
+        return;
+    };
+    let Some(revision) = record.get("revision").and_then(Value::as_i64) else {
+        return;
+    };
+    let Some(active) = record.get("active").and_then(Value::as_bool) else {
+        return;
+    };
+    let Some(incoming_hash) = record.get("versionHash").and_then(Value::as_str) else {
+        return;
+    };
+    let local: Option<(i64, bool, String)> = conn
+        .query_row(
+            "SELECT revision,active,version_hash FROM membership_versions
+             WHERE workspace_guid=?1 AND user_guid=?2",
+            params![workspace_guid, user_guid],
+            |row| Ok((row.get(0)?, row.get::<_, i64>(1)? != 0, row.get(2)?)),
+        )
+        .optional()
+        .ok()
+        .flatten();
+    let incoming_wins = match local {
+        None => true,
+        Some((local_revision, _, _)) if revision > local_revision => true,
+        Some((local_revision, _, _)) if revision < local_revision => false,
+        Some((_, true, _)) if !active => true,
+        Some((_, false, _)) if active => false,
+        Some((_, _, local_hash)) => incoming_hash > local_hash.as_str(),
+    };
+    if !incoming_wins {
+        return;
+    }
+    let _ = conn.execute(
+        "INSERT INTO membership_versions(workspace_guid,user_guid,revision,active,rights_json,position,role_name,personnel_number,ledger_hash,version_hash,updated_at)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)
+         ON CONFLICT(workspace_guid,user_guid) DO UPDATE SET revision=excluded.revision,
+           active=excluded.active,rights_json=excluded.rights_json,position=excluded.position,
+           role_name=excluded.role_name,personnel_number=excluded.personnel_number,
+           ledger_hash=excluded.ledger_hash,version_hash=excluded.version_hash,updated_at=excluded.updated_at",
+        params![workspace_guid,user_guid,revision,i64::from(active),record.get("rights").and_then(Value::as_str),
+            record.get("position").and_then(Value::as_str),record.get("roleName").and_then(Value::as_str),
+            record.get("personnelNumber").and_then(Value::as_str),record.get("ledgerHash").and_then(Value::as_str),
+            incoming_hash,record.get("updatedAt").and_then(Value::as_str).unwrap_or("")],
+    );
+    let Some(workspace) = id_by_guid(conn, "workspaces", workspace_guid) else {
+        return;
+    };
+    let user = id_by_guid(conn, "users", user_guid);
+    if !active {
+        if let Some(user) = user {
+            let _ = conn.execute(
+                "DELETE FROM user_workspaces WHERE user_id=?1 AND workspace_id=?2",
+                params![user, workspace],
+            );
+            let other: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM user_workspaces WHERE user_id=?1",
+                    [user],
+                    |row| row.get(0),
+                )
+                .unwrap_or(0);
+            if other == 0 {
+                let _ = conn.execute("UPDATE users SET status='disabled' WHERE id=?1", [user]);
+                let _ = conn.execute(
+                    "UPDATE sessions SET revoked_at=?1 WHERE user_id=?2 AND revoked_at IS NULL",
+                    params![chrono::Utc::now().to_rfc3339(), user],
+                );
+            }
+        }
+        return;
+    }
+    let Some(user) = user else { return };
+    let rights = record.get("rights").and_then(Value::as_str);
+    let position = record.get("position").and_then(Value::as_str);
+    let role_name = record.get("roleName").and_then(Value::as_str);
+    let personnel_number = record.get("personnelNumber").and_then(Value::as_str);
+    let changed = conn
+        .execute(
+            "UPDATE user_workspaces SET rights_json=?1,position=?2,role_name=?3,personnel_number=?4
+             WHERE user_id=?5 AND workspace_id=?6",
+            params![
+                rights,
+                position,
+                role_name,
+                personnel_number,
+                user,
+                workspace
+            ],
+        )
+        .unwrap_or(0);
+    if changed == 0 {
+        let _ = conn.execute(
+            "INSERT INTO user_workspaces(user_id,workspace_id,rights_json,position,role_name,personnel_number)
+             VALUES(?1,?2,?3,?4,?5,?6)",
+            params![user,workspace,rights,position,role_name,personnel_number],
+        );
+    }
+    let _ = conn.execute("UPDATE users SET status=CASE WHEN status='disabled' THEN 'active' ELSE status END WHERE id=?1", [user]);
 }
 
 fn notify_conflict(conn: &Connection, ws: i64, item_id: i64, text: &str) {
@@ -1735,6 +1994,9 @@ pub fn apply_remote_journal(conn: &Connection, journal: &Value, peer_url: &str) 
     if let Err(error) = ledger::verify_journal(journal) {
         return json!({"ok":false,"error":format!("Криптографическая проверка снимка: {error}")});
     }
+    if let Err(error) = verify_membership_records(conn, journal) {
+        return json!({"ok":false,"error":format!("Проверка членства: {error}")});
+    }
     if let Err(error) = enforce_node_trust(conn, journal, peer_url) {
         return json!({"ok":false,"error":format!("Ключ mesh-ноды не разрешён: {error}")});
     }
@@ -1804,6 +2066,71 @@ pub fn apply_remote_journal(conn: &Connection, journal: &Value, peer_url: &str) 
         resolve_peer_error(conn, peer_url);
     }
     result
+}
+
+fn verify_membership_records(conn: &Connection, journal: &Value) -> anyhow::Result<()> {
+    if journal.get("membershipMode").and_then(Value::as_str) != Some("versioned-tombstones/v1") {
+        anyhow::bail!("journal does not provide membership tombstones");
+    }
+    let incoming_history: HashSet<&str> = journal
+        .get("history")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|event| event.get("opId").and_then(Value::as_str))
+        .collect();
+    let mut membership_keys = HashSet::new();
+    for record in journal
+        .get("memberships")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let workspace = record
+            .get("workspaceGuid")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("membership has no workspace GUID"))?;
+        let user = record
+            .get("userGuid")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("membership has no user GUID"))?;
+        if !membership_keys.insert((workspace.to_owned(), user.to_owned())) {
+            anyhow::bail!("duplicate membership version");
+        }
+        let revision = record
+            .get("revision")
+            .and_then(Value::as_i64)
+            .filter(|value| *value > 0)
+            .ok_or_else(|| anyhow::anyhow!("membership has invalid revision"))?;
+        let active = record
+            .get("active")
+            .and_then(Value::as_bool)
+            .ok_or_else(|| anyhow::anyhow!("membership has no active flag"))?;
+        let ledger_hash = record.get("ledgerHash").and_then(Value::as_str);
+        let fields = MembershipFields::from_json(record);
+        let expected =
+            membership_version_hash(workspace, user, revision, active, &fields, ledger_hash);
+        if record.get("versionHash").and_then(Value::as_str) != Some(expected.as_str()) {
+            anyhow::bail!("membership version hash mismatch");
+        }
+        if revision > 1 && ledger_hash.is_none() {
+            anyhow::bail!("non-legacy membership has no ledger event");
+        }
+        if let Some(hash) = ledger_hash {
+            let known = incoming_history.contains(hash)
+                || conn
+                    .query_row(
+                        "SELECT 1 FROM history_entries WHERE hash=?1",
+                        [hash],
+                        |_| Ok(()),
+                    )
+                    .is_ok();
+            if !known {
+                anyhow::bail!("membership ledger event is unavailable");
+            }
+        }
+    }
+    Ok(())
 }
 
 struct JournalReceipt {
@@ -2113,6 +2440,7 @@ pub fn integrity_audit(conn: &Connection) -> Value {
     let knowledge_result = crate::knowledge::verify(conn);
     let snapshot = export_journal(conn);
     let snapshot_result = ledger::verify_journal(&snapshot);
+    let membership_result = verify_membership_records(conn, &snapshot);
 
     let count = |table: &str| -> i64 {
         conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
@@ -2185,12 +2513,14 @@ pub fn integrity_audit(conn: &Connection) -> Value {
     let accounting_error = accounting_result.as_ref().err().map(ToString::to_string);
     let knowledge_error = knowledge_result.as_ref().err().map(ToString::to_string);
     let snapshot_error = snapshot_result.as_ref().err().map(ToString::to_string);
+    let membership_error = membership_result.as_ref().err().map(ToString::to_string);
     let healthy = database_check == "ok"
         && ledger_result.is_ok()
         && chat_result.is_ok()
         && accounting_result.is_ok()
         && knowledge_result.is_ok()
         && snapshot_result.is_ok()
+        && membership_result.is_ok()
         && orphan_history == 0
         && missing_guids == 0
         && missing_blobs == 0
@@ -2208,6 +2538,8 @@ pub fn integrity_audit(conn: &Connection) -> Value {
         "knowledgeError": knowledge_error,
         "knowledgeVerified": knowledge_result.is_ok(),
         "snapshotError": snapshot_error,
+        "membershipError": membership_error,
+        "membershipVerified": membership_result.is_ok(),
         "snapshotHash": snapshot.get("journalHash"),
         "lastEventAt": last_event_at,
         "orphanHistory": orphan_history,
@@ -2227,6 +2559,7 @@ pub fn integrity_audit(conn: &Connection) -> Value {
             "accountingLines": count("accounting_lines"),
             "knowledgePages": count("knowledge_pages"),
             "knowledgeRevisions": count("knowledge_revisions"),
+            "membershipVersions": count("membership_versions"),
         },
         "ledgerHeads": heads,
     })
@@ -2607,6 +2940,165 @@ mod tests {
         assert_eq!(receipt.0, 2);
         assert_eq!(receipt.1, second["journalHash"]);
 
+        drop((source, target));
+        for path in [source_path, target_path] {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    #[test]
+    fn membership_tombstone_wins_concurrent_role_update_in_any_delivery_order() {
+        let path =
+            std::env::temp_dir().join(format!("membership-merge-{}.db", uuid::Uuid::new_v4()));
+        let db = crate::db::open(&path).unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        db.execute(
+            "INSERT INTO workspaces(name,internal_id_prefix,created_at,guid)
+             VALUES('Org','O-',?1,'membership-workspace')",
+            [&now],
+        )
+        .unwrap();
+        let workspace = db.last_insert_rowid();
+        db.execute(
+            "INSERT INTO users(full_name,phone,status,created_at,guid)
+             VALUES('Member','+70000000999','active',?1,'membership-user')",
+            [&now],
+        )
+        .unwrap();
+        let user = db.last_insert_rowid();
+        let rights = crate::db::default_rights().to_string();
+        db.execute(
+            "INSERT INTO user_workspaces(user_id,workspace_id,rights_json,role_name)
+             VALUES(?1,?2,?3,'Member')",
+            params![user, workspace, rights],
+        )
+        .unwrap();
+        record_membership_version(&db, workspace, user, true, None, true).unwrap();
+
+        let active_hash = membership_version_hash(
+            "membership-workspace",
+            "membership-user",
+            2,
+            true,
+            &MembershipFields {
+                rights: Some(rights.clone()),
+                role_name: Some("Auditor".into()),
+                ..MembershipFields::default()
+            },
+            Some("active-ledger"),
+        );
+        let tombstone_hash = membership_version_hash(
+            "membership-workspace",
+            "membership-user",
+            2,
+            false,
+            &MembershipFields::default(),
+            Some("revoke-ledger"),
+        );
+        let active = json!({
+            "workspaceGuid":"membership-workspace","userGuid":"membership-user",
+            "revision":2,"active":true,"rights":rights,"roleName":"Auditor",
+            "ledgerHash":"active-ledger","versionHash":active_hash,"updatedAt":now
+        });
+        let tombstone = json!({
+            "workspaceGuid":"membership-workspace","userGuid":"membership-user",
+            "revision":2,"active":false,"ledgerHash":"revoke-ledger",
+            "versionHash":tombstone_hash,"updatedAt":now
+        });
+        merge_membership_record(&db, &active);
+        merge_membership_record(&db, &tombstone);
+        merge_membership_record(&db, &active);
+        assert_eq!(
+            db.query_row(
+                "SELECT COUNT(*) FROM user_workspaces WHERE user_id=?1 AND workspace_id=?2",
+                params![user, workspace],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            0
+        );
+        let resolved: (i64, i64, String) = db
+            .query_row(
+                "SELECT revision,active,version_hash FROM membership_versions",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(resolved, (2, 0, tombstone_hash));
+
+        let rejoin_hash = membership_version_hash(
+            "membership-workspace",
+            "membership-user",
+            3,
+            true,
+            &MembershipFields {
+                rights: Some(rights.clone()),
+                role_name: Some("Rejoined".into()),
+                ..MembershipFields::default()
+            },
+            Some("rejoin-ledger"),
+        );
+        merge_membership_record(
+            &db,
+            &json!({
+                "workspaceGuid":"membership-workspace","userGuid":"membership-user",
+                "revision":3,"active":true,"rights":rights,"roleName":"Rejoined",
+                "ledgerHash":"rejoin-ledger","versionHash":rejoin_hash,"updatedAt":now
+            }),
+        );
+        assert_eq!(
+            db.query_row(
+                "SELECT role_name FROM user_workspaces WHERE user_id=?1 AND workspace_id=?2",
+                params![user, workspace],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            "Rejoined"
+        );
+        drop(db);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn node_signed_membership_payload_with_wrong_version_hash_is_rejected() {
+        let source_path = std::env::temp_dir().join(format!(
+            "membership-forge-source-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let target_path = std::env::temp_dir().join(format!(
+            "membership-forge-target-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let source = crate::db::open(&source_path).unwrap();
+        let target = crate::db::open(&target_path).unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        source.execute("INSERT INTO workspaces(name,internal_id_prefix,created_at,guid) VALUES('Org','O-',?1,'forged-membership-workspace')",[&now]).unwrap();
+        let workspace = source.last_insert_rowid();
+        source.execute("INSERT INTO users(full_name,phone,status,created_at,guid) VALUES('Member','+70000000888','active',?1,'forged-membership-user')",[&now]).unwrap();
+        let user = source.last_insert_rowid();
+        source
+            .execute(
+                "INSERT INTO user_workspaces(user_id,workspace_id,rights_json) VALUES(?1,?2,'{}')",
+                params![user, workspace],
+            )
+            .unwrap();
+        record_membership_version(&source, workspace, user, true, None, true).unwrap();
+        let mut forged = export_journal(&source);
+        forged["memberships"][0]["rights"] = json!(crate::db::owner_rights().to_string());
+        ledger::sign_journal(&source, &mut forged).unwrap();
+        let rejected = apply_remote_journal(&target, &forged, "");
+        assert_eq!(rejected["ok"], false);
+        assert!(rejected["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("version hash mismatch"));
+        assert_eq!(
+            target
+                .query_row("SELECT COUNT(*) FROM user_workspaces", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
         drop((source, target));
         for path in [source_path, target_path] {
             let _ = std::fs::remove_file(path);

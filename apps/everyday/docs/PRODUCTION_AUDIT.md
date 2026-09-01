@@ -12,7 +12,7 @@
 | Догон после разрыва | account-chain frontier, идемпотентный store-and-forward | `npm run mesh:test`, `npm run sync:test` | Проверено |
 | Конфликты/двойная выдача | обе ветви сохраняются, предмет → `needs-check` | `npm run adversarial:test` | Проверено |
 | Подделка/replay | snapshot hash, Ed25519, nonce, trust registry, signed monotonic sequence/scope, atomic receipt, rollback savepoint | `npm run adversarial:test`, Rust rollback/equivocation test, `npm run verify` | Проверено |
-| Несколько организаций | членства/роли отдельно, scoped capability на journal/CAS | `npm run capability:test` | Проверено |
+| Несколько организаций | scoped capability journal/CAS; versioned membership ACL и revoke tombstones | `npm run capability:test`, concurrent role/revoke в `npm run adversarial:test`, Rust merge/tamper tests | Проверено |
 | Административная летопись | участники, роли, приглашения и дерево требуют device-proof и пишутся атомарно в Ledger V2 | `npm run smoke`, `npm run sync:test`, Rust membership/device tests | Проверено |
 | 100 узлов | разреженная топология, 100 процессов/БД, отказ 10 процессов | `npm run scale:test` | Проверено 2026-09-01 |
 | Фото и документы | SHA-256 CAS, chunks, resume, metadata/smart/full | `npm run sync:test`, `npm run scale:test` | Проверено |
