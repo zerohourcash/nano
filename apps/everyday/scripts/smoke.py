@@ -200,6 +200,12 @@ if isinstance(hist, list) and hist:
     show("last history", hist[0])
 
 print("\n== 8. Приглашение и вступление ==")
+unsigned_invite = owner.call(
+    "admin.workspaces.createInvite",
+    {"workspaceId": ws_id, "role": "viewer", "maxUses": 1},
+    signed=False,
+)
+check("unsigned member administration rejected", unsigned_invite.get("__http") == 403, str(unsigned_invite)[:160])
 inv = owner.call("admin.workspaces.createInvite", {"workspaceId": ws_id, "role": "viewer", "maxUses": 1})
 show("invite", inv)
 token = inv.get("token") if isinstance(inv, dict) else None
@@ -215,6 +221,19 @@ check("invite single-use enforced", "__err" in jr2, str(jr2)[:120])
 check("invite carries expiry", isinstance(inv, dict) and bool(inv.get("expiresAt")), str(inv.get("expiresAt") if isinstance(inv, dict) else inv))
 check("invite carries role", isinstance(inv, dict) and inv.get("role") == "viewer", str(inv.get("role") if isinstance(inv, dict) else inv))
 check("inviteInfo exposes expiry", isinstance(info, dict) and bool(info.get("expiresAt")), str(info.get("expiresAt") if isinstance(info, dict) else info))
+admin_events = [
+    event
+    for event in owner.call("history.all", {"workspaceId": ws_id}, mutation=False)
+    if event.get("type") == "invitation_create"
+]
+check(
+    "member administration is ledger-bound to device proof",
+    len(admin_events) == 1
+    and bool(admin_events[0].get("requestDeviceId"))
+    and bool(admin_events[0].get("requestNonce"))
+    and bool(admin_events[0].get("requestHash")),
+    str(admin_events)[:220],
+)
 
 print("\n== 9. Права наблюдателя (роль viewer из приглашения) ==")
 gme = guest.call("auth.me", None, mutation=False)

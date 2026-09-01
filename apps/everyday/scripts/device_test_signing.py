@@ -16,6 +16,10 @@ CRITICAL = {
     "inventory.checkItem", "inventory.complete",
     "chat.send", "items.addDocument", "bit.transfer", "bit.sale", "bit.mint", "knowledge.save", "sync.importBundle",
     "sync.clearDiagnostics", "sync.reportTransportStatus", "content.setMode",
+    "admin.users.create", "admin.users.update", "admin.users.remove", "admin.users.invite",
+    "admin.workspaces.create", "admin.workspaces.update", "admin.workspaces.remove",
+    "admin.workspaces.createInvite", "admin.organizationNodes.create",
+    "admin.organizationNodes.update", "admin.organizationNodes.remove",
 }
 
 

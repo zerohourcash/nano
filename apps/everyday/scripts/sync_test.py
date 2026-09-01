@@ -321,6 +321,19 @@ def main() -> int:
             and mesh_invite["token"] not in json.dumps(journal),
             str(synced_invites),
         )
+        administrative_events = [
+            event
+            for event in journal.get("history", [])
+            if event.get("type")
+            in {"organization_node_create", "invitation_create"}
+        ]
+        check(
+            "структура и приглашение привязаны к Ed25519 device-proof администратора",
+            len(administrative_events) == 3
+            and all(event.get("requestDeviceId") for event in administrative_events)
+            and all(event.get("requestSignature") for event in administrative_events),
+            str(administrative_events)[:300],
+        )
 
         node.call("sync.pullNow", {})
 

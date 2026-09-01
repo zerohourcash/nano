@@ -1081,21 +1081,17 @@ fn dispatch_inner(
         "profile.update" => profile_update(conn, input, user_id),
         "profile.changePassword" => profile_password(conn, input, user_id),
         "admin.users.list" => admin_users(conn, input),
-        "admin.users.create" => admin_user_create(conn, input),
+        "admin.users.create" => admin_user_create(conn, input, user_id),
         "admin.users.update" => admin_user_update(conn, input, user_id),
         "admin.users.remove" => admin_user_remove(conn, input, user_id),
         "admin.users.invite" => admin_user_invite(conn, input, user_id),
         "admin.users.defaultRights" => Ok(db::default_rights()),
         "admin.workspaces.list" => workspaces_list(conn),
         "admin.workspaces.create" => ws_create(conn, input, user_id),
-        "admin.workspaces.update" => ws_update(conn, input),
-        "admin.workspaces.remove" => {
-            conn.execute(
-                "DELETE FROM workspaces WHERE id=?1",
-                params![i64v(input, "id").unwrap_or(0)],
-            )?;
-            Ok(json!({"ok": true}))
-        }
+        "admin.workspaces.update" => ws_update(conn, input, user_id),
+        "admin.workspaces.remove" => Err(ApiError::conflict(
+            "Неизменяемую летопись организации нельзя удалить; используйте отзыв доступа",
+        )),
         "admin.workspaces.createInvite" => ws_create_invite(conn, input, user_id),
         "admin.workspaces.invites" => ws_invites(conn, input),
         "admin.storages.list" => storages_list(conn, input),
@@ -2724,7 +2720,7 @@ fn history_list(conn: &Connection, input: &Value, types: &[&str]) -> ApiResult {
     let mut out = Vec::new();
     for id in ids {
         if let Ok(v) = conn.query_row(
-            "SELECT id, workspace_id, item_id, type, actor_user_id, from_label, to_label, quantity_delta, comment, hash, created_at, photo_url FROM history_entries WHERE id=?1",
+            "SELECT id, workspace_id, item_id, type, actor_user_id, from_label, to_label, quantity_delta, comment, hash, created_at, photo_url,event_version,request_device_id,request_nonce,request_hash FROM history_entries WHERE id=?1",
             params![id],
             |r| {
                 let actor: i64 = r.get(4)?;
@@ -2742,6 +2738,10 @@ fn history_list(conn: &Connection, input: &Value, types: &[&str]) -> ApiResult {
                     "opId": r.get::<_, String>(9)?,
                     "createdAt": r.get::<_, String>(10)?,
                     "photoUrl": r.get::<_, Option<String>>(11)?,
+                    "eventVersion": r.get::<_, i64>(12)?,
+                    "requestDeviceId": r.get::<_, Option<String>>(13)?,
+                    "requestNonce": r.get::<_, Option<String>>(14)?,
+                    "requestHash": r.get::<_, Option<String>>(15)?,
                     "actor": jsn::user_public(conn, actor),
                     "item": item_id.and_then(|i| jsn::item_json(conn, i, false)),
                 }))
@@ -3634,7 +3634,12 @@ fn admin_users(conn: &Connection, input: &Value) -> ApiResult {
     }
     Ok(Value::Array(out))
 }
-fn admin_user_create(conn: &Connection, input: &Value) -> ApiResult {
+fn admin_user_create(conn: &mut Connection, input: &Value, actor: Option<i64>) -> ApiResult {
+    atomic(conn, |conn| admin_user_create_atomic(conn, input, actor))
+}
+
+fn admin_user_create_atomic(conn: &Connection, input: &Value, actor: Option<i64>) -> ApiResult {
+    let actor = require_user(conn, actor)?;
     let name = s(input, "fullName").ok_or_else(|| ApiError::bad("fullName"))?;
     let phone = s(input, "phone").ok_or_else(|| ApiError::bad("phone"))?;
     conn.execute(
@@ -3647,13 +3652,31 @@ fn admin_user_create(conn: &Connection, input: &Value) -> ApiResult {
         "INSERT INTO user_workspaces(user_id,workspace_id,rights_json,position,role_name,personnel_number) VALUES (?1,?2,?3,?4,?5,?6)",
         params![uid,ws,db::default_rights().to_string(),s(input,"position"),s(input,"organizationRole"),s(input,"personnelNumber")],
     )?;
+    let user_guid = ledger::guid(conn, "users", uid)
+        .map_err(|error| ApiError::internal(format!("Ошибка GUID: {error}")))?;
+    ledger::append(
+        conn,
+        ws,
+        actor,
+        None,
+        "membership_create",
+        None,
+        Some(&user_guid),
+        None,
+        Some(&format!("Добавлен участник: {name}")),
+    )
+    .map_err(|error| ApiError::internal(format!("Ошибка журнала: {error}")))?;
     jsn::user_public(conn, uid).ok_or_else(|| ApiError::bad("ошибка"))
 }
-fn admin_user_update(conn: &Connection, input: &Value, actor: Option<i64>) -> ApiResult {
-    if let Some(uid) = actor {
-        require_can(conn, uid, "manageUsers")?;
-    }
+fn admin_user_update(conn: &mut Connection, input: &Value, actor: Option<i64>) -> ApiResult {
+    atomic(conn, |conn| admin_user_update_atomic(conn, input, actor))
+}
+
+fn admin_user_update_atomic(conn: &Connection, input: &Value, actor: Option<i64>) -> ApiResult {
+    let actor = require_user(conn, actor)?;
+    require_can(conn, actor, "manageUsers")?;
     let id = i64v(input, "id").ok_or_else(|| ApiError::bad("id"))?;
+    let before = jsn::user_public(conn, id).ok_or_else(|| ApiError::not_found("нет"))?;
     conn.execute("UPDATE users SET full_name=COALESCE(?2,full_name), position=COALESCE(?3,position), phone=COALESCE(?4,phone), status=COALESCE(?5,status) WHERE id=?1",
         params![id, s(input,"fullName"), s(input,"position"), s(input,"phone"), s(input,"status")])?;
     if let Some(rr) = input.get("roleRights") {
@@ -3678,12 +3701,37 @@ fn admin_user_update(conn: &Connection, input: &Value, actor: Option<i64>) -> Ap
             )?;
         }
     }
-    jsn::user_public(conn, id).ok_or_else(|| ApiError::not_found("нет"))
+    let updated = jsn::user_public(conn, id).ok_or_else(|| ApiError::not_found("нет"))?;
+    let target_guid = ledger::guid(conn, "users", id)
+        .map_err(|error| ApiError::internal(format!("Ошибка GUID: {error}")))?;
+    ledger::append(
+        conn,
+        ws,
+        actor,
+        None,
+        "membership_update",
+        Some(&target_guid),
+        Some(&target_guid),
+        None,
+        Some(&format!(
+            "Изменёны права/профиль: {}",
+            updated["fullName"]
+                .as_str()
+                .or_else(|| before["fullName"].as_str())
+                .unwrap_or("участник")
+        )),
+    )
+    .map_err(|error| ApiError::internal(format!("Ошибка журнала: {error}")))?;
+    Ok(updated)
 }
 /// Исключение участника. Историю и подписанные блоки трогать нельзя (ТЗ §7—8):
 /// если за человеком что-то числится, он блокируется и выводится из пространства,
 /// а не стирается вместе со следами своих операций.
-fn admin_user_remove(conn: &Connection, input: &Value, actor: Option<i64>) -> ApiResult {
+fn admin_user_remove(conn: &mut Connection, input: &Value, actor: Option<i64>) -> ApiResult {
+    atomic(conn, |conn| admin_user_remove_atomic(conn, input, actor))
+}
+
+fn admin_user_remove_atomic(conn: &Connection, input: &Value, actor: Option<i64>) -> ApiResult {
     let uid = require_user(conn, actor)?;
     let id = i64v(input, "id").ok_or_else(|| ApiError::bad("id"))?;
     if id == uid {
@@ -3705,6 +3753,8 @@ fn admin_user_remove(conn: &Connection, input: &Value, actor: Option<i64>) -> Ap
         |r| r.get(0),
     )?;
     let ws = i64v(input, "workspaceId").unwrap_or_else(|| ws_fallback(conn));
+    let target_guid = ledger::guid(conn, "users", id)
+        .map_err(|error| ApiError::internal(format!("Ошибка GUID: {error}")))?;
     conn.execute(
         "DELETE FROM user_workspaces WHERE user_id=?1 AND workspace_id=?2",
         params![id, ws],
@@ -3725,9 +3775,33 @@ fn admin_user_remove(conn: &Connection, input: &Value, actor: Option<i64>) -> Ap
         )?;
     }
     if traces == 0 && other_workspaces == 0 {
+        ledger::append(
+            conn,
+            ws,
+            uid,
+            None,
+            "membership_remove",
+            Some(&target_guid),
+            None,
+            None,
+            Some("Участник исключён; учётная запись удалена без операционных следов"),
+        )
+        .map_err(|error| ApiError::internal(format!("Ошибка журнала: {error}")))?;
         conn.execute("DELETE FROM users WHERE id=?1", params![id])?;
         return Ok(json!({"ok": true, "deleted": true}));
     }
+    ledger::append(
+        conn,
+        ws,
+        uid,
+        None,
+        "membership_remove",
+        Some(&target_guid),
+        None,
+        None,
+        Some("Участник исключён из организации; история сохранена"),
+    )
+    .map_err(|error| ApiError::internal(format!("Ошибка журнала: {error}")))?;
     Ok(json!({
         "ok": true,
         "deleted": false,
@@ -3736,8 +3810,12 @@ fn admin_user_remove(conn: &Connection, input: &Value, actor: Option<i64>) -> Ap
     }))
 }
 
-fn admin_user_invite(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
-    let created = admin_user_create(conn, input)?;
+fn admin_user_invite(conn: &mut Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
+    atomic(conn, |conn| admin_user_invite_atomic(conn, input, user_id))
+}
+
+fn admin_user_invite_atomic(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
+    let created = admin_user_create_atomic(conn, input, user_id)?;
     let ws = i64v(input, "workspaceId").unwrap_or_else(|| ws_fallback(conn));
     let token = Uuid::new_v4().to_string().replace('-', "");
     let expires_at = invite_expiry(input);
@@ -3748,7 +3826,11 @@ fn admin_user_invite(conn: &Connection, input: &Value, user_id: Option<i64>) -> 
     Ok(json!({"user": created, "token": token, "expiresAt": expires_at}))
 }
 
-fn ws_create(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
+fn ws_create(conn: &mut Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
+    atomic(conn, |conn| ws_create_atomic(conn, input, user_id))
+}
+
+fn ws_create_atomic(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
     let uid = require_user(conn, user_id)?;
     conn.execute(
         "INSERT INTO workspaces (name, timezone, internal_id_prefix, comment, created_at, sync_url, guid) VALUES (?1,?2,?3,?4,?5,?6,?7)",
@@ -3763,17 +3845,52 @@ fn ws_create(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiResul
     if let Some(url) = s(input, "syncUrl") {
         crate::sync::add_peer(conn, &url, Some("relay"), None);
     }
-    jsn::workspace_json(conn, id).ok_or_else(|| ApiError::bad("ошибка"))
+    let workspace = jsn::workspace_json(conn, id).ok_or_else(|| ApiError::bad("ошибка"))?;
+    ledger::append(
+        conn,
+        id,
+        uid,
+        None,
+        "workspace_create",
+        None,
+        workspace["guid"].as_str(),
+        None,
+        Some(&format!(
+            "Создана организация: {}",
+            workspace["name"].as_str().unwrap_or("организация")
+        )),
+    )
+    .map_err(|error| ApiError::internal(format!("Ошибка журнала: {error}")))?;
+    Ok(workspace)
 }
-fn ws_update(conn: &Connection, input: &Value) -> ApiResult {
+fn ws_update(conn: &mut Connection, input: &Value, actor: Option<i64>) -> ApiResult {
+    atomic(conn, |conn| ws_update_atomic(conn, input, actor))
+}
+
+fn ws_update_atomic(conn: &Connection, input: &Value, actor: Option<i64>) -> ApiResult {
+    let actor = require_user(conn, actor)?;
     let id = i64v(input, "id").ok_or_else(|| ApiError::bad("id"))?;
+    let before = jsn::workspace_json(conn, id).ok_or_else(|| ApiError::not_found("нет"))?;
     conn.execute("UPDATE workspaces SET name=COALESCE(?2,name), timezone=COALESCE(?3,timezone), internal_id_prefix=COALESCE(?4,internal_id_prefix), comment=?5, sync_url=COALESCE(?6,sync_url), require_writeoff_photo=CASE WHEN ?7 THEN ?8 ELSE require_writeoff_photo END WHERE id=?1",
         params![id, s(input,"name"), s(input,"timezone"), s(input,"internalIdPrefix"), s(input,"comment"), s(input,"syncUrl"),
                 input.get("requireWriteoffPhoto").is_some(), b(input,"requireWriteoffPhoto").unwrap_or(false) as i64])?;
     if let Some(url) = s(input, "syncUrl") {
         crate::sync::add_peer(conn, &url, Some("relay"), None);
     }
-    jsn::workspace_json(conn, id).ok_or_else(|| ApiError::not_found("нет"))
+    let updated = jsn::workspace_json(conn, id).ok_or_else(|| ApiError::not_found("нет"))?;
+    ledger::append(
+        conn,
+        id,
+        actor,
+        None,
+        "workspace_update",
+        before["name"].as_str(),
+        updated["name"].as_str(),
+        None,
+        Some("Изменены настройки организации"),
+    )
+    .map_err(|error| ApiError::internal(format!("Ошибка журнала: {error}")))?;
+    Ok(updated)
 }
 /// Срок жизни приглашения по умолчанию — неделя (ТЗ: у приглашения есть срок действия).
 const INVITE_DEFAULT_TTL_HOURS: i64 = 168;
@@ -3796,7 +3913,12 @@ fn invite_position(role: &str) -> &'static str {
     }
 }
 
-fn ws_create_invite(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
+fn ws_create_invite(conn: &mut Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
+    atomic(conn, |conn| ws_create_invite_atomic(conn, input, user_id))
+}
+
+fn ws_create_invite_atomic(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
+    let actor = require_user(conn, user_id)?;
     let ws = i64v(input, "workspaceId").unwrap_or_else(|| ws_fallback(conn));
     let token = Uuid::new_v4().to_string().replace('-', "");
     let role = s(input, "role").unwrap_or_else(|| "member".into());
@@ -3805,6 +3927,21 @@ fn ws_create_invite(conn: &Connection, input: &Value, user_id: Option<i64>) -> A
         "INSERT INTO invites (workspace_id, token, role, created_by, max_uses, expires_at, created_at) VALUES (?1,?2,?3,?4,?5,?6,?7)",
         params![ws, token, role, user_id, i64v(input,"maxUses").unwrap_or(20), expires_at, now()],
     )?;
+    ledger::append(
+        conn,
+        ws,
+        actor,
+        None,
+        "invitation_create",
+        None,
+        Some(&role),
+        None,
+        Some(&format!(
+            "Создано приглашение; maxUses={}, expiresAt={expires_at}",
+            i64v(input, "maxUses").unwrap_or(20)
+        )),
+    )
+    .map_err(|error| ApiError::internal(format!("Ошибка журнала: {error}")))?;
     let wsj = jsn::workspace_json(conn, ws).unwrap_or(json!({}));
     Ok(json!({
         "token": token,
@@ -5967,6 +6104,68 @@ mod tests {
     }
 
     #[test]
+    fn membership_administration_is_atomic_and_ledger_bound() {
+        let (mut conn, path, users, ws) = test_db();
+        let created = dispatch(
+            &mut conn,
+            "admin.users.create",
+            &json!({
+                "workspaceId": ws,
+                "fullName": "Новый аудитор",
+                "phone": "+7 900 123-45-67",
+                "organizationRole": "Аудитор"
+            }),
+            Some(users[0]),
+        )
+        .unwrap();
+        let target = created["id"].as_i64().unwrap();
+        dispatch(
+            &mut conn,
+            "admin.users.update",
+            &json!({
+                "workspaceId": ws,
+                "id": target,
+                "organizationRole": "Старший аудитор",
+                "personnelNumber": "AUD-7"
+            }),
+            Some(users[0]),
+        )
+        .unwrap();
+        dispatch(
+            &mut conn,
+            "admin.users.remove",
+            &json!({"workspaceId": ws, "id": target}),
+            Some(users[0]),
+        )
+        .unwrap();
+
+        let types: Vec<String> = conn
+            .prepare("SELECT type FROM history_entries WHERE type LIKE 'membership_%' ORDER BY id")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .flatten()
+            .collect();
+        assert_eq!(
+            types,
+            [
+                "membership_create",
+                "membership_update",
+                "membership_remove"
+            ]
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM users WHERE id=?1", [target], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+            0
+        );
+        ledger::verify_all(&conn).unwrap();
+        cleanup(conn, path);
+    }
+
+    #[test]
     fn bit_transfer_is_atomic_balanced_and_permission_checked() {
         let (mut conn, path, users, ws) = test_db();
         let minted=dispatch(&mut conn,"bit.mint",&json!({"workspaceId":ws,"recipientUserId":users[0],"amount":100,"memo":"Начальная эмиссия"}),Some(users[0])).unwrap();
@@ -6370,8 +6569,12 @@ mod tests {
         .unwrap();
         assert_eq!(item["organizationNode"]["name"], "Кабинет 204");
 
-        let other_ws = ws_create(&conn, &json!({"name":"Чужая организация"}), Some(users[0]))
-            .unwrap()["id"]
+        let other_ws = ws_create(
+            &mut conn,
+            &json!({"name":"Чужая организация"}),
+            Some(users[0]),
+        )
+        .unwrap()["id"]
             .as_i64()
             .unwrap();
         let foreign = organization_node_create_atomic(

@@ -44,6 +44,17 @@ pub fn requires_signature(procedure: &str) -> bool {
             | "sync.clearDiagnostics"
             | "sync.reportTransportStatus"
             | "content.setMode"
+            | "admin.users.create"
+            | "admin.users.update"
+            | "admin.users.remove"
+            | "admin.users.invite"
+            | "admin.workspaces.create"
+            | "admin.workspaces.update"
+            | "admin.workspaces.remove"
+            | "admin.workspaces.createInvite"
+            | "admin.organizationNodes.create"
+            | "admin.organizationNodes.update"
+            | "admin.organizationNodes.remove"
     )
 }
 
@@ -249,6 +260,27 @@ mod tests {
         let tampered_headers =
             signed_headers(&key, "phone-device-0001", path, body, "unique-nonce-0002");
         assert!(verify_request(&db, 7, path, br#"{"itemId":43}"#, &tampered_headers).is_err());
+    }
+
+    #[test]
+    fn administrative_identity_and_structure_changes_require_device_signature() {
+        for procedure in [
+            "admin.users.create",
+            "admin.users.update",
+            "admin.users.remove",
+            "admin.users.invite",
+            "admin.workspaces.create",
+            "admin.workspaces.update",
+            "admin.workspaces.remove",
+            "admin.workspaces.createInvite",
+            "admin.organizationNodes.create",
+            "admin.organizationNodes.update",
+            "admin.organizationNodes.remove",
+        ] {
+            assert!(requires_signature(procedure), "unsigned {procedure}");
+        }
+        assert!(!requires_signature("admin.users.list"));
+        assert!(!requires_signature("admin.organizationNodes.list"));
     }
 
     #[test]

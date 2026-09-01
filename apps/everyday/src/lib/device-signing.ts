@@ -93,6 +93,17 @@ const CRITICAL = [
   'sync.clearDiagnostics',
   'sync.reportTransportStatus',
   'content.setMode',
+  'admin.users.create',
+  'admin.users.update',
+  'admin.users.remove',
+  'admin.users.invite',
+  'admin.workspaces.create',
+  'admin.workspaces.update',
+  'admin.workspaces.remove',
+  'admin.workspaces.createInvite',
+  'admin.organizationNodes.create',
+  'admin.organizationNodes.update',
+  'admin.organizationNodes.remove',
 ]
 
 export function requiresDeviceSignature(url: string): boolean {
