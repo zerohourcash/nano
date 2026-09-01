@@ -3190,6 +3190,9 @@ pub fn import_journal(conn: &Connection, journal: &Value) -> Value {
             merge_membership_record(conn, m);
         }
     }
+    if let Err(error) = rebuild_quantitative_stock(conn) {
+        return json!({"ok":false,"error":format!("Не удалось восстановить подписанный остаток: {error}")});
+    }
     json!({
         "ok": true,
         "workspaces": workspaces,
@@ -5189,7 +5192,141 @@ fn verify_stock_operation_records(journal: &Value) -> anyhow::Result<(usize, usi
             anyhow::bail!("item site snapshot differs from latest signed move")
         }
     }
+    // A frontier delta intentionally omits already-known events. Its incoming
+    // snapshot is therefore not independently sufficient for this equation;
+    // import rebuilds from the local+incoming union and the post-import full
+    // verification below remains authoritative.
+    if journal.get("historyMode").and_then(Value::as_str) != Some("delta") {
+        for (item_guid, expected) in expected_stock_quantities(journal)? {
+            let snapshot = journal
+                .get("items")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .find(|item| item.get("guid").and_then(Value::as_str) == Some(item_guid.as_str()))
+                .ok_or_else(|| anyhow::anyhow!("quantitative item snapshot unavailable"))?;
+            let actual = snapshot
+                .get("quantity")
+                .and_then(Value::as_f64)
+                .ok_or_else(|| anyhow::anyhow!("quantitative item has no stock quantity"))?;
+            if !actual.is_finite() || (actual - expected).abs() > 1e-8 {
+                anyhow::bail!(
+                    "item quantity snapshot differs from signed history: actual={actual} expected={expected}"
+                )
+            }
+        }
+    }
     Ok((verified, legacy))
+}
+
+fn expected_stock_quantities(journal: &Value) -> anyhow::Result<HashMap<String, f64>> {
+    let mut winners: HashMap<&str, &Value> = HashMap::new();
+    for record in journal
+        .get("itemStateVersions")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let Some(item) = record.get("itemGuid").and_then(Value::as_str) else {
+            continue;
+        };
+        let candidate_depth = record.get("depth").and_then(Value::as_i64).unwrap_or(-1);
+        let candidate_hash = record
+            .get("versionHash")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if winners.get(item).is_none_or(|current| {
+            (candidate_depth, candidate_hash)
+                > (
+                    current.get("depth").and_then(Value::as_i64).unwrap_or(-1),
+                    current
+                        .get("versionHash")
+                        .and_then(Value::as_str)
+                        .unwrap_or(""),
+                )
+        }) {
+            winners.insert(item, record);
+        }
+    }
+    let mut expected = HashMap::new();
+    for (item, winner) in winners {
+        let fields = winner.get("fields").unwrap_or(&Value::Null);
+        if fields.get("quantitative").and_then(Value::as_bool) != Some(true) {
+            continue;
+        }
+        let mut quantity = fields
+            .get("quantity")
+            .and_then(Value::as_f64)
+            .ok_or_else(|| anyhow::anyhow!("quantitative master state has no quantity"))?;
+        let baseline = winner
+            .get("updatedAt")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        for event in journal
+            .get("history")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|event| {
+                event.get("itemGuid").and_then(Value::as_str) == Some(item)
+                    && event
+                        .get("createdAt")
+                        .and_then(Value::as_str)
+                        .is_some_and(|created| created >= baseline)
+                    && matches!(
+                        event.get("type").and_then(Value::as_str),
+                        Some("replenish" | "write_off" | "inventory")
+                    )
+            })
+        {
+            let delta = event
+                .get("quantityDelta")
+                .and_then(Value::as_f64)
+                .ok_or_else(|| anyhow::anyhow!("stock event has no quantity delta"))?;
+            if !delta.is_finite() {
+                anyhow::bail!("stock event has invalid quantity delta")
+            }
+            quantity += delta;
+        }
+        for custody in journal
+            .get("custody")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|entry| {
+                entry.get("itemGuid").and_then(Value::as_str) == Some(item)
+                    && entry
+                        .get("createdAt")
+                        .and_then(Value::as_str)
+                        .is_some_and(|created| created >= baseline)
+            })
+        {
+            let delta = custody
+                .get("quantityDelta")
+                .and_then(Value::as_f64)
+                .ok_or_else(|| anyhow::anyhow!("custody entry has no quantity delta"))?;
+            if !delta.is_finite() {
+                anyhow::bail!("custody entry has invalid quantity delta")
+            }
+            quantity -= delta;
+        }
+        if quantity < -1e-8 {
+            anyhow::bail!("signed operations produce negative stock for {item}")
+        }
+        expected.insert(item.to_owned(), quantity.max(0.0));
+    }
+    Ok(expected)
+}
+
+fn rebuild_quantitative_stock(conn: &Connection) -> anyhow::Result<()> {
+    let snapshot = export_journal(conn);
+    for (guid, quantity) in expected_stock_quantities(&snapshot)? {
+        conn.execute(
+            "UPDATE items SET quantity=?1 WHERE guid=?2 AND quantitative=1",
+            params![quantity, guid],
+        )?;
+    }
+    Ok(())
 }
 
 fn photo_commitment(photo: &Value) -> anyhow::Result<String> {
@@ -9444,6 +9581,53 @@ mod tests {
         movement["toLabel"] =
             json!(stock_operation_commitment(&movement, "move", Some("storage-b"), None).unwrap());
         assert!(verify_stock_operation_records(&json!({"history":[movement]})).is_err());
+
+        let stock = json!({
+            "history":[{
+                "type":"inventory","itemGuid":"material-1","quantityDelta":4.0,
+                "createdAt":"2026-09-01T12:01:00Z"
+            }],
+            "custody":[{
+                "itemGuid":"material-1","quantityDelta":3.0,
+                "createdAt":"2026-09-01T12:02:00Z"
+            }],
+            "itemStateVersions":[{
+                "itemGuid":"material-1","depth":0,"versionHash":"state-1",
+                "updatedAt":"2026-09-01T12:00:00Z",
+                "fields":{"quantitative":true,"quantity":10.0}
+            }],
+            "items":[{"guid":"material-1","quantity":11.0}]
+        });
+        assert_eq!(verify_stock_operation_records(&stock).unwrap(), (0, 0));
+        let mut forged_stock = stock;
+        forged_stock["items"][0]["quantity"] = json!(99.0);
+        assert!(verify_stock_operation_records(&forged_stock).is_err());
+    }
+
+    #[test]
+    fn quantitative_stock_is_rebuilt_from_master_and_custody_not_node_snapshot() {
+        let path = std::env::temp_dir().join(format!("stock-rebuild-{}.db", uuid::Uuid::new_v4()));
+        let conn = crate::db::open(&path).unwrap();
+        conn.execute("INSERT INTO workspaces(name,internal_id_prefix,created_at,guid) VALUES('Stock org','S-','2026-09-01T00:00:00Z','stock-ws')", []).unwrap();
+        let workspace = conn.last_insert_rowid();
+        conn.execute("INSERT INTO items(internal_id,title,workspace_id,quantitative,quantity,created_at,guid) VALUES('S-1','Cable',?1,1,99,'2026-09-01T00:00:00Z','stock-item')", [workspace]).unwrap();
+        let fields = json!({
+            "internalId":"S-1","title":"Cable","quantitative":true,"quantity":10.0
+        });
+        conn.execute("INSERT INTO item_state_versions(version_hash,item_guid,depth,workspace_guid,actor_guid,fields_json,payload_hash,ledger_hash,updated_at) VALUES('state-1','stock-item',0,'stock-ws','stock-owner',?1,'payload','ledger','2026-09-01T00:00:00Z')", [fields.to_string()]).unwrap();
+        conn.execute("INSERT INTO custody_entries(entry_hash,workspace_guid,item_guid,user_guid,quantity_delta,ledger_hash,created_at) VALUES('custody-1','stock-ws','stock-item','stock-owner',3,'custody-ledger','2026-09-01T00:01:00Z')", []).unwrap();
+
+        rebuild_quantitative_stock(&conn).unwrap();
+        let rebuilt: f64 = conn
+            .query_row(
+                "SELECT quantity FROM items WHERE guid='stock-item'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!((rebuilt - 7.0).abs() < 1e-9, "{rebuilt}");
+        drop(conn);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
