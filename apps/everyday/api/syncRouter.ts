@@ -62,11 +62,30 @@ export const syncRouter = createRouter({
     trusted: [] as Array<{ publicKey: string; label: string | null; approvedBy: number | null; source: string; createdAt: string }>,
     pending: [] as Array<{ publicKey: string; peerUrl: string | null; nodeName: string | null; firstSeen: string; lastSeen: string }>,
   })),
+  diagnostics: publicQuery.query(async () => ({
+    unresolved: 0,
+    events: [] as Array<{
+      id: number;
+      severity: "info" | "warning" | "error" | "critical";
+      component: string;
+      code: string;
+      message: string;
+      context: { peer?: string } | null;
+      firstAt: string;
+      lastAt: string;
+      count: number;
+      resolvedAt: string | null;
+    }>,
+  })),
+  clearDiagnostics: publicQuery.input(z.object({}).optional()).mutation(async () => ({ ok: true, removed: 0 })),
   exportBundle: publicQuery.query(async () => ({
     format: "everyday-sync-bundle" as const,
-    version: 1 as const,
+    version: 2 as const,
     createdAt: "",
-    journal: {} as Record<string, unknown>,
+    cipher: "XChaCha20-Poly1305" as const,
+    kdf: "HKDF-SHA256" as const,
+    nonce: "",
+    ciphertext: "",
   })),
   importBundle: publicQuery
     .input(z.object({ bundle: z.unknown() }))

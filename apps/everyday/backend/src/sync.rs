@@ -1473,6 +1473,7 @@ pub fn apply_remote_journal(conn: &Connection, journal: &Value, peer_url: &str) 
                 peer_url.trim().trim_end_matches('/')
             ],
         );
+        resolve_peer_error(conn, peer_url);
     }
     result
 }
@@ -1824,6 +1825,23 @@ pub fn touch_peer_error(conn: &Connection, url: &str, err: &str) {
     let _ = conn.execute(
         "UPDATE peers SET last_error=?1 WHERE url=?2",
         params![err, url.trim().trim_end_matches('/')],
+    );
+    crate::diagnostics::record(
+        conn,
+        "warning",
+        "sync",
+        "peer_error",
+        err,
+        Some(&json!({"peer":url.trim().trim_end_matches('/')})),
+    );
+}
+
+pub fn resolve_peer_error(conn: &Connection, url: &str) {
+    crate::diagnostics::resolve(
+        conn,
+        "sync",
+        "peer_error",
+        Some(&json!({"peer":url.trim().trim_end_matches('/')})),
     );
 }
 

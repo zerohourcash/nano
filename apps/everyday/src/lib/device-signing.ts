@@ -90,6 +90,7 @@ const CRITICAL = [
   'bit.mint',
   'knowledge.save',
   'sync.importBundle',
+  'sync.clearDiagnostics',
 ]
 
 export function requiresDeviceSignature(url: string): boolean {

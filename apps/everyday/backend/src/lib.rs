@@ -4,6 +4,7 @@ mod auth;
 mod content;
 mod db;
 mod device;
+mod diagnostics;
 mod discovery;
 mod json;
 mod knowledge;
@@ -763,6 +764,7 @@ async fn sync_once(client: &reqwest::Client, state: &Arc<AppState>, upstream: &s
                     "UPDATE peers SET last_sync=?1, last_error=NULL WHERE url=?2",
                     rusqlite::params![chrono::Utc::now().to_rfc3339(), upstream],
                 );
+                sync::resolve_peer_error(&db, upstream);
             }
         }
         Ok(resp) => {

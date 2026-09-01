@@ -72,6 +72,10 @@
 - Android Share receiver принимает только `content://`, потоково применяет лимит
   30 МБ и передаёт ciphertext в авторизованный frontend. Он не обладает API для
   прямой мутации SQLite; импорт сохраняет ACL и обязательный device proof.
+- Operational diagnostics хранится только локально, ограничена 500 событиями,
+  удаляет control characters и обрезает message/context до 500/2000 символов.
+  Повторы дедуплицируются. В контекст peer попадает URL без bearer-токена;
+  очистка истории доступна владельцу и требует Ed25519 device proof.
 
 ## Production checklist
 

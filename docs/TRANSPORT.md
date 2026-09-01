@@ -64,6 +64,11 @@ Unix-время, случайный nonce и HMAC-SHA256 общего transport 
 broadcast `255.255.255.255:8767`; desktop-узлы включают его явно. Это работает
 без Internet через одну Wi-Fi LAN или hotspot и не является BLE Mesh transport.
 
+Ошибки доставки записываются в локальный bounded diagnostics store без transport
+token. Повтор одной причины/peer увеличивает счётчик, успешный полный обмен ставит
+`resolvedAt`. Это позволяет отличить ожидаемый временный partition от постоянной
+ошибки конфигурации, не превращая журнал диагностики в неограниченный spam sink.
+
 ## Файл и системный Share
 
 `everyday-sync-bundle` версии 2 шифрует полный подписанный journal:

@@ -77,6 +77,17 @@ def main() -> int:
             wait_for(lambda: bool((peer(b, dead_c_url) or {}).get("lastError")), timeout=15),
             str(peer(b, dead_c_url)),
         )
+        diagnostics = b.call("sync.diagnostics", None, mutation=False)
+        check(
+            "ошибка доставки попала в bounded-панель диагностики",
+            any(
+                event.get("code") == "peer_error"
+                and event.get("context", {}).get("peer") == dead_c_url
+                and not event.get("resolvedAt")
+                for event in diagnostics.get("events", [])
+            ),
+            str(diagnostics)[:300],
+        )
 
         c = Node("mesh-c", c_port, {**common, "MESHKEEPER_ADVERTISE_URL": dead_c_url})
         check("C появился после разрыва", c.wait_ready())
@@ -89,6 +100,16 @@ def main() -> int:
             "ошибка C очищена после успешного обмена",
             wait_for(lambda: not (peer(b, dead_c_url) or {}).get("lastError")),
             str(peer(b, dead_c_url)),
+        )
+        check(
+            "восстановление связи автоматически закрыло диагностику",
+            wait_for(
+                lambda: any(
+                    event.get("context", {}).get("peer") == dead_c_url
+                    and bool(event.get("resolvedAt"))
+                    for event in b.call("sync.diagnostics", None, mutation=False).get("events", [])
+                )
+            ),
         )
         login_c = c.call("auth.login", {"phone": OWNER_PHONE, "password": OWNER_PASSWORD})
         check("владелец входит на C офлайн", isinstance(login_c, dict) and "id" in login_c)

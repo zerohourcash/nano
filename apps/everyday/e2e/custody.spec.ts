@@ -164,4 +164,13 @@ test('browser signs a real custody transaction and ledger retains its proof', as
   })
   const forgedImportPayload = await (await forgedImportResponse).json()
   expect(forgedImportPayload[0]?.error?.json?.message).toMatch(/повреждён|mesh-токен/)
+  const diagnostics = await trpc<{
+    unresolved: number
+    events: Array<{ component: string; code: string; count: number; resolvedAt: string | null }>
+  }>(page, 'sync.diagnostics', null, false)
+  expect(diagnostics.unresolved).toBeGreaterThan(0)
+  expect(diagnostics.events).toEqual(expect.arrayContaining([
+    expect.objectContaining({ component: 'transport', code: 'bundle_rejected', resolvedAt: null }),
+  ]))
+  await expect(page.getByTestId('node-diagnostics')).toContainText('bundle_rejected', { timeout: 10_000 })
 })

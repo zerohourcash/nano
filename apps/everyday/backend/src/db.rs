@@ -290,6 +290,15 @@ fn migrate(conn: &Connection) -> Result<()> {
           last_sync TEXT,
           last_error TEXT
         );
+        CREATE TABLE IF NOT EXISTS diagnostic_events (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          severity TEXT NOT NULL CHECK(severity IN ('info','warning','error','critical')),
+          component TEXT NOT NULL, code TEXT NOT NULL, message TEXT NOT NULL,
+          context_json TEXT, first_at TEXT NOT NULL, last_at TEXT NOT NULL,
+          count INTEGER NOT NULL DEFAULT 1, resolved_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS diagnostic_events_open_idx
+          ON diagnostic_events(resolved_at,last_at DESC);
         CREATE TABLE IF NOT EXISTS item_holdings (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           item_id INTEGER NOT NULL,

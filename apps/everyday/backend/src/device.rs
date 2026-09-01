@@ -41,6 +41,7 @@ pub fn requires_signature(procedure: &str) -> bool {
             | "bit.mint"
             | "knowledge.save"
             | "sync.importBundle"
+            | "sync.clearDiagnostics"
     )
 }
 

@@ -93,6 +93,7 @@ pub fn is_mutation(procedure: &str) -> bool {
             | "sync.peers"
             | "sync.conflicts"
             | "sync.nodeKeys"
+            | "sync.diagnostics"
             | "sync.exportBundle"
             | "bit.balance"
             | "bit.transactions"
@@ -839,10 +840,23 @@ fn dispatch_inner(
         "sync.audit" => Ok(crate::sync::integrity_audit(conn)),
         "sync.peers" => Ok(crate::sync::list_peers(conn)),
         "sync.nodeKeys" => Ok(crate::sync::node_keys(conn)),
+        "sync.diagnostics" => Ok(crate::diagnostics::list(conn)),
+        "sync.clearDiagnostics" => Ok(crate::diagnostics::clear_resolved(conn)),
         "sync.exportBundle" => {
             let token = crate::sync_token();
             let result = crate::sync::export_transport_bundle(conn, token.as_deref());
             if result.get("ok").and_then(Value::as_bool) == Some(false) {
+                crate::diagnostics::record(
+                    conn,
+                    "error",
+                    "transport",
+                    "bundle_export_failed",
+                    result
+                        .get("error")
+                        .and_then(Value::as_str)
+                        .unwrap_or("Transport bundle отклонён"),
+                    None,
+                );
                 return Err(ApiError::bad(
                     result
                         .get("error")
@@ -850,6 +864,7 @@ fn dispatch_inner(
                         .unwrap_or("Не удалось зашифровать transport bundle"),
                 ));
             }
+            crate::diagnostics::resolve(conn, "transport", "bundle_export_failed", None);
             Ok(result)
         }
         "sync.importBundle" => {
@@ -859,6 +874,17 @@ fn dispatch_inner(
             let token = crate::sync_token();
             let result = crate::sync::import_transport_bundle(conn, bundle, token.as_deref());
             if result.get("ok").and_then(Value::as_bool) == Some(false) {
+                crate::diagnostics::record(
+                    conn,
+                    "error",
+                    "transport",
+                    "bundle_rejected",
+                    result
+                        .get("error")
+                        .and_then(Value::as_str)
+                        .unwrap_or("Transport bundle отклонён"),
+                    None,
+                );
                 return Err(ApiError::bad(
                     result
                         .get("error")
@@ -866,6 +892,7 @@ fn dispatch_inner(
                         .unwrap_or("Transport bundle отклонён"),
                 ));
             }
+            crate::diagnostics::resolve(conn, "transport", "bundle_rejected", None);
             Ok(result)
         }
         "sync.approveNodeKey" => {

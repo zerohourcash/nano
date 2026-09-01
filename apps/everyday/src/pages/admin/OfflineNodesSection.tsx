@@ -18,6 +18,7 @@ export default function OfflineNodesSection() {
   const auditQ = trpc.sync.audit.useQuery(undefined, { refetchInterval: 30000 })
   const conflictsQ = trpc.sync.conflicts.useQuery(undefined, { refetchInterval: 8000 })
   const keysQ = trpc.sync.nodeKeys.useQuery(undefined, { refetchInterval: 8000 })
+  const diagnosticsQ = trpc.sync.diagnostics.useQuery(undefined, { refetchInterval: 8000 })
   const bundleQ = trpc.sync.exportBundle.useQuery(undefined, { enabled: false })
   const [peerUrl, setPeerUrl] = useState('')
   const [password, setPassword] = useState('')
@@ -57,6 +58,10 @@ export default function OfflineNodesSection() {
   })
   const revokeKey = trpc.sync.revokeNodeKey.useMutation({
     onSuccess: () => { utils.sync.nodeKeys.invalidate(); toast('Доверие к ключу отозвано') },
+    onError: (e) => toast(e.message, 'error'),
+  })
+  const clearDiagnostics = trpc.sync.clearDiagnostics.useMutation({
+    onSuccess: () => { diagnosticsQ.refetch(); toast('Закрытые записи диагностики удалены') },
     onError: (e) => toast(e.message, 'error'),
   })
   const importBundle = trpc.sync.importBundle.useMutation({
@@ -103,6 +108,7 @@ export default function OfflineNodesSection() {
   const isNode = st?.role === 'node' || st?.role === 'mesh'
   const peers = st?.peers ?? []
   const conflicts = (conflictsQ.data ?? []).filter((c) => c.status === 'open')
+  const diagnostics = diagnosticsQ.data?.events ?? []
 
   const onImportFile = async (file: File) => {
     if (password.length < 12) {
@@ -216,6 +222,44 @@ export default function OfflineNodesSection() {
             )}
           </div>
         )}
+      </section>
+
+      <section className={cardCls + ' p-5 space-y-3'} data-testid="node-diagnostics">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div className="flex items-center gap-2">
+            <ShieldAlert size={18} className={diagnosticsQ.data?.unresolved ? 'text-danger' : 'text-teal-dark'} />
+            <h3 className="text-[17px] font-semibold text-ink-900">Диагностика ноды</h3>
+          </div>
+          <button
+            className={btnSecondaryCls}
+            disabled={clearDiagnostics.isPending}
+            onClick={() => clearDiagnostics.mutate({})}
+          >
+            <Trash2 size={15} /> Очистить закрытые
+          </button>
+        </div>
+        <p className="text-sm text-ink-500">
+          Активных проблем: <b>{diagnosticsQ.data?.unresolved ?? 0}</b>. Повторяющиеся ошибки объединяются и не раздувают базу.
+        </p>
+        {diagnostics.length === 0 && (
+          <p className="rounded-xl bg-teal/10 p-3 text-sm text-teal-dark">Ошибок ноды пока не зафиксировано.</p>
+        )}
+        <div className="max-h-80 space-y-2 overflow-auto">
+          {diagnostics.map((event) => (
+            <div key={event.id} className={cn(
+              'rounded-xl border p-3 text-sm',
+              event.resolvedAt ? 'border-brand-100 opacity-60' : event.severity === 'critical' || event.severity === 'error' ? 'border-danger/40 bg-danger/5' : 'border-[#E8D48A] bg-[#FFFDF2]',
+            )}>
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <b>{event.component} · {event.code}</b>
+                <span className="font-mono-num text-[11px] text-ink-300">{fmtMoment(event.lastAt)} · ×{event.count}</span>
+              </div>
+              <p className="mt-1 break-words text-ink-700">{event.message}</p>
+              {event.context?.peer && <p className="mt-1 break-all font-mono-num text-[11px] text-ink-500">Peer: {event.context.peer}</p>}
+              {event.resolvedAt && <p className="mt-1 text-[11px] text-teal-dark">Закрыто {fmtMoment(event.resolvedAt)}</p>}
+            </div>
+          ))}
+        </div>
       </section>
 
       <section className={cardCls + ' p-5 space-y-3'}>
