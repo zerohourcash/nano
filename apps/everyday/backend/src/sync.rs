@@ -2068,16 +2068,85 @@ pub fn apply_remote_journal(conn: &Connection, journal: &Value, peer_url: &str) 
     result
 }
 
+struct MembershipLedgerEvidence {
+    operation: String,
+    actor_guid: String,
+    has_device_proof: bool,
+}
+
+fn membership_ledger_evidence(
+    conn: &Connection,
+    incoming: &HashMap<&str, &Value>,
+    hash: &str,
+) -> anyhow::Result<MembershipLedgerEvidence> {
+    if let Some(event) = incoming.get(hash) {
+        let present = |field: &str| {
+            event
+                .get(field)
+                .and_then(Value::as_str)
+                .is_some_and(|value| !value.is_empty())
+        };
+        return Ok(MembershipLedgerEvidence {
+            operation: event
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
+            actor_guid: event
+                .get("actorGuid")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
+            has_device_proof: [
+                "requestDeviceId",
+                "requestPublicKey",
+                "requestNonce",
+                "requestSignature",
+                "requestHash",
+                "requestTimestamp",
+                "requestPath",
+            ]
+            .into_iter()
+            .all(present),
+        });
+    }
+    conn.query_row(
+        "SELECT h.type,u.guid,
+                h.request_device_id IS NOT NULL AND h.request_device_id!='' AND
+                h.request_public_key IS NOT NULL AND h.request_public_key!='' AND
+                h.request_nonce IS NOT NULL AND h.request_nonce!='' AND
+                h.request_signature IS NOT NULL AND h.request_signature!='' AND
+                h.request_hash IS NOT NULL AND h.request_hash!='' AND
+                h.request_timestamp IS NOT NULL AND h.request_timestamp!='' AND
+                h.request_path IS NOT NULL AND h.request_path!=''
+         FROM history_entries h JOIN users u ON u.id=h.actor_user_id WHERE h.hash=?1",
+        [hash],
+        |row| {
+            Ok(MembershipLedgerEvidence {
+                operation: row.get(0)?,
+                actor_guid: row.get(1)?,
+                has_device_proof: row.get::<_, i64>(2)? != 0,
+            })
+        },
+    )
+    .map_err(Into::into)
+}
+
 fn verify_membership_records(conn: &Connection, journal: &Value) -> anyhow::Result<()> {
     if journal.get("membershipMode").and_then(Value::as_str) != Some("versioned-tombstones/v1") {
         anyhow::bail!("journal does not provide membership tombstones");
     }
-    let incoming_history: HashSet<&str> = journal
+    let incoming_history: HashMap<&str, &Value> = journal
         .get("history")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .filter_map(|event| event.get("opId").and_then(Value::as_str))
+        .filter_map(|event| {
+            event
+                .get("opId")
+                .and_then(Value::as_str)
+                .map(|hash| (hash, event))
+        })
         .collect();
     let mut membership_keys = HashSet::new();
     for record in journal
@@ -2117,16 +2186,32 @@ fn verify_membership_records(conn: &Connection, journal: &Value) -> anyhow::Resu
             anyhow::bail!("non-legacy membership has no ledger event");
         }
         if let Some(hash) = ledger_hash {
-            let known = incoming_history.contains(hash)
-                || conn
-                    .query_row(
-                        "SELECT 1 FROM history_entries WHERE hash=?1",
-                        [hash],
-                        |_| Ok(()),
+            let evidence = membership_ledger_evidence(conn, &incoming_history, hash)
+                .map_err(|_| anyhow::anyhow!("membership ledger event is unavailable"))?;
+            let expected = if active {
+                if revision == 1 {
+                    matches!(
+                        evidence.operation.as_str(),
+                        "membership_create" | "membership_join" | "workspace_create"
                     )
-                    .is_ok();
-            if !known {
-                anyhow::bail!("membership ledger event is unavailable");
+                } else {
+                    matches!(
+                        evidence.operation.as_str(),
+                        "membership_update" | "membership_join"
+                    )
+                }
+            } else {
+                evidence.operation == "membership_remove"
+            };
+            if !expected {
+                anyhow::bail!("membership references incompatible ledger operation");
+            }
+            if evidence.operation == "membership_join" {
+                if evidence.actor_guid != user {
+                    anyhow::bail!("membership join actor does not match user");
+                }
+            } else if !evidence.has_device_proof {
+                anyhow::bail!("administrative membership event has no device proof");
             }
         }
     }
@@ -3098,6 +3183,76 @@ mod tests {
                     .get::<_, i64>(0))
                 .unwrap(),
             0
+        );
+        drop((source, target));
+        for path in [source_path, target_path] {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    #[test]
+    fn node_signed_admin_membership_event_without_device_proof_is_rejected() {
+        let source_path = std::env::temp_dir().join(format!(
+            "membership-proof-source-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let target_path = std::env::temp_dir().join(format!(
+            "membership-proof-target-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let source = crate::db::open(&source_path).unwrap();
+        let target = crate::db::open(&target_path).unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        source.execute("INSERT INTO workspaces(name,internal_id_prefix,created_at,guid) VALUES('Org','O-',?1,'proof-workspace')",[&now]).unwrap();
+        let workspace = source.last_insert_rowid();
+        source.execute("INSERT INTO users(full_name,phone,status,created_at,guid) VALUES('Owner','+70000000777','active',?1,'proof-owner')",[&now]).unwrap();
+        let owner = source.last_insert_rowid();
+        source
+            .execute(
+                "INSERT INTO user_workspaces(user_id,workspace_id,rights_json) VALUES(?1,?2,?3)",
+                params![owner, workspace, crate::db::owner_rights().to_string()],
+            )
+            .unwrap();
+        record_membership_version(&source, workspace, owner, true, None, true).unwrap();
+        let event = ledger::append(
+            &source,
+            workspace,
+            owner,
+            None,
+            "membership_update",
+            Some("proof-owner"),
+            Some("proof-owner"),
+            None,
+            Some("forged without user device"),
+        )
+        .unwrap();
+        record_membership_version(
+            &source,
+            workspace,
+            owner,
+            true,
+            event["opId"].as_str(),
+            false,
+        )
+        .unwrap();
+        let journal = export_journal(&source);
+        let remote_key = journal["journalPublicKey"].as_str().unwrap();
+        let rejected = apply_remote_journal(&target, &journal, "");
+        assert_eq!(rejected["ok"], false);
+        assert!(rejected["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("no device proof"));
+        assert_eq!(
+            target
+                .query_row(
+                    "SELECT COUNT(*) FROM trusted_node_keys WHERE public_key=?1",
+                    [remote_key],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0,
+            "invalid journal must not bootstrap the remote key"
         );
         drop((source, target));
         for path in [source_path, target_path] {
