@@ -147,6 +147,11 @@ fn migrate(conn: &Connection) -> Result<()> {
         "ALTER TABLE transfers ADD COLUMN bit_transaction_guid TEXT",
         [],
     );
+    let _ = conn.execute("ALTER TABLE transfers ADD COLUMN guid TEXT", []);
+    let _ = conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS transfers_guid_idx ON transfers(guid) WHERE guid IS NOT NULL",
+        [],
+    );
     let _ = conn.execute("ALTER TABLE history_entries ADD COLUMN photo_url TEXT", []);
     // ТЗ §5: у вложения есть уменьшенная копия и контрольная сумма.
     let _ = conn.execute("ALTER TABLE item_photos ADD COLUMN thumb_url TEXT", []);
@@ -897,6 +902,7 @@ fn init_schema(conn: &Connection) -> Result<()> {
           no_confirmation INTEGER NOT NULL DEFAULT 0,
           bit_amount INTEGER CHECK(bit_amount IS NULL OR bit_amount > 0),
           bit_transaction_guid TEXT,
+          guid TEXT,
           created_at TEXT NOT NULL,
           completed_at TEXT
         );

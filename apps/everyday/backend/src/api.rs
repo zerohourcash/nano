@@ -3125,9 +3125,9 @@ fn transfers_prepare_atomic(conn: &Connection, input: &Value, user_id: Option<i6
     };
     let code = next_transfer_code(conn, ws);
     conn.execute(
-        "INSERT INTO transfers (code, item_id, from_user_id, to_user_id, to_storage_id, building_site_id, workspace_id, quantity, status, comment, no_confirmation,source_custody,bit_amount,created_at)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
-        params![code, item_id, uid, to, i64v(input,"toStorageId"), i64v(input,"buildingSiteId"), ws, quantity, status, s(input,"comment"), b(input,"noConfirmation").unwrap_or(false) as i64,source_custody as i64,bit_amount,now()],
+        "INSERT INTO transfers (code, item_id, from_user_id, to_user_id, to_storage_id, building_site_id, workspace_id, quantity, status, comment, no_confirmation,source_custody,bit_amount,guid,created_at)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
+        params![code, item_id, uid, to, i64v(input,"toStorageId"), i64v(input,"buildingSiteId"), ws, quantity, status, s(input,"comment"), b(input,"noConfirmation").unwrap_or(false) as i64,source_custody as i64,bit_amount,s(input,"offerGuid"),now()],
     )?;
     let tid = conn.last_insert_rowid();
     let from_guid = ledger::guid(conn, "users", uid)
@@ -4668,6 +4668,22 @@ fn bit_offer(conn: &mut Connection, input: &Value, user_id: Option<i64>) -> ApiR
         .as_i64()
         .ok_or_else(|| ApiError::bad("У ТМЦ нет организации"))?;
     require_can_in_workspace(conn, uid, ws, "transferItems")?;
+    let offer_guid = s(input, "offerGuid").ok_or_else(|| ApiError::bad("offerGuid"))?;
+    let workspace_guid = s(input, "workspaceGuid").ok_or_else(|| ApiError::bad("workspaceGuid"))?;
+    let item_guid = s(input, "itemGuid").ok_or_else(|| ApiError::bad("itemGuid"))?;
+    let buyer_guid = s(input, "buyerGuid").ok_or_else(|| ApiError::bad("buyerGuid"))?;
+    if Uuid::parse_str(&offer_guid).is_err()
+        || item["guid"].as_str() != Some(item_guid.as_str())
+        || ledger::guid(conn, "workspaces", ws).ok().as_deref() != Some(workspace_guid.as_str())
+        || i64v(input, "toUserId")
+            .and_then(|id| ledger::guid(conn, "users", id).ok())
+            .as_deref()
+            != Some(buyer_guid.as_str())
+    {
+        return Err(ApiError::bad(
+            "GUID предложения, организации, ТМЦ или покупателя не совпадает с локальным реестром",
+        ));
+    }
     transfers_prepare(conn, input, user_id)
 }
 
@@ -9194,10 +9210,16 @@ mod tests {
             50
         );
         let offered_item = insert_item(&conn, ws, Some(users[0]), false, None);
+        db::fill_guids(&conn).unwrap();
+        let ws_guid = ledger::guid(&conn, "workspaces", ws).unwrap();
+        let buyer_guid = ledger::guid(&conn, "users", users[1]).unwrap();
+        let offered_item_guid = ledger::guid(&conn, "items", offered_item).unwrap();
         let offer = dispatch(
             &mut conn,
             "bit.offer",
-            &json!({"itemId":offered_item,"toUserId":users[1],"bitAmount":15,"comment":"Двухфазная продажа"}),
+            &json!({"itemId":offered_item,"toUserId":users[1],"bitAmount":15,"comment":"Двухфазная продажа",
+                "offerGuid":Uuid::new_v4().to_string(),"workspaceGuid":ws_guid,
+                "itemGuid":offered_item_guid,"buyerGuid":buyer_guid}),
             Some(users[0]),
         )
         .unwrap();
@@ -9253,10 +9275,13 @@ mod tests {
             "повтор принятия не должен создавать вторую оплату"
         );
         let expensive_item = insert_item(&conn, ws, Some(users[0]), false, None);
+        let expensive_item_guid = ledger::guid(&conn, "items", expensive_item).unwrap();
         let expensive_offer = dispatch(
             &mut conn,
             "bit.offer",
-            &json!({"itemId":expensive_item,"toUserId":users[1],"bitAmount":1000}),
+            &json!({"itemId":expensive_item,"toUserId":users[1],"bitAmount":1000,
+                "offerGuid":Uuid::new_v4().to_string(),"workspaceGuid":ws_guid,
+                "itemGuid":expensive_item_guid,"buyerGuid":buyer_guid}),
             Some(users[0]),
         )
         .unwrap();
@@ -9293,10 +9318,13 @@ mod tests {
             "недостаток Bit не должен оставлять оплату или завершать предложение"
         );
         let stale_item = insert_item(&conn, ws, Some(users[0]), false, None);
+        let stale_item_guid = ledger::guid(&conn, "items", stale_item).unwrap();
         let stale_offer = dispatch(
             &mut conn,
             "bit.offer",
-            &json!({"itemId":stale_item,"toUserId":users[1],"bitAmount":1}),
+            &json!({"itemId":stale_item,"toUserId":users[1],"bitAmount":1,
+                "offerGuid":Uuid::new_v4().to_string(),"workspaceGuid":ws_guid,
+                "itemGuid":stale_item_guid,"buyerGuid":buyer_guid}),
             Some(users[0]),
         )
         .unwrap();

@@ -521,6 +521,38 @@ fn guid_of(conn: &Connection, table: &str, id: i64) -> String {
         })
 }
 
+fn sale_offer_payload(record: &Value) -> anyhow::Result<Value> {
+    let required = |field: &str| {
+        record
+            .get(field)
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("sale offer has no {field}"))
+    };
+    let amount = record
+        .get("bitAmount")
+        .and_then(Value::as_i64)
+        .filter(|amount| *amount > 0)
+        .ok_or_else(|| anyhow::anyhow!("sale offer amount is invalid"))?;
+    Ok(json!({
+        "domain":"everyday/bit-sale-offer/v1",
+        "offerGuid":required("offerGuid")?, "workspaceGuid":required("workspaceGuid")?,
+        "itemGuid":required("itemGuid")?, "sellerGuid":required("sellerGuid")?,
+        "buyerGuid":required("buyerGuid")?, "bitAmount":amount,
+        "comment":record.get("comment").cloned().unwrap_or(Value::Null),
+        "createdAt":required("createdAt")?, "ledgerHash":required("ledgerHash")?,
+        "status":record.get("status").cloned().unwrap_or_else(||json!("pending")),
+        "decisionLedgerHash":record.get("decisionLedgerHash").cloned().unwrap_or(Value::Null),
+        "bitTransactionGuid":record.get("bitTransactionGuid").cloned().unwrap_or(Value::Null),
+    }))
+}
+
+fn sale_offer_hash(record: &Value) -> anyhow::Result<String> {
+    Ok(hex::encode(Sha256::digest(serde_json::to_vec(
+        &sale_offer_payload(record)?,
+    )?)))
+}
+
 pub fn hello(conn: &Connection) -> Value {
     let (id, name) = ensure_node(conn);
     json!({
@@ -661,6 +693,33 @@ pub fn export_journal_since(conn: &Connection, recipient_frontier: Option<&Value
     if let Ok(mut statement)=conn.prepare("SELECT record_hash,session_guid,workspace_guid,actor_guid,kind,item_guid,fields_json,payload_hash,ledger_hash,created_at FROM inventory_records ORDER BY created_at,record_hash") {
         if let Ok(rows)=statement.query_map([],|r|{let fields:String=r.get(6)?;Ok(json!({"recordHash":r.get::<_,String>(0)?,"sessionGuid":r.get::<_,String>(1)?,"workspaceGuid":r.get::<_,String>(2)?,"actorGuid":r.get::<_,String>(3)?,"kind":r.get::<_,String>(4)?,"itemGuid":r.get::<_,Option<String>>(5)?,"fields":serde_json::from_str::<Value>(&fields).unwrap_or(Value::Null),"payloadHash":r.get::<_,String>(7)?,"ledgerHash":r.get::<_,String>(8)?,"createdAt":r.get::<_,String>(9)?}))}) { inventory_records.extend(rows.flatten()); }
     }
+    let mut sale_offers = Vec::new();
+    if let Ok(mut statement) = conn.prepare(
+        "SELECT guid,workspace_id,item_id,from_user_id,to_user_id,bit_amount,comment,created_at,prepare_ledger_hash,status,accept_ledger_hash,bit_transaction_guid
+         FROM transfers WHERE guid IS NOT NULL AND bit_amount IS NOT NULL AND status IN ('pending','accepted','rejected')
+         ORDER BY created_at,guid",
+    ) {
+        if let Ok(rows) = statement.query_map([], |row| {
+            let mut record = json!({
+                "offerGuid":row.get::<_,String>(0)?,
+                "workspaceGuid":guid_of(conn,"workspaces",row.get(1)?),
+                "itemGuid":guid_of(conn,"items",row.get(2)?),
+                "sellerGuid":guid_of(conn,"users",row.get(3)?),
+                "buyerGuid":guid_of(conn,"users",row.get(4)?),
+                "bitAmount":row.get::<_,i64>(5)?, "comment":row.get::<_,Option<String>>(6)?,
+                "createdAt":row.get::<_,String>(7)?, "ledgerHash":row.get::<_,String>(8)?,
+                "status":row.get::<_,String>(9)?,
+                "decisionLedgerHash":row.get::<_,Option<String>>(10)?,
+                "bitTransactionGuid":row.get::<_,Option<String>>(11)?,
+            });
+            record["recordHash"] = json!(sale_offer_hash(&record).unwrap_or_default());
+            Ok(record)
+        }) {
+            sale_offers.extend(rows.flatten().filter(|record| {
+                record.get("recordHash").and_then(Value::as_str).is_some_and(|hash| !hash.is_empty())
+            }));
+        }
+    }
     let mut users = Vec::new();
     if let Ok(mut stmt) = conn.prepare("SELECT id, full_name, position, phone, status, role_rights, checkout_policy, guid, password_hash FROM users") {
         for row in stmt.query_map([], |r| {
@@ -781,7 +840,33 @@ pub fn export_journal_since(conn: &Connection, recipient_frontier: Option<&Value
         }
     }
     if let Some(recipient_frontier) = recipient_frontier {
+        let required_offer_events: HashSet<&str> = sale_offers
+            .iter()
+            .flat_map(|offer| [offer.get("ledgerHash"), offer.get("decisionLedgerHash")])
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect();
+        let retained_offer_events: Vec<Value> = history
+            .iter()
+            .filter(|event| {
+                event
+                    .get("opId")
+                    .and_then(Value::as_str)
+                    .is_some_and(|hash| required_offer_events.contains(hash))
+            })
+            .cloned()
+            .collect();
         retain_after_frontier(&mut history, recipient_frontier);
+        let included: HashSet<String> = history
+            .iter()
+            .filter_map(|event| event.get("opId").and_then(Value::as_str).map(str::to_owned))
+            .collect();
+        history.extend(retained_offer_events.into_iter().filter(|event| {
+            event
+                .get("opId")
+                .and_then(Value::as_str)
+                .is_some_and(|hash| !included.contains(hash))
+        }));
     }
     let mut invites = Vec::new();
     // Реплицируем возможность локального onboarding, но не сам bearer secret.
@@ -1125,6 +1210,8 @@ pub fn export_journal_since(conn: &Connection, recipient_frontier: Option<&Value
         );
         object.insert("inventoryMode".into(), json!("append-only-records/v1"));
         object.insert("inventoryRecords".into(), Value::Array(inventory_records));
+        object.insert("saleOfferMode".into(), json!("device-signed-intent/v1"));
+        object.insert("saleOffers".into(), Value::Array(sale_offers));
         object.insert("organizationNodeMode".into(), json!("portable-branches/v1"));
         object.insert(
             "organizationNodeVersions".into(),
@@ -1194,6 +1281,7 @@ fn filter_journal_scope(journal: &mut Value, allowed: &HashSet<String>) {
         "configVersions",
         "itemStateVersions",
         "inventoryRecords",
+        "saleOffers",
         "messages",
         "frontier",
     ] {
@@ -2749,6 +2837,86 @@ pub fn import_journal(conn: &Connection, journal: &Value) -> Value {
     if let Err(error) = rebuild_item_state(conn) {
         return json!({"ok":false,"error":format!("Не удалось восстановить master-состояние ТМЦ: {error}")});
     }
+    if let Some(offers) = journal.get("saleOffers").and_then(Value::as_array) {
+        for offer in offers {
+            let Some(workspace) = offer
+                .get("workspaceGuid")
+                .and_then(Value::as_str)
+                .and_then(|guid| id_by_guid(conn, "workspaces", guid))
+            else {
+                skipped += 1;
+                continue;
+            };
+            let Some(item) = offer
+                .get("itemGuid")
+                .and_then(Value::as_str)
+                .and_then(|guid| id_by_guid(conn, "items", guid))
+            else {
+                skipped += 1;
+                continue;
+            };
+            let Some(seller) = offer
+                .get("sellerGuid")
+                .and_then(Value::as_str)
+                .and_then(|guid| id_by_guid(conn, "users", guid))
+            else {
+                skipped += 1;
+                continue;
+            };
+            let Some(buyer) = offer
+                .get("buyerGuid")
+                .and_then(Value::as_str)
+                .and_then(|guid| id_by_guid(conn, "users", guid))
+            else {
+                skipped += 1;
+                continue;
+            };
+            let guid = offer.get("offerGuid").and_then(Value::as_str).unwrap_or("");
+            let amount = offer.get("bitAmount").and_then(Value::as_i64).unwrap_or(0);
+            let immutable: Option<(i64,i64,i64,i64,i64)> = conn.query_row(
+                "SELECT workspace_id,item_id,from_user_id,to_user_id,bit_amount FROM transfers WHERE guid=?1",
+                [guid], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)),
+            ).optional().ok().flatten();
+            if immutable
+                .is_some_and(|existing| existing != (workspace, item, seller, buyer, amount))
+            {
+                return json!({"ok":false,"error":"GUID предложения Bit уже связан с другими неизменяемыми полями"});
+            }
+            let code = format!("SALE-{}", guid.chars().take(8).collect::<String>());
+            let inserted = conn.execute(
+                "INSERT OR IGNORE INTO transfers(code,item_id,from_user_id,to_user_id,workspace_id,status,comment,no_confirmation,source_custody,bit_amount,guid,prepare_ledger_hash,created_at)
+                 VALUES(?1,?2,?3,?4,?5,'pending',?6,0,1,?7,?8,?9,?10)",
+                params![code,item,seller,buyer,workspace,offer.get("comment").and_then(Value::as_str),
+                    amount,guid,
+                    offer.get("ledgerHash").and_then(Value::as_str),offer.get("createdAt").and_then(Value::as_str)],
+            ).unwrap_or(0);
+            if inserted > 0 {
+                ops += 1
+            } else {
+                skipped += 1
+            }
+            let status = offer
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("pending");
+            if status == "accepted" {
+                conn.execute(
+                    "UPDATE transfers SET status='accepted',completed_at=COALESCE(completed_at,?1),accept_ledger_hash=?2,bit_transaction_guid=?3 WHERE guid=?4 AND status!='accepted'",
+                    params![chrono::Utc::now().to_rfc3339(),offer.get("decisionLedgerHash").and_then(Value::as_str),offer.get("bitTransactionGuid").and_then(Value::as_str),guid],
+                ).unwrap_or(0);
+                conn.execute(
+                    "UPDATE items SET responsible_user_id=?1 WHERE id=?2",
+                    params![buyer, item],
+                )
+                .unwrap_or(0);
+            } else if status == "rejected" {
+                conn.execute(
+                    "UPDATE transfers SET status='rejected',completed_at=COALESCE(completed_at,?1),accept_ledger_hash=?2 WHERE guid=?3 AND status='pending'",
+                    params![chrono::Utc::now().to_rfc3339(),offer.get("decisionLedgerHash").and_then(Value::as_str),guid],
+                ).unwrap_or(0);
+            }
+        }
+    }
     if let Some(entries) = journal.get("custody").and_then(Value::as_array) {
         for entry in entries {
             let inserted = conn
@@ -3320,6 +3488,9 @@ pub fn apply_remote_journal(conn: &Connection, journal: &Value, peer_url: &str) 
     if let Err(error) = verify_chat_records(conn, journal) {
         return json!({"ok":false,"error":format!("Проверка intent чата: {error}")});
     }
+    if let Err(error) = verify_sale_offers(journal) {
+        return json!({"ok":false,"error":format!("Проверка предложений Bit: {error}")});
+    }
     if let Err(error) = crate::accounting::verify_journal_links(conn, journal) {
         return json!({"ok":false,"error":format!("Проверка Bit-летописи: {error}")});
     }
@@ -3418,6 +3589,10 @@ pub fn apply_remote_journal(conn: &Connection, journal: &Value, peer_url: &str) 
     if let Err(error) = verify_chat_records(conn, &export_journal(conn)) {
         let _ = conn.execute_batch("ROLLBACK TO verified_sync; RELEASE verified_sync");
         return json!({"ok":false,"error":format!("Проверка сохранённого intent чата: {error}")});
+    }
+    if let Err(error) = verify_sale_offers(&export_journal(conn)) {
+        let _ = conn.execute_batch("ROLLBACK TO verified_sync; RELEASE verified_sync");
+        return json!({"ok":false,"error":format!("Проверка сохранённых предложений Bit: {error}")});
     }
     if let Err(error) = ledger::verify_chat_links(conn) {
         let _ = conn.execute_batch("ROLLBACK TO verified_sync; RELEASE verified_sync");
@@ -4507,6 +4682,130 @@ fn trpc_request_input(envelope: &Value) -> anyhow::Result<&Value> {
         .and_then(|value| value.get("json"))
         .or_else(|| envelope.get("json"))
         .ok_or_else(|| anyhow::anyhow!("signed tRPC request input unavailable"))
+}
+
+fn verify_sale_offers(journal: &Value) -> anyhow::Result<()> {
+    let history = journal
+        .get("history")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    for offer in journal
+        .get("saleOffers")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[])
+    {
+        if offer.get("recordHash").and_then(Value::as_str) != Some(&sale_offer_hash(offer)?) {
+            anyhow::bail!("sale offer commitment mismatch");
+        }
+        let ledger_hash = offer["ledgerHash"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("sale offer ledger hash unavailable"))?;
+        let event = history
+            .iter()
+            .find(|event| event.get("opId").and_then(Value::as_str) == Some(ledger_hash))
+            .ok_or_else(|| anyhow::anyhow!("sale offer has no signed ledger event"))?;
+        if event.get("eventVersion").and_then(Value::as_i64) != Some(3)
+            || event.get("type").and_then(Value::as_str) != Some("transfer_send")
+            || event.get("workspaceGuid") != offer.get("workspaceGuid")
+            || event.get("itemGuid") != offer.get("itemGuid")
+            || event.get("actorGuid") != offer.get("sellerGuid")
+            || event.get("fromLabel") != offer.get("sellerGuid")
+            || event.get("toLabel") != offer.get("buyerGuid")
+            || event.get("requestPath").and_then(Value::as_str) != Some("/api/trpc/bit.offer")
+        {
+            anyhow::bail!("sale offer differs from signed ledger intent");
+        }
+        let body = event["requestBody"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("sale offer signed body unavailable"))?;
+        if event.get("requestHash").and_then(Value::as_str)
+            != Some(hex::encode(Sha256::digest(body.as_bytes())).as_str())
+        {
+            anyhow::bail!("sale offer request body hash mismatch");
+        }
+        let envelope: Value = serde_json::from_str(body)?;
+        let input = trpc_request_input(&envelope)?;
+        for field in ["offerGuid", "workspaceGuid", "itemGuid", "buyerGuid"] {
+            if input.get(field) != offer.get(field) {
+                anyhow::bail!("sale offer {field} differs from signed request");
+            }
+        }
+        if input.get("bitAmount") != offer.get("bitAmount")
+            || input.get("comment").unwrap_or(&Value::Null)
+                != offer.get("comment").unwrap_or(&Value::Null)
+        {
+            anyhow::bail!("sale offer price or comment differs from signed request");
+        }
+        let status = offer
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("pending");
+        if !matches!(status, "pending" | "accepted" | "rejected") {
+            anyhow::bail!("unsupported sale offer status");
+        }
+        if status != "pending" {
+            let decision_hash = offer
+                .get("decisionLedgerHash")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow::anyhow!("decided sale offer has no buyer event"))?;
+            let decision = history
+                .iter()
+                .find(|event| event.get("opId").and_then(Value::as_str) == Some(decision_hash))
+                .ok_or_else(|| anyhow::anyhow!("sale offer buyer event unavailable"))?;
+            let expected_type = if status == "accepted" {
+                "transfer_receive"
+            } else {
+                "transfer_reject"
+            };
+            if decision.get("type").and_then(Value::as_str) != Some(expected_type)
+                || decision.get("workspaceGuid") != offer.get("workspaceGuid")
+                || decision.get("itemGuid") != offer.get("itemGuid")
+                || decision.get("actorGuid") != offer.get("buyerGuid")
+                || decision.get("fromLabel") != offer.get("sellerGuid")
+                || decision.get("toLabel") != offer.get("buyerGuid")
+                || decision.get("requestPath").and_then(Value::as_str)
+                    != Some(if status == "accepted" {
+                        "/api/trpc/bit.acceptSale"
+                    } else {
+                        "/api/trpc/bit.rejectSale"
+                    })
+            {
+                anyhow::bail!("sale offer decision differs from buyer signature");
+            }
+        }
+        if status == "accepted" {
+            let transaction_guid = offer
+                .get("bitTransactionGuid")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow::anyhow!("accepted sale offer has no Bit transaction"))?;
+            let transaction = journal
+                .get("accounting")
+                .and_then(|value| value.get("transactions"))
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .find(|transaction| {
+                    transaction.get("guid").and_then(Value::as_str) == Some(transaction_guid)
+                })
+                .ok_or_else(|| anyhow::anyhow!("accepted sale Bit transaction unavailable"))?;
+            if transaction.get("kind").and_then(Value::as_str) != Some("sale")
+                || transaction.get("workspaceGuid") != offer.get("workspaceGuid")
+                || transaction.get("actorGuid") != offer.get("buyerGuid")
+                || transaction.get("reference") != offer.get("itemGuid")
+                || transaction.get("amount") != offer.get("bitAmount")
+            {
+                anyhow::bail!("accepted sale differs from portable accounting");
+            }
+        } else if offer
+            .get("bitTransactionGuid")
+            .is_some_and(|value| !value.is_null())
+        {
+            anyhow::bail!("non-accepted sale offer contains Bit transaction");
+        }
+    }
+    Ok(())
 }
 
 fn verify_inventory_intent(record: &Value, event: &Value) -> anyhow::Result<()> {
@@ -6573,6 +6872,7 @@ pub fn integrity_audit(conn: &Connection) -> Value {
     let document_result = verify_document_records(conn, &snapshot);
     let knowledge_intent_result = verify_knowledge_records(conn, &snapshot);
     let chat_intent_result = verify_chat_records(conn, &snapshot);
+    let sale_offer_result = verify_sale_offers(&snapshot);
     let membership_result = verify_membership_records(conn, &snapshot);
 
     let count = |table: &str| -> i64 {
@@ -6676,6 +6976,7 @@ pub fn integrity_audit(conn: &Connection) -> Value {
         .map(ToString::to_string);
     let chat_intent_error = chat_intent_result.as_ref().err().map(ToString::to_string);
     let membership_error = membership_result.as_ref().err().map(ToString::to_string);
+    let sale_offer_error = sale_offer_result.as_ref().err().map(ToString::to_string);
     let healthy = database_check == "ok"
         && ledger_result.is_ok()
         && chat_result.is_ok()
@@ -6697,6 +6998,7 @@ pub fn integrity_audit(conn: &Connection) -> Value {
         && knowledge_intent_result.is_ok()
         && chat_intent_result.is_ok()
         && membership_result.is_ok()
+        && sale_offer_result.is_ok()
         && orphan_history == 0
         && missing_guids == 0
         && missing_blobs == 0
@@ -6765,6 +7067,14 @@ pub fn integrity_audit(conn: &Connection) -> Value {
         "ledgerHeads": heads,
     });
     if let Some(object) = audit.as_object_mut() {
+        object.insert(
+            "saleOffersVerified".into(),
+            json!(sale_offer_result.is_ok()),
+        );
+        object.insert(
+            "saleOfferError".into(),
+            sale_offer_error.map(Value::String).unwrap_or(Value::Null),
+        );
         object.insert(
             "inventoryError".into(),
             inventory_error.map(Value::String).unwrap_or(Value::Null),
@@ -6891,6 +7201,157 @@ mod tests {
             path: path.to_owned(),
             request_body: Some(request_body),
         }
+    }
+
+    #[test]
+    fn pending_sale_offer_crosses_partition_and_is_accepted_by_buyer() {
+        let source_path =
+            std::env::temp_dir().join(format!("sale-source-{}.db", uuid::Uuid::new_v4()));
+        let target_path =
+            std::env::temp_dir().join(format!("sale-target-{}.db", uuid::Uuid::new_v4()));
+        let rejected_path =
+            std::env::temp_dir().join(format!("sale-rejected-{}.db", uuid::Uuid::new_v4()));
+        let mut source = db::open(&source_path).unwrap();
+        let mut target = db::open(&target_path).unwrap();
+        let workspace_guid = uuid::Uuid::new_v4().to_string();
+        let seller_guid = uuid::Uuid::new_v4().to_string();
+        let buyer_guid = uuid::Uuid::new_v4().to_string();
+        let item_guid = uuid::Uuid::new_v4().to_string();
+        let offer_guid = uuid::Uuid::new_v4().to_string();
+        source.execute("INSERT INTO workspaces(guid,name,internal_id_prefix,created_at) VALUES(?1,'Offline sale','S-',?2)",params![workspace_guid,chrono::Utc::now().to_rfc3339()]).unwrap();
+        let workspace = source.last_insert_rowid();
+        source.execute("INSERT INTO users(guid,full_name,phone,status,role_rights,created_at) VALUES(?1,'Seller','700000001','active',?2,?3)",params![seller_guid,db::owner_rights().to_string(),chrono::Utc::now().to_rfc3339()]).unwrap();
+        let seller = source.last_insert_rowid();
+        source.execute("INSERT INTO users(guid,full_name,phone,status,role_rights,created_at) VALUES(?1,'Buyer','700000002','active',?2,?3)",params![buyer_guid,db::default_rights().to_string(),chrono::Utc::now().to_rfc3339()]).unwrap();
+        let buyer = source.last_insert_rowid();
+        source
+            .execute(
+                "INSERT INTO user_workspaces(user_id,workspace_id,rights_json) VALUES(?1,?2,?3)",
+                params![seller, workspace, db::owner_rights().to_string()],
+            )
+            .unwrap();
+        source
+            .execute(
+                "INSERT INTO user_workspaces(user_id,workspace_id,rights_json) VALUES(?1,?2,?3)",
+                params![buyer, workspace, db::default_rights().to_string()],
+            )
+            .unwrap();
+        source.execute("INSERT INTO items(guid,internal_id,title,responsible_user_id,workspace_id,quantitative,created_at) VALUES(?1,'SALE-1','Offline tool',?2,?3,0,?4)",params![item_guid,seller,workspace,chrono::Utc::now().to_rfc3339()]).unwrap();
+        let item = source.last_insert_rowid();
+        let seller_key = SigningKey::generate(&mut OsRng);
+        let buyer_key = SigningKey::generate(&mut OsRng);
+        let seller_device = "sale-seller-device";
+        let buyer_device = "sale-buyer-device";
+        for (device, user, key) in [
+            (seller_device, seller, &seller_key),
+            (buyer_device, buyer, &buyer_key),
+        ] {
+            source.execute("INSERT INTO user_devices(device_id,user_id,name,public_key,created_at) VALUES(?1,?2,'Phone',?3,?4)",params![device,user,URL_SAFE_NO_PAD.encode(key.verifying_key().to_bytes()),chrono::Utc::now().to_rfc3339()]).unwrap();
+        }
+        crate::device::set_pending(
+            &source,
+            seller,
+            &signed_device_proof(&seller_key, seller_device, "/api/trpc/bit.mint"),
+        )
+        .unwrap();
+        crate::api::dispatch(
+            &mut source,
+            "bit.mint",
+            &json!({"workspaceId":workspace,"recipientUserId":buyer,"amount":50}),
+            Some(seller),
+        )
+        .unwrap();
+        let input = json!({"itemId":item,"toUserId":buyer,"bitAmount":20,
+            "offerGuid":offer_guid,"workspaceGuid":workspace_guid,"itemGuid":item_guid,
+            "buyerGuid":buyer_guid,"comment":"Partition sale"});
+        let body = json!({"0":{"json":input}});
+        crate::device::set_pending(
+            &source,
+            seller,
+            &signed_device_proof_body(&seller_key, seller_device, "/api/trpc/bit.offer", &body),
+        )
+        .unwrap();
+        let created = crate::api::dispatch(&mut source, "bit.offer", &input, Some(seller)).unwrap();
+        assert_eq!(created["status"], "pending");
+        let snapshot = export_journal(&source);
+        assert_eq!(snapshot["saleOffers"].as_array().unwrap().len(), 1);
+        let mut tampered = snapshot.clone();
+        tampered["saleOffers"][0]["bitAmount"] = json!(1);
+        tampered["saleOffers"][0]["recordHash"] =
+            json!(sale_offer_hash(&tampered["saleOffers"][0]).unwrap());
+        ledger::sign_journal(&source, &mut tampered).unwrap();
+        let rejected = db::open(&rejected_path).unwrap();
+        let rejection = apply_remote_journal(&rejected, &tampered, "");
+        assert_eq!(rejection["ok"], false, "{rejection}");
+        assert!(rejection["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("signed request"));
+        assert_eq!(
+            rejected
+                .query_row("SELECT count(*) FROM transfers", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        let imported = apply_remote_journal(&target, &snapshot, "");
+        assert_eq!(imported["ok"], true, "{imported}");
+        let imported_offer: i64 = target
+            .query_row(
+                "SELECT id FROM transfers WHERE guid=?1 AND status='pending'",
+                [offer_guid.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let target_buyer = id_by_guid(&target, "users", &buyer_guid).unwrap();
+        crate::device::set_pending(
+            &target,
+            target_buyer,
+            &signed_device_proof(&buyer_key, buyer_device, "/api/trpc/bit.acceptSale"),
+        )
+        .unwrap();
+        let accepted = crate::api::dispatch(
+            &mut target,
+            "bit.acceptSale",
+            &json!({"id":imported_offer}),
+            Some(target_buyer),
+        )
+        .unwrap();
+        assert_eq!(accepted["status"], "accepted");
+        assert!(accepted["bitTransactionGuid"].as_str().is_some());
+        let settled = export_journal_since(&target, Some(&frontier(&source)));
+        assert_eq!(settled["historyMode"], "delta");
+        let first_return = apply_remote_journal(&source, &settled, "");
+        assert_eq!(first_return["ok"], false);
+        let target_key = ledger::node_public_key(&target).unwrap();
+        approve_node_key(&source, &target_key, Some("Buyer node"), seller).unwrap();
+        let returned = apply_remote_journal(&source, &settled, "");
+        assert_eq!(returned["ok"], true, "{returned}");
+        assert_eq!(
+            source.query_row("SELECT u.guid FROM items i JOIN users u ON u.id=i.responsible_user_id WHERE i.guid=?1",[item_guid.as_str()],|row|row.get::<_,String>(0)).unwrap(),
+            buyer_guid
+        );
+        assert_eq!(
+            source
+                .query_row(
+                    "SELECT status FROM transfers WHERE guid=?1",
+                    [offer_guid.as_str()],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+            "accepted"
+        );
+        assert_eq!(
+            crate::accounting::balance(&source, workspace, buyer).unwrap(),
+            30
+        );
+        assert_eq!(
+            crate::accounting::balance(&source, workspace, seller).unwrap(),
+            20
+        );
+        let _ = std::fs::remove_file(source_path);
+        let _ = std::fs::remove_file(target_path);
+        let _ = std::fs::remove_file(rejected_path);
     }
 
     #[test]

@@ -94,7 +94,22 @@ export default function BitWallet() {
         return
       }
       if (mode === 'sell') {
-        offer.mutate({ itemId: item, toUserId: target, bitAmount: units, comment: memo.trim() || undefined })
+        const selectedItem = itemsQ.data?.rows.find((entry) => entry.id === item)
+        const buyer = recipients.find((entry) => entry.id === target)
+        if (!workspace?.guid || !selectedItem?.guid || !buyer?.guid) {
+          toast.error('Не удалось связать предложение с глобальными идентификаторами')
+          return
+        }
+        offer.mutate({
+          itemId: item,
+          toUserId: target,
+          bitAmount: units,
+          offerGuid: crypto.randomUUID(),
+          workspaceGuid: workspace.guid,
+          itemGuid: selectedItem.guid,
+          buyerGuid: buyer.guid,
+          comment: memo.trim() || undefined,
+        })
       } else {
         sale.mutate({ itemId: item, sellerUserId: target, amount: units, memo: memo.trim() || undefined })
       }

@@ -56,7 +56,11 @@ export const itemsRouter = createRouter({
       limit: input.limit,
       sort: input.sort,
     });
-    return { ...result, total: await countItems(workspaceId) };
+    return {
+      ...result,
+      rows: result.rows.map((item) => ({ ...item, guid: null as string | null })),
+      total: await countItems(workspaceId),
+    };
   }),
 
   byId: publicQuery

@@ -84,6 +84,7 @@ fn should_retain_request_body(path: &str, body: &[u8]) -> bool {
             "/api/trpc/items.addPhoto" | "/api/trpc/items.addDocument"
         )
         || (path.starts_with("/api/trpc/interorg.") && body.len() <= 64 * 1024)
+        || (path == "/api/trpc/bit.offer" && body.len() <= 16 * 1024)
         || (path == "/api/trpc/knowledge.save" && is_compact_knowledge_intent(body))
         || (path == "/api/trpc/chat.send" && is_compact_chat_intent(body))
 }
@@ -543,6 +544,17 @@ mod tests {
             &vec![0; 64 * 1024 + 1]
         ));
         assert!(requires_signature("interorg.send"));
+    }
+
+    #[test]
+    fn portable_sale_offer_retains_a_bounded_signed_intent() {
+        let body = br#"{"0":{"json":{"offerGuid":"d014d5ea-d7e9-4b39-b195-b90ec8451018","workspaceGuid":"f8390f35-63e0-4772-92e8-a440ec8c9286","itemGuid":"2e7caf4e-9da2-47f1-9801-d155990bfc19","buyerGuid":"fa06e502-6dc0-40e2-8e18-d536151ee68a","bitAmount":20}}}"#;
+        assert!(should_retain_request_body("/api/trpc/bit.offer", body));
+        assert!(!should_retain_request_body(
+            "/api/trpc/bit.offer",
+            &vec![0; 16 * 1024 + 1]
+        ));
+        assert!(requires_signature("bit.offer"));
     }
 
     #[test]
