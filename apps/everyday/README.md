@@ -347,6 +347,7 @@ npm run sync:test    # связка «сервер + локальный узел
 npm run mesh:test    # 3 узла, разрыв/восстановление и работа без первого узла
 npm run discovery:test # LAN discovery и отбрасывание анонса с чужим токеном
 npm run adversarial:test # повторы, replay, фальсификация и полное восстановление
+npm run interorg:test # две изолированные организации, partition и opaque relay
 npm run scale:test   # 100 реальных процессов и отказ 10 узлов
 npm run test:e2e     # production-сборка + Chromium/Playwright
 
@@ -374,6 +375,12 @@ x86_64 emulator. Этот gate исполняет durable BLE spool: восст�
 один узел, сохраняет на нём подписанные операции, возвращает соседей и без
 ручного `pullNow` проверяет автоматическую store-and-forward доставку ровно
 одного экземпляра каждой операции.
+
+`npm run interorg:test` поднимает две организации на отдельных процессах и БД
+без общего sync token. Получатель отключается физически, отправитель сохраняет
+подписанную текстовую транзакцию, а после восстановления публичный relay-gossip
+доставляет только ciphertext. Тест проверяет точный текст после расшифрования,
+одно принятие в Ledger и отсутствие чужих складских карточек на второй ноде.
 
 `npm run mobile:node:test` воспроизводит Android-топологию на production
 бинарнике: закрытый UI listener, отдельный token-protected sync listener,
