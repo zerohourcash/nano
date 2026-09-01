@@ -6,6 +6,7 @@ import { ru } from 'date-fns/locale'
 import { trpc } from '@/providers/trpc'
 import { useStore } from '@/lib/store'
 import { cn } from '@/lib/utils'
+import { BROWSER_FILE_LIMIT_BYTES, BROWSER_FILE_LIMIT_LABEL } from '@/lib/content-limits'
 
 export default function Chat() {
   const { currentUser, workspace } = useStore()
@@ -13,6 +14,7 @@ export default function Chat() {
   const [text, setText] = useState('')
   const [files, setFiles] = useState<File[]>([])
   const [draftGuid, setDraftGuid] = useState(() => crypto.randomUUID())
+  const [fileError, setFileError] = useState<string | null>(null)
   const listRef = useRef<HTMLDivElement>(null)
   const fileRef = useRef<HTMLInputElement>(null)
   const listQ = trpc.chat.list.useQuery(
@@ -23,6 +25,7 @@ export default function Chat() {
     onSuccess: () => {
       setText('')
       setFiles([])
+      setFileError(null)
       setDraftGuid(crypto.randomUUID())
       utils.chat.list.invalidate()
     },
@@ -153,8 +156,11 @@ export default function Chat() {
           )}
           <div className="flex items-end gap-2">
           <input ref={fileRef} type="file" multiple className="hidden" onChange={(event) => {
-            const selected = Array.from(event.target.files ?? []).filter(file => file.size <= 32 * 1024 * 1024)
+            const candidates = Array.from(event.target.files ?? [])
+            const selected = candidates.filter(file => file.size > 0 && file.size <= BROWSER_FILE_LIMIT_BYTES)
+            const rejected = candidates.filter(file => file.size === 0 || file.size > BROWSER_FILE_LIMIT_BYTES)
             setFiles(current => [...current, ...selected].slice(0, 10))
+            setFileError(rejected.length ? `Не добавлены: ${rejected.map(file => file.name).join(', ')}. Лимит ${BROWSER_FILE_LIMIT_LABEL}` : null)
             event.target.value = ''
           }} />
           <button type="button" aria-label="Прикрепить файлы" onClick={() => fileRef.current?.click()} className="h-11 w-11 shrink-0 rounded-xl border border-brand-100 text-brand-700 inline-flex items-center justify-center hover:bg-brand-50"><Paperclip size={17} /></button>
@@ -187,6 +193,7 @@ export default function Chat() {
           </p>
         )}
         {ingestContent.error && <p className="px-3 pb-3 text-xs text-danger" role="alert">{ingestContent.error.message}</p>}
+        {fileError && <p className="px-3 pb-3 text-xs text-danger" role="alert">{fileError}</p>}
       </section>
     </div>
   )

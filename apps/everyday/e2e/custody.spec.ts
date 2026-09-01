@@ -124,7 +124,14 @@ test('browser signs a real custody transaction and ledger retains its proof', as
       'base64'
     ),
   });
-  await page.locator('input[type="file"]').nth(2).setInputFiles({
+  const createDocumentInput = page.locator('input[type="file"]').nth(2);
+  await createDocumentInput.setInputFiles({
+    name: 'empty.pdf',
+    mimeType: 'application/pdf',
+    buffer: Buffer.alloc(0),
+  });
+  await expect(page.getByText(/Не добавлены: empty\.pdf.*1 байт–20 МБ/)).toBeVisible();
+  await createDocumentInput.setInputFiles({
     name: 'manual.pdf',
     mimeType: 'application/pdf',
     buffer: Buffer.from('E2E signed document'),

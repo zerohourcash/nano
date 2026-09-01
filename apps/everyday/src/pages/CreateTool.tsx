@@ -29,6 +29,8 @@ import { cn } from '@/lib/utils'
 import { trpc } from '@/providers/trpc'
 import { preparePhoto } from '@/lib/photo'
 import type { PreparedPhoto } from '@/lib/photo'
+import { useStore } from '@/lib/store'
+import { BROWSER_FILE_LIMIT_BYTES, BROWSER_FILE_LIMIT_LABEL } from '@/lib/content-limits'
 
 // ─── Схема формы ─────────────────────────────────────────────────────────────
 
@@ -165,6 +167,8 @@ function fmtThousands(v: string): string {
 export default function CreateTool() {
   const navigate = useNavigate()
   const utils = trpc.useUtils()
+  const { currentUser } = useStore()
+  const canManageDocuments = currentUser?.roleRights.manageDocuments === true
   const [toast, setToast] = useState<string | null>(null)
   const [justCreated, setJustCreated] = useState(false)
 
@@ -307,49 +311,63 @@ export default function CreateTool() {
       },
       {
         onSuccess: async (item) => {
-          try {
-            if (item) {
+          const attachmentFailures: string[] = []
+          if (item) {
+            try {
               const itemGuid = (item as typeof item & { guid?: string }).guid
               if (!itemGuid) throw new Error('Нода не вернула GUID карточки')
               for (const [index, photo] of photos.entries()) {
-                const [original, thumbnail] = await Promise.all([
-                  ingestContent.mutateAsync({ workspaceId: item.workspaceId, dataUrl: photo.url }),
-                  ingestContent.mutateAsync({ workspaceId: item.workspaceId, dataUrl: photo.thumbUrl }),
-                ])
-                await addPhoto.mutateAsync({
-                  itemId: item.id,
-                  itemGuid,
-                  photoGuid: crypto.randomUUID(),
-                  url: original.url,
-                  thumbUrl: thumbnail.url,
-                  isTitle: index === 0,
-                })
+                try {
+                  const [original, thumbnail] = await Promise.all([
+                    ingestContent.mutateAsync({ workspaceId: item.workspaceId, dataUrl: photo.url }),
+                    ingestContent.mutateAsync({ workspaceId: item.workspaceId, dataUrl: photo.thumbUrl }),
+                  ])
+                  await addPhoto.mutateAsync({
+                    itemId: item.id,
+                    itemGuid,
+                    photoGuid: crypto.randomUUID(),
+                    url: original.url,
+                    thumbUrl: thumbnail.url,
+                    isTitle: index === 0,
+                  })
+                } catch (error) {
+                  attachmentFailures.push(`фото ${index + 1}: ${error instanceof Error ? error.message : 'ошибка'}`)
+                }
               }
               for (const document of docs) {
-                const dataUrl = await new Promise<string>((resolve, reject) => {
-                  const reader = new FileReader()
-                  reader.onerror = () => reject(reader.error ?? new Error('Не удалось прочитать документ'))
-                  reader.onload = () => resolve(String(reader.result))
-                  reader.readAsDataURL(document.file)
-                })
-                const uploaded = await ingestContent.mutateAsync({ workspaceId: item.workspaceId, dataUrl })
-                await addDocument.mutateAsync({
-                  itemId: item.id,
-                  itemGuid,
-                  documentGuid: crypto.randomUUID(),
-                  name: document.name,
-                  url: uploaded.url,
-                  mime: uploaded.mime,
-                  accessLevel: 'members',
-                })
+                try {
+                  const dataUrl = await new Promise<string>((resolve, reject) => {
+                    const reader = new FileReader()
+                    reader.onerror = () => reject(reader.error ?? new Error('Не удалось прочитать документ'))
+                    reader.onload = () => resolve(String(reader.result))
+                    reader.readAsDataURL(document.file)
+                  })
+                  const uploaded = await ingestContent.mutateAsync({ workspaceId: item.workspaceId, dataUrl })
+                  await addDocument.mutateAsync({
+                    itemId: item.id,
+                    itemGuid,
+                    documentGuid: crypto.randomUUID(),
+                    name: document.name,
+                    url: uploaded.url,
+                    mime: uploaded.mime,
+                    accessLevel: 'members',
+                  })
+                } catch (error) {
+                  attachmentFailures.push(`${document.name}: ${error instanceof Error ? error.message : 'ошибка'}`)
+                }
               }
+            } catch (error) {
+              attachmentFailures.push(error instanceof Error ? error.message : 'не удалось подготовить вложения')
             }
-          } catch (error) {
-            setToast(error instanceof Error ? `Карточка создана, но вложение не добавлено: ${error.message}` : 'Карточка создана, но вложение не добавлено')
           }
           utils.items.list.invalidate()
           utils.items.nextInternalId.invalidate()
-          if (andMore) {
+          if (attachmentFailures.length > 0) {
+            setToast(`Карточка создана, не добавлено: ${attachmentFailures.join('; ')}`)
+            setTimeout(() => {
+              if (item) navigate(`/tool/${item.id}`)
+            }, 2500)
+          } else if (andMore) {
             reset()
             setTitlePhoto(null)
             setExtraPhotos([])
@@ -993,6 +1011,8 @@ export default function CreateTool() {
           <SectionCard title="Документы и комментарий" delay={0.15}>
             <div className="space-y-4">
               <div>
+                {canManageDocuments ? (
+                  <>
                 <button
                   type="button"
                   onClick={() => docFileRef.current?.click()}
@@ -1008,7 +1028,10 @@ export default function CreateTool() {
                   className="hidden"
                   onChange={(e) => {
                     const files = Array.from(e.target.files ?? [])
-                    if (files.length) setDocs((p) => [...p, ...files.map((file) => ({ name: file.name, size: file.size, file }))])
+                    const accepted = files.filter((file) => file.size > 0 && file.size <= BROWSER_FILE_LIMIT_BYTES)
+                    const rejected = files.filter((file) => file.size === 0 || file.size > BROWSER_FILE_LIMIT_BYTES)
+                    if (accepted.length) setDocs((p) => [...p, ...accepted.map((file) => ({ name: file.name, size: file.size, file }))])
+                    if (rejected.length) setToast(`Не добавлены: ${rejected.map((file) => file.name).join(', ')}. Допустимо 1 байт–${BROWSER_FILE_LIMIT_LABEL}`)
                     e.target.value = ''
                   }}
                 />
@@ -1037,8 +1060,14 @@ export default function CreateTool() {
                   </ul>
                 )}
                 <p className="mt-1.5 text-xs text-ink-300">
-                  В демо-версии файлы прикрепляются к карточке через панель управления
+                  До {BROWSER_FILE_LIMIT_LABEL} на файл. После создания файл попадёт в локальный CAS и подписанную историю.
                 </p>
+                  </>
+                ) : (
+                  <p className="rounded-xl bg-brand-50 px-3 py-2.5 text-xs font-semibold text-ink-500">
+                    Добавлять документы может участник с правом управления документами.
+                  </p>
+                )}
               </div>
               <div>
                 <FieldLabel>Комментарий</FieldLabel>

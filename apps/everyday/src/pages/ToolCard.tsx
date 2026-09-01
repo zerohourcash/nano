@@ -48,6 +48,7 @@ import { parseDueInput, toDateTimeLocal } from '@/lib/due-date'
 import { preparePhoto } from '@/lib/photo'
 import { useStore } from '@/lib/store'
 import QrScanner from '@/components/QrScanner'
+import { BROWSER_FILE_LIMIT_BYTES, BROWSER_FILE_LIMIT_LABEL } from '@/lib/content-limits'
 
 // ─── Утилиты ─────────────────────────────────────────────────────────────────
 
@@ -1696,8 +1697,8 @@ function DocumentsTab({ item, onDone }: { item: ItemFull; onDone: (msg: string) 
     const file = event.target.files?.[0]
     event.target.value = ''
     if (!file || uploading) return
-    if (file.size === 0 || file.size > 32 * 1024 * 1024) {
-      onDone('Документ должен занимать от 1 байта до 32 МБ')
+    if (file.size === 0 || file.size > BROWSER_FILE_LIMIT_BYTES) {
+      onDone(`Документ должен занимать от 1 байта до ${BROWSER_FILE_LIMIT_LABEL}`)
       return
     }
     setUploading(true)
@@ -1794,7 +1795,7 @@ function DocumentsTab({ item, onDone }: { item: ItemFull; onDone: (msg: string) 
             className="w-full rounded-xl border border-brand-100 px-4 py-3 text-sm font-semibold text-ink-500 hover:bg-brand-50 transition-colors flex items-center justify-center gap-2 disabled:opacity-60"
           >
             {uploading ? <Loader2 size={16} className="animate-spin" /> : <Upload size={16} strokeWidth={1.75} />}
-            {uploading ? 'Сохраняем и подписываем…' : 'Загрузить документ (до 32 МБ)'}
+            {uploading ? 'Сохраняем и подписываем…' : `Загрузить документ (до ${BROWSER_FILE_LIMIT_LABEL})`}
           </button>
         </div>
       )}
