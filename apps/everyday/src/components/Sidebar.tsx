@@ -13,6 +13,7 @@ import {
   Bell,
   ChevronsLeft,
   ChevronsRight,
+  Coins,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { useStore } from '@/lib/store'
@@ -26,6 +27,7 @@ const navItems = [
   { to: '/notifications', label: 'Сроки и уведомления', icon: Bell },
   { to: '/chat', label: 'Чат группы', icon: MessageCircle },
   { to: '/knowledge', label: 'База знаний', icon: BookOpen },
+  { to: '/bit', label: 'Кошелёк Bit', icon: Coins },
   { to: '/inventory', label: 'Инвентаризация', icon: ClipboardCheck },
   { to: '/reports', label: 'Отчёты', icon: BarChart3 },
   { to: '/admin', label: 'Панель управления', icon: Settings2 },
@@ -60,7 +62,7 @@ export default function Sidebar() {
 
       {/* Навигация */}
       <nav className="flex-1 overflow-y-auto py-3 px-2 space-y-1">
-        {navItems.map((item) => (
+        {navItems.filter((item) => item.to !== '/bit' || currentUser?.roleRights.useBit === true).map((item) => (
           <NavLink
             key={item.to}
             to={item.to}

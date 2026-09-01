@@ -14,6 +14,7 @@ import { backupRouter, syncRouter } from "./syncRouter";
 import { knowledgeRouter } from "./knowledgeRouter";
 import { contentRouter } from "./contentRouter";
 import { interorgRouter } from "./interorgRouter";
+import { bitRouter } from "./bitRouter";
 
 export const appRouter = createRouter({
   ping: publicQuery.query(() => ({ ok: true, ts: Date.now() })),
@@ -34,6 +35,7 @@ export const appRouter = createRouter({
   backup: backupRouter,
   content: contentRouter,
   interorg: interorgRouter,
+  bit: bitRouter,
 });
 
 export type AppRouter = typeof appRouter;

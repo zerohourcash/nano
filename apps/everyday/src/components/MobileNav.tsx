@@ -17,6 +17,7 @@ import {
   BookOpen,
   UserRound,
   X,
+  Coins,
 } from 'lucide-react'
 import { AnimatePresence, motion } from 'framer-motion'
 import { cn } from '@/lib/utils'
@@ -28,6 +29,7 @@ const moreItems = [
   { to: '/history', label: 'История', icon: History },
   { to: '/chat', label: 'Чат группы', icon: MessageCircle },
   { to: '/knowledge', label: 'База знаний', icon: BookOpen },
+  { to: '/bit', label: 'Кошелёк Bit', icon: Coins },
   { to: '/inventory', label: 'Инвентаризация', icon: ClipboardCheck },
   { to: '/reports', label: 'Отчёты', icon: BarChart3 },
   { to: '/admin', label: 'Панель управления', icon: Settings2 },
@@ -36,7 +38,7 @@ const moreItems = [
 
 /** Мобильный каркас: верхняя панель 56px + нижняя навигация с FAB (design.md §5) */
 export default function MobileNav() {
-  const { workspace, workspaces, setWorkspace, transfersToSend, transfersToReceive, unreadNotifications } = useStore()
+  const { workspace, workspaces, setWorkspace, currentUser, transfersToSend, transfersToReceive, unreadNotifications } = useStore()
   const [sheetOpen, setSheetOpen] = useState(false)
   const [wsOpen, setWsOpen] = useState(false)
   const navigate = useNavigate()
@@ -175,7 +177,7 @@ export default function MobileNav() {
                 </button>
               </div>
               <div className="grid grid-cols-2 gap-2">
-                {moreItems.map((item) => (
+              {moreItems.filter((item) => item.to !== '/bit' || currentUser?.roleRights.useBit === true).map((item) => (
                   <button
                     key={item.to}
                     onClick={() => {

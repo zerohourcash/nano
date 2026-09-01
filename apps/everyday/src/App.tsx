@@ -22,6 +22,7 @@ const Join = lazy(() => import('@/pages/Join'))
 const Chat = lazy(() => import('@/pages/Chat'))
 const Invite = lazy(() => import('@/pages/Invite'))
 const Knowledge = lazy(() => import('@/pages/Knowledge'))
+const BitWallet = lazy(() => import('@/pages/BitWallet'))
 
 function PageFallback() {
   return (
@@ -52,6 +53,7 @@ export default function App() {
             <Route path="notifications" element={<Notifications />} />
             <Route path="chat" element={<Chat />} />
             <Route path="knowledge" element={<Knowledge />} />
+            <Route path="bit" element={<BitWallet />} />
             <Route path="invite" element={<Invite />} />
             <Route path="reports" element={<Reports />} />
             <Route path="admin" element={<Admin />} />

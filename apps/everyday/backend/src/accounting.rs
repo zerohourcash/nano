@@ -190,12 +190,37 @@ pub fn balance(conn: &Connection, workspace: i64, user: i64) -> anyhow::Result<i
 }
 
 pub fn transaction(conn: &Connection, guid: &str) -> Option<Value> {
-    conn.query_row("SELECT guid,workspace_id,actor_user_id,kind,memo,reference,sender_account_guid,amount,tx_hash,status,created_at FROM accounting_transactions WHERE guid=?1",[guid],|r|Ok(json!({"guid":r.get::<_,String>(0)?,"workspaceId":r.get::<_,i64>(1)?,"actorId":r.get::<_,i64>(2)?,"kind":r.get::<_,String>(3)?,"memo":r.get::<_,Option<String>>(4)?,"reference":r.get::<_,Option<String>>(5)?,"senderAccountGuid":r.get::<_,Option<String>>(6)?,"amount":r.get::<_,i64>(7)?,"txHash":r.get::<_,String>(8)?,"status":r.get::<_,String>(9)?,"createdAt":r.get::<_,String>(10)?}))).ok()
+    conn.query_row("SELECT t.guid,t.workspace_id,t.actor_user_id,t.kind,t.memo,t.reference,t.sender_account_guid,t.amount,t.tx_hash,t.status,t.created_at,
+        (SELECT owner_user_id FROM accounting_accounts WHERE guid=t.sender_account_guid),
+        (SELECT a.owner_user_id FROM accounting_lines l JOIN accounting_accounts a ON a.guid=l.account_guid WHERE l.transaction_guid=t.guid AND l.debit>0 LIMIT 1)
+        FROM accounting_transactions t WHERE t.guid=?1",[guid],|r|Ok(json!({"guid":r.get::<_,String>(0)?,"workspaceId":r.get::<_,i64>(1)?,"actorId":r.get::<_,i64>(2)?,"kind":r.get::<_,String>(3)?,"memo":r.get::<_,Option<String>>(4)?,"reference":r.get::<_,Option<String>>(5)?,"senderAccountGuid":r.get::<_,Option<String>>(6)?,"amount":r.get::<_,i64>(7)?,"txHash":r.get::<_,String>(8)?,"status":r.get::<_,String>(9)?,"createdAt":r.get::<_,String>(10)?,"senderUserId":r.get::<_,Option<i64>>(11)?,"recipientUserId":r.get::<_,Option<i64>>(12)?}))).ok()
 }
 
 pub fn list(conn: &Connection, workspace: i64) -> Value {
     let mut out = Vec::new();
     if let Ok(mut s)=conn.prepare("SELECT guid FROM accounting_transactions WHERE workspace_id=?1 ORDER BY created_at DESC,guid DESC") {if let Ok(rows)=s.query_map([workspace],|r|r.get::<_,String>(0)){for guid in rows.flatten(){if let Some(v)=transaction(conn,&guid){out.push(v)}}}}
+    Value::Array(out)
+}
+
+pub fn list_for_user(conn: &Connection, workspace: i64, user: i64) -> Value {
+    let mut out = Vec::new();
+    if let Ok(mut statement) = conn.prepare(
+        "SELECT DISTINCT t.guid FROM accounting_transactions t
+         JOIN accounting_lines l ON l.transaction_guid=t.guid
+         JOIN accounting_accounts a ON a.guid=l.account_guid
+         WHERE t.workspace_id=?1 AND a.owner_user_id=?2
+         ORDER BY t.created_at DESC,t.guid DESC",
+    ) {
+        if let Ok(rows) =
+            statement.query_map(params![workspace, user], |row| row.get::<_, String>(0))
+        {
+            for guid in rows.flatten() {
+                if let Some(value) = transaction(conn, &guid) {
+                    out.push(value);
+                }
+            }
+        }
+    }
     Value::Array(out)
 }
 

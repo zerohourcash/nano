@@ -334,6 +334,72 @@ test('browser signs a real custody transaction and ledger retains its proof', as
   await expect(page.getByTestId('inventory-act-verification')).toContainText('Подпись или содержимое акта повреждены');
   await trpc(page, 'transfers.returnItem', { itemId: qrItem.id });
 
+  const bitRecipient = await trpc<{ id: number }>(page, 'admin.users.create', {
+    workspaceId: workspaces[0].id,
+    fullName: 'Иван Получатель Bit',
+    phone: '79005550199',
+    position: 'Мастер',
+  });
+  await trpc(page, 'admin.users.update', {
+    workspaceId: workspaces[0].id,
+    id: bitRecipient.id,
+    status: 'active',
+  });
+  const currentUser = await trpc<{ id: number }>(page, 'auth.me', null, false);
+  await page.goto('/bit');
+  await expect(page.getByRole('heading', { name: 'Кошелёк Bit' })).toBeVisible();
+  await page.getByRole('button', { name: 'Эмиссия' }).click();
+  await page.getByLabel('Получатель Bit').selectOption(String(currentUser.id));
+  await page.getByLabel('Сумма Bit').fill('100');
+  await page.getByLabel('Назначение платежа').fill('Стартовый фонд E2E');
+  await page.getByRole('button', { name: 'Подписать транзакцию' }).click();
+  await expect(page.getByTestId('bit-balance')).toHaveText('100 Bit');
+
+  await page.getByRole('button', { name: 'Перевод' }).click();
+  await page.getByLabel('Получатель Bit').selectOption(String(bitRecipient.id));
+  await page.getByLabel('Сумма Bit').fill('25');
+  await page.getByLabel('Назначение платежа').fill('Оплата смены');
+  await page.getByRole('button', { name: 'Подписать транзакцию' }).click();
+  await expect(page.getByTestId('bit-balance')).toHaveText('75 Bit');
+
+  await page.getByRole('button', { name: 'Покупка' }).click();
+  await page.getByLabel('Продавец').selectOption(String(bitRecipient.id));
+  await page.getByLabel('Товар или ТМЦ').selectOption(String(qrItem.id));
+  await page.getByLabel('Сумма Bit').fill('10');
+  await page.getByLabel('Назначение платежа').fill('Покупка расходника');
+  await page.getByRole('button', { name: 'Подписать транзакцию' }).click();
+  await expect(page.getByTestId('bit-balance')).toHaveText('65 Bit');
+  await expect(page.getByTestId('bit-transaction')).toHaveCount(3);
+  const bitTransactions = await trpc<Array<{
+    kind: string;
+    status: string;
+    senderUserId: number | null;
+    recipientUserId: number | null;
+  }>>(page, 'bit.transactions', { workspaceId: workspaces[0].id }, false);
+  expect(bitTransactions).toHaveLength(3);
+  expect(bitTransactions.every(transaction => transaction.status === 'posted')).toBe(true);
+  expect(bitTransactions.find(transaction => transaction.kind === 'sale')).toMatchObject({
+    senderUserId: currentUser.id,
+    recipientUserId: bitRecipient.id,
+  });
+  const bitHistory = await trpc<Array<{
+    type: string;
+    eventVersion: number;
+    requestDeviceId?: string;
+    requestHash?: string;
+  }>>(page, 'history.all', { workspaceId: workspaces[0].id, limit: 500 }, false);
+  for (const type of ['bit_mint', 'bit_transfer', 'bit_sale']) {
+    expect(bitHistory.find(event => event.type === type)).toMatchObject({
+      eventVersion: 2,
+      requestDeviceId: expect.any(String),
+      requestHash: expect.stringMatching(/^[a-f0-9]{64}$/),
+    });
+  }
+  const bitAudit = await trpc<{ accountingVerified: boolean; accountingError: string | null }>(
+    page, 'sync.audit', null, false
+  );
+  expect(bitAudit).toMatchObject({ accountingVerified: true, accountingError: null });
+
   await page.goto('/knowledge');
   await expect(
     page.getByRole('heading', { name: 'База знаний' })

@@ -15,6 +15,7 @@ interface User {
   position: string | null
   phone: string
   avatarUrl: string | null
+  roleRights: Record<string, unknown>
 }
 
 interface AppStore {
@@ -86,6 +87,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
             position: meQ.data.position,
             phone: meQ.data.phone,
             avatarUrl: meQ.data.avatarUrl,
+            roleRights: (meQ.data.roleRights ?? {}) as Record<string, unknown>,
           }
         : null,
       selectedToolIds,

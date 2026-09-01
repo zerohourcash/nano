@@ -100,6 +100,8 @@ pub fn is_mutation(procedure: &str) -> bool {
             | "content.status"
             | "bit.balance"
             | "bit.transactions"
+            | "bit.myTransactions"
+            | "bit.recipients"
             | "knowledge.list"
             | "knowledge.bySlug"
             | "interorg.identity"
@@ -501,7 +503,10 @@ fn required_right(procedure: &str) -> Option<&'static str> {
         Some("viewItems")
     } else if procedure == "bit.mint" {
         Some("manageAccounting")
-    } else if matches!(procedure, "bit.transfer" | "bit.sale" | "bit.balance") {
+    } else if matches!(
+        procedure,
+        "bit.transfer" | "bit.sale" | "bit.balance" | "bit.myTransactions" | "bit.recipients"
+    ) {
         Some("useBit")
     } else if procedure == "bit.transactions" {
         Some("viewAccounting")
@@ -992,7 +997,9 @@ fn dispatch_inner(
             Ok(crate::content::status(conn))
         }
         "bit.balance" => bit_balance(conn, input, user_id),
-        "bit.transactions" => bit_transactions(conn, input),
+        "bit.transactions" => bit_transactions(conn, input, user_id),
+        "bit.myTransactions" => bit_my_transactions(conn, input, user_id),
+        "bit.recipients" => bit_recipients(conn, input, user_id),
         "bit.transfer" => bit_transfer(conn, input, user_id),
         "bit.sale" => bit_sale(conn, input, user_id),
         "bit.mint" => bit_mint(conn, input, user_id),
@@ -4370,9 +4377,40 @@ fn bit_balance(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiRes
     Ok(json!({"workspaceId":ws,"userId":target,"currency":"BIT","minorUnit":1,"balance":balance}))
 }
 
-fn bit_transactions(conn: &Connection, input: &Value) -> ApiResult {
+fn bit_transactions(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
+    let uid = require_user(conn, user_id)?;
     let ws = i64v(input, "workspaceId").unwrap_or_else(|| ws_fallback(conn));
+    require_member(conn, uid, ws)?;
     Ok(crate::accounting::list(conn, ws))
+}
+
+fn bit_my_transactions(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
+    let uid = require_user(conn, user_id)?;
+    let ws = i64v(input, "workspaceId").unwrap_or_else(|| ws_fallback(conn));
+    require_member(conn, uid, ws)?;
+    Ok(crate::accounting::list_for_user(conn, ws, uid))
+}
+
+fn bit_recipients(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
+    let uid = require_user(conn, user_id)?;
+    let ws = i64v(input, "workspaceId").unwrap_or_else(|| ws_fallback(conn));
+    require_member(conn, uid, ws)?;
+    let mut statement = conn.prepare(
+        "SELECT u.id,u.guid,u.full_name,uw.position,uw.role_name
+         FROM user_workspaces uw JOIN users u ON u.id=uw.user_id
+         WHERE uw.workspace_id=?1 AND u.status='active' ORDER BY u.full_name,u.id",
+    )?;
+    let users: Vec<Value> = statement
+        .query_map([ws], |row| {
+            Ok(json!({
+                "id":row.get::<_,i64>(0)?,"guid":row.get::<_,String>(1)?,
+                "fullName":row.get::<_,String>(2)?,"position":row.get::<_,Option<String>>(3)?,
+                "roleName":row.get::<_,Option<String>>(4)?
+            }))
+        })?
+        .flatten()
+        .collect();
+    Ok(Value::Array(users))
 }
 
 fn bit_transfer(conn: &mut Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
@@ -8964,6 +9002,42 @@ mod tests {
             bit_balance(&conn, &json!({"workspaceId":ws}), Some(users[1])).unwrap()["balance"],
             50
         );
+        let recipients = dispatch(
+            &mut conn,
+            "bit.recipients",
+            &json!({"workspaceId":ws}),
+            Some(users[1]),
+        )
+        .unwrap();
+        assert_eq!(recipients.as_array().unwrap().len(), 3);
+        assert!(recipients
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|user| user.get("phone").is_none()));
+        let personal = dispatch(
+            &mut conn,
+            "bit.myTransactions",
+            &json!({"workspaceId":ws}),
+            Some(users[1]),
+        )
+        .unwrap();
+        assert_eq!(personal.as_array().unwrap().len(), 2);
+        assert!(personal.as_array().unwrap().iter().all(|transaction| {
+            transaction["senderUserId"] == users[1] || transaction["recipientUserId"] == users[1]
+        }));
+        assert_eq!(
+            dispatch(
+                &mut conn,
+                "bit.transactions",
+                &json!({"workspaceId":ws}),
+                Some(users[1]),
+            )
+            .unwrap_err()
+            .http,
+            403,
+            "обычный участник не должен читать чужую бухгалтерскую летопись"
+        );
         let before: i64 = conn
             .query_row("SELECT count(*) FROM accounting_transactions", [], |r| {
                 r.get(0)
@@ -9001,6 +9075,17 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(denied.http, 403);
+        assert_eq!(
+            dispatch(
+                &mut conn,
+                "bit.myTransactions",
+                &json!({"workspaceId":ws}),
+                Some(users[1]),
+            )
+            .unwrap_err()
+            .http,
+            403
+        );
         cleanup(conn, path);
     }
 
