@@ -549,6 +549,19 @@ def main() -> int:
             bool(fault.get("recordHash")) and bool(resolved_fault.get("recordHash")),
             str(resolved_fault)[:180],
         )
+        change = node.call(
+            "items.requestChange",
+            {"itemId": created["id"], "payload": {"comment": "Проверено офлайн"}, "comment": "Добавить отметку"},
+        )
+        change_decision = node.call(
+            "items.decideChange",
+            {"id": change["id"], "accept": True, "reason": "Подтверждено локально"},
+        )
+        check(
+            "офлайн заявка и решение связаны с Ledger",
+            bool(change.get("recordHash")) and bool(change_decision.get("recordHash")),
+            str(change_decision)[:180],
+        )
         node.call("sync.pullNow", {})
         back = wait_for(lambda: "Шуруповёрт с узла" in titles(server, ws_id))
         check("предмет с узла доехал до сервера", back, str(titles(server, ws_id))[:160])
@@ -611,6 +624,15 @@ def main() -> int:
                 for row in synced_faults
             ),
             str(synced_faults)[:260],
+        )
+        synced_changes = server.call("items.changeRequests", {"workspaceId": ws_id}, mutation=False)
+        changed_card = item_named(server, ws_id, "Шуруповёрт с узла") or {}
+        check(
+            "полная нода восстановила офлайн-заявку, решение и применённый patch",
+            isinstance(synced_changes, list)
+            and any(row.get("guid") == change.get("guid") and row.get("status") == "accepted" for row in synced_changes)
+            and changed_card.get("comment") == "Проверено офлайн",
+            str(synced_changes)[:260],
         )
 
         print("\n== 6. Статус синхронизации ==")

@@ -10,7 +10,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 DOMAIN = "everyday/device-request/v1"
 CRITICAL = {
-    "items.create", "items.update", "items.remove", "items.addComment", "items.reportFault", "items.resolveFault",
+    "items.create", "items.update", "items.remove", "items.addComment", "items.reportFault", "items.resolveFault", "items.requestChange", "items.decideChange",
     "transfers.take", "transfers.takeMany", "transfers.returnItem",
     "transfers.prepare", "transfers.accept", "transfers.reject",
     "history.writeOff", "history.replenish", "history.move",

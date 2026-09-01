@@ -98,6 +98,16 @@ capability, затем применяют только её scope. Неверн�
   исходным Ledger payload hash.
   Первая операция над legacy-неисправностью создаёт device-signed
   `fault_adopt`; система не приписывает старым данным несуществовавшую подпись.
+- Заявки на изменение используют `portable-branches/v1`: request и decision
+  подписываются устройством, commitment включает portable patch, снимок полей
+  до изменения, автора, item/workspace GUID, parent, решение и причину.
+  Локальные ID не пересылаются как идентичность: user связывается по GUID,
+  status по slug, именованные справочники по `(workspace, name)`. Параллельные
+  accept/reject сохраняются ветками; победитель `(depth, recordHash)` либо
+  применяет patch, либо восстанавливает подписанное состояние «до». Legacy-
+  заявка вводится в модель явным `change_adopt`. Более поздний прямой
+  device-signed `items.update` причинно перекрывает старое решение, поэтому
+  повторный sync не откатывает последующую ручную правку.
 - «Удаление» ТМЦ реализовано как delete-wins `itemTombstoneMode=monotonic/v1`.
   Tombstone коммитит GUID организации, карточки и автора, Ledger hash и время;
   связанное `item_archive` обязано иметь полный device-proof. Проверка проходит

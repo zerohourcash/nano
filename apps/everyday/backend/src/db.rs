@@ -464,6 +464,7 @@ fn migrate(conn: &Connection) -> Result<()> {
         [],
     );
     let _ = conn.execute("ALTER TABLE faults ADD COLUMN guid TEXT", []);
+    let _ = conn.execute("ALTER TABLE change_requests ADD COLUMN guid TEXT", []);
     conn.execute_batch(
         "CREATE UNIQUE INDEX IF NOT EXISTS faults_guid_idx ON faults(guid) WHERE guid IS NOT NULL;
          CREATE TABLE IF NOT EXISTS fault_records(
@@ -486,6 +487,29 @@ fn migrate(conn: &Connection) -> Result<()> {
          );
          CREATE INDEX IF NOT EXISTS fault_record_fault_idx
            ON fault_records(fault_guid,depth DESC,record_hash DESC);",
+    )?;
+    conn.execute_batch(
+        "CREATE UNIQUE INDEX IF NOT EXISTS change_requests_guid_idx ON change_requests(guid) WHERE guid IS NOT NULL;
+         CREATE TABLE IF NOT EXISTS change_request_records(
+           record_hash TEXT PRIMARY KEY,
+           request_guid TEXT NOT NULL,
+           parent_hash TEXT,
+           depth INTEGER NOT NULL CHECK(depth >= 0),
+           workspace_guid TEXT NOT NULL,
+           item_guid TEXT NOT NULL,
+           requester_guid TEXT NOT NULL,
+           actor_guid TEXT NOT NULL,
+           patch_json TEXT NOT NULL,
+           before_json TEXT NOT NULL,
+           comment TEXT,
+           status TEXT NOT NULL CHECK(status IN ('pending','accepted','rejected')),
+           reason TEXT,
+           payload_hash TEXT NOT NULL,
+           ledger_hash TEXT NOT NULL UNIQUE,
+           created_at TEXT NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS change_record_request_idx
+           ON change_request_records(request_guid,depth DESC,record_hash DESC);",
     )?;
     let _ = conn.execute("ALTER TABLE chat_messages ADD COLUMN guid TEXT", []);
     let _ = conn.execute("ALTER TABLE chat_messages ADD COLUMN ledger_hash TEXT", []);

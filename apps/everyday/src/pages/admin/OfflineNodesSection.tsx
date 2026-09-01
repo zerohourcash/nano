@@ -423,6 +423,7 @@ export default function OfflineNodesSection() {
               <div>Tombstone ТМЦ: <b>{auditQ.data?.itemTombstonesVerified ?? 0}</b></div>
               <div>Комментариев ТМЦ: <b>{auditQ.data?.itemCommentsVerified ?? 0}</b></div>
               <div>Событий неисправностей: <b>{auditQ.data?.faultRecordsVerified ?? 0}</b></div>
+              <div>Событий заявок: <b>{auditQ.data?.changeRequestRecordsVerified ?? 0}</b></div>
               <div>Глав цепочек: <b>{auditQ.data?.ledgerHeads.length ?? 0}</b></div>
               <div>Потерянных связей: <b>{auditQ.data?.orphanHistory ?? 0}</b></div>
               <div>CAS-файлов: <b>{auditQ.data?.counts.blobs ?? 0}</b></div>
@@ -430,9 +431,9 @@ export default function OfflineNodesSection() {
               <div>Ревизий знаний: <b>{auditQ.data?.counts.knowledgeRevisions ?? 0}</b></div>
               <div>Недокачанных файлов: <b>{auditQ.data?.missingBlobs ?? 0}</b></div>
             </div>
-            {(auditQ.data?.ledgerError || auditQ.data?.chatError || auditQ.data?.deviceError || auditQ.data?.custodyError || auditQ.data?.itemTombstoneError || auditQ.data?.itemCommentError || auditQ.data?.faultError || auditQ.data?.membershipError || auditQ.data?.accountingError || auditQ.data?.knowledgeError || auditQ.data?.snapshotError) && (
+            {(auditQ.data?.ledgerError || auditQ.data?.chatError || auditQ.data?.deviceError || auditQ.data?.custodyError || auditQ.data?.itemTombstoneError || auditQ.data?.itemCommentError || auditQ.data?.faultError || auditQ.data?.changeRequestError || auditQ.data?.membershipError || auditQ.data?.accountingError || auditQ.data?.knowledgeError || auditQ.data?.snapshotError) && (
               <p className="text-sm text-danger break-all">
-                {auditQ.data.ledgerError || auditQ.data.chatError || auditQ.data.deviceError || auditQ.data.custodyError || auditQ.data.itemTombstoneError || auditQ.data.itemCommentError || auditQ.data.faultError || auditQ.data.membershipError || auditQ.data.accountingError || auditQ.data.knowledgeError || auditQ.data.snapshotError}
+                {auditQ.data.ledgerError || auditQ.data.chatError || auditQ.data.deviceError || auditQ.data.custodyError || auditQ.data.itemTombstoneError || auditQ.data.itemCommentError || auditQ.data.faultError || auditQ.data.changeRequestError || auditQ.data.membershipError || auditQ.data.accountingError || auditQ.data.knowledgeError || auditQ.data.snapshotError}
               </p>
             )}
             <div className="flex items-center gap-2">

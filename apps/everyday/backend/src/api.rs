@@ -1806,6 +1806,15 @@ fn items_update(conn: &mut Connection, input: &Value, user_id: Option<i64>) -> A
 }
 
 fn items_update_atomic(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
+    items_update_atomic_bound(conn, input, user_id, None)
+}
+
+fn items_update_atomic_bound(
+    conn: &Connection,
+    input: &Value,
+    user_id: Option<i64>,
+    ledger_binding: Option<(&str, &str, &str)>,
+) -> ApiResult {
     let uid = require_user(conn, user_id)?;
     require_can(conn, uid, "editItems")?;
     let id = i64v(input, "id").ok_or_else(|| ApiError::bad("id"))?;
@@ -1937,19 +1946,27 @@ fn items_update_atomic(conn: &Connection, input: &Value, user_id: Option<i64>) -
             name.unwrap_or_else(|| "не указан".into())
         ));
     }
-    ledger::append(
+    let (event_type, from_label, to_label) = ledger_binding
+        .map_or(("update", None, None), |(kind, from, to)| {
+            (kind, Some(from), Some(to))
+        });
+    let event = ledger::append(
         conn,
         ws,
         uid,
         Some(id),
-        "update",
-        None,
-        None,
+        event_type,
+        from_label,
+        to_label,
         None,
         Some(&note),
     )
     .map_err(|e| ApiError::internal(format!("Ошибка журнала: {e}")))?;
-    jsn::item_json(conn, id, true).ok_or_else(|| ApiError::not_found("нет"))
+    let mut item = jsn::item_json(conn, id, true).ok_or_else(|| ApiError::not_found("нет"))?;
+    if let Some(object) = item.as_object_mut() {
+        object.insert("ledgerHash".into(), event["opId"].clone());
+    }
+    Ok(item)
 }
 
 fn items_remove(conn: &mut Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
@@ -4974,16 +4991,103 @@ fn resolve_fault_atomic(conn: &Connection, input: &Value, user_id: Option<i64>) 
 }
 
 fn request_change(conn: &mut Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
+    atomic(conn, |conn| request_change_atomic(conn, input, user_id))
+}
+
+fn request_change_atomic(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
     let uid = require_user(conn, user_id)?;
     let item_id = i64v(input, "itemId").ok_or_else(|| ApiError::bad("itemId"))?;
     let ws = require_item_access(conn, uid, item_id)?;
     require_can_in_workspace(conn, uid, ws, "requestChanges")?;
-    let payload = input.get("payload").cloned().unwrap_or(json!({}));
+    let payload = input
+        .get("payload")
+        .filter(|v| v.is_object())
+        .cloned()
+        .ok_or_else(|| ApiError::bad("payload должен быть объектом"))?;
+    if payload.as_object().is_none_or(|o| o.is_empty()) {
+        return Err(ApiError::bad("Заявка не содержит изменений"));
+    }
+    if payload.to_string().len() > 64 * 1024 {
+        return Err(ApiError::bad("Заявка превышает 64 КиБ"));
+    }
+    if payload.as_object().is_some_and(|o| {
+        o.keys().any(|key| {
+            !CHANGEABLE_FIELDS
+                .iter()
+                .any(|(allowed, _, _)| allowed == key)
+        })
+    }) {
+        return Err(ApiError::bad("Заявка содержит запрещённое поле"));
+    }
+    let comment = s(input, "comment");
+    if comment
+        .as_deref()
+        .is_some_and(|v| v.chars().count() > 4_000)
+    {
+        return Err(ApiError::bad("Комментарий длиннее 4000 символов"));
+    }
+    let item = jsn::item_json(conn, item_id, false)
+        .ok_or_else(|| ApiError::not_found("Инструмент не найден"))?;
+    let patch = portable_change_fields(conn, ws, &payload)?;
+    let before_source = Value::Object(
+        payload
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(|key| (key.clone(), item.get(key).cloned().unwrap_or(Value::Null)))
+            .collect(),
+    );
+    let before = portable_change_fields(conn, ws, &before_source)?;
+    let guid = Uuid::new_v4().to_string();
+    let created_at = now();
+    let workspace_guid =
+        ledger::guid(conn, "workspaces", ws).map_err(|e| ApiError::internal(e.to_string()))?;
+    let item_guid =
+        ledger::guid(conn, "items", item_id).map_err(|e| ApiError::internal(e.to_string()))?;
+    let requester_guid =
+        ledger::guid(conn, "users", uid).map_err(|e| ApiError::internal(e.to_string()))?;
+    let patch_json =
+        serde_json::to_string(&patch).map_err(|e| ApiError::internal(e.to_string()))?;
+    let before_json =
+        serde_json::to_string(&before).map_err(|e| ApiError::internal(e.to_string()))?;
+    let payload_hash = change_record_payload_hash(
+        &guid,
+        None,
+        0,
+        &workspace_guid,
+        &item_guid,
+        &requester_guid,
+        &requester_guid,
+        &patch_json,
+        &before_json,
+        comment.as_deref(),
+        "pending",
+        None,
+        &created_at,
+    );
+    let event = ledger::append(
+        conn,
+        ws,
+        uid,
+        Some(item_id),
+        "change_request",
+        Some(&guid),
+        Some(&payload_hash),
+        None,
+        comment.as_deref().or(Some("Заявка на изменение карточки")),
+    )
+    .map_err(|e| ApiError::internal(format!("Ошибка журнала: {e}")))?;
+    let ledger_hash = event["opId"]
+        .as_str()
+        .ok_or_else(|| ApiError::internal("Ledger не вернул hash"))?;
+    let record_hash = change_record_hash(&payload_hash, ledger_hash);
     conn.execute(
-        "INSERT INTO change_requests (item_id, workspace_id, author_id, payload, comment, created_at) VALUES (?1,?2,?3,?4,?5,?6)",
-        params![item_id, ws, uid, payload.to_string(), s(input, "comment"), now()],
+        "INSERT INTO change_requests(item_id,workspace_id,author_id,payload,comment,created_at,guid) VALUES(?1,?2,?3,?4,?5,?6,?7)",
+        params![item_id,ws,uid,payload.to_string(),comment,created_at,guid],
     )?;
     let rid = conn.last_insert_rowid();
+    conn.execute("INSERT INTO change_request_records(record_hash,request_guid,parent_hash,depth,workspace_guid,item_guid,requester_guid,actor_guid,patch_json,before_json,comment,status,reason,payload_hash,ledger_hash,created_at)
+        VALUES(?1,?2,NULL,0,?3,?4,?5,?5,?6,?7,?8,'pending',NULL,?9,?10,?11)",params![record_hash,guid,workspace_guid,item_guid,requester_guid,patch_json,before_json,comment,payload_hash,ledger_hash,created_at])?;
     notify_admins(
         conn,
         ws,
@@ -4993,7 +5097,9 @@ fn request_change(conn: &mut Connection, input: &Value, user_id: Option<i64>) ->
             .as_deref()
             .unwrap_or("Изменение карточки"),
     );
-    Ok(json!({"id": rid, "status": "pending"}))
+    Ok(
+        json!({"id":rid,"guid":guid,"recordHash":record_hash,"ledgerHash":ledger_hash,"status":"pending"}),
+    )
 }
 
 /// Человекочитаемое имя записи справочника. Для пользователей это ФИО,
@@ -5029,6 +5135,90 @@ const CHANGEABLE_FIELDS: [(&str, &str, Option<&str>); 13] = [
     ("calibratedUntil", "Поверка до", None),
     ("minQuantity", "Мин. остаток", None),
 ];
+
+fn portable_change_fields(conn: &Connection, ws: i64, source: &Value) -> Result<Value, ApiError> {
+    let mut result = serde_json::Map::new();
+    for (key, _, dictionary) in CHANGEABLE_FIELDS {
+        let Some(value) = source.get(key) else {
+            continue;
+        };
+        if value.is_null() {
+            result.insert(key.into(), Value::Null);
+            continue;
+        }
+        let portable = match dictionary {
+            None => value.clone(),
+            Some("users") => {
+                let id = value
+                    .as_i64()
+                    .ok_or_else(|| ApiError::bad(format!("{key}: ожидается ID")))?;
+                let guid:String=conn.query_row("SELECT u.guid FROM users u JOIN user_workspaces uw ON uw.user_id=u.id WHERE u.id=?1 AND uw.workspace_id=?2",params![id,ws],|r|r.get(0)).map_err(|_|ApiError::bad(format!("{key}: пользователь не найден")))?;
+                json!({"$ref":"user","guid":guid})
+            }
+            Some("statuses") => {
+                let id = value
+                    .as_i64()
+                    .ok_or_else(|| ApiError::bad(format!("{key}: ожидается ID")))?;
+                let (slug, name): (String, String) = conn
+                    .query_row(
+                        "SELECT slug,name FROM statuses WHERE id=?1 AND workspace_id=?2",
+                        params![id, ws],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .map_err(|_| ApiError::bad(format!("{key}: статус не найден")))?;
+                json!({"$ref":"status","slug":slug,"name":name})
+            }
+            Some(table) => {
+                let id = value
+                    .as_i64()
+                    .ok_or_else(|| ApiError::bad(format!("{key}: ожидается ID")))?;
+                let sql = format!("SELECT name FROM {table} WHERE id=?1 AND workspace_id=?2");
+                let name: String = conn
+                    .query_row(&sql, params![id, ws], |r| r.get(0))
+                    .map_err(|_| ApiError::bad(format!("{key}: справочник не найден")))?;
+                json!({"$ref":table,"name":name})
+            }
+        };
+        result.insert(key.into(), portable);
+    }
+    Ok(Value::Object(result))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn change_record_payload_hash(
+    request_guid: &str,
+    parent_hash: Option<&str>,
+    depth: i64,
+    workspace_guid: &str,
+    item_guid: &str,
+    requester_guid: &str,
+    actor_guid: &str,
+    patch_json: &str,
+    before_json: &str,
+    comment: Option<&str>,
+    status: &str,
+    reason: Option<&str>,
+    created_at: &str,
+) -> String {
+    let payload = json!({"domain":"everyday/change-request-record/v1","requestGuid":request_guid,"parentHash":parent_hash,"depth":depth,
+        "workspaceGuid":workspace_guid,"itemGuid":item_guid,"requesterGuid":requester_guid,"actorGuid":actor_guid,
+        "patch":serde_json::from_str::<Value>(patch_json).unwrap_or(Value::Null),"before":serde_json::from_str::<Value>(before_json).unwrap_or(Value::Null),
+        "comment":comment,"status":status,"reason":reason,"createdAt":created_at});
+    format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&payload).expect("JSON serialization"))
+    )
+}
+
+fn change_record_hash(payload_hash: &str, ledger_hash: &str) -> String {
+    format!(
+        "{:x}",
+        Sha256::digest(
+            format!("everyday/change-request-record-ledger/v1\n{payload_hash}\n{ledger_hash}")
+                .as_bytes()
+        )
+    )
+}
 
 /// Приводит значение поля к строке для показа администратору.
 fn display_value(conn: &Connection, raw: &Value, dictionary: Option<&str>) -> Option<String> {
@@ -5077,7 +5267,7 @@ fn describe_change(conn: &Connection, item_id: i64, payload: &Value) -> Value {
 
 fn list_changes(conn: &Connection, input: &Value) -> ApiResult {
     let ws = i64v(input, "workspaceId").unwrap_or_else(|| ws_fallback(conn));
-    let mut stmt = conn.prepare("SELECT id, item_id, workspace_id, author_id, payload, comment, status, reason, decided_by, created_at, decided_at FROM change_requests WHERE workspace_id=?1 ORDER BY id DESC LIMIT 200")?;
+    let mut stmt = conn.prepare("SELECT id,item_id,workspace_id,author_id,payload,comment,status,reason,decided_by,created_at,decided_at,guid FROM change_requests WHERE workspace_id=?1 ORDER BY id DESC LIMIT 200")?;
     let rows: Vec<Value> = stmt.query_map(params![ws], |r| {
         let author: i64 = r.get(3)?;
         let payload: String = r.get(4)?;
@@ -5087,6 +5277,7 @@ fn list_changes(conn: &Connection, input: &Value) -> ApiResult {
             "comment": r.get::<_, Option<String>>(5)?, "status": r.get::<_, String>(6)?,
             "reason": r.get::<_, Option<String>>(7)?, "decidedBy": r.get::<_, Option<i64>>(8)?,
             "createdAt": r.get::<_, String>(9)?, "decidedAt": r.get::<_, Option<String>>(10)?,
+            "guid":r.get::<_,Option<String>>(11)?,
             "author": jsn::user_public(conn, author),
             "item": jsn::item_json(conn, r.get(1)?, false),
             "changes": describe_change(conn, r.get(1)?, &serde_json::from_str::<Value>(&payload).unwrap_or(json!({})))
@@ -5102,11 +5293,11 @@ fn decide_change(conn: &mut Connection, input: &Value, user_id: Option<i64>) -> 
 fn decide_change_atomic(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
     let uid = require_user(conn, user_id)?;
     let id = i64v(input, "id").ok_or_else(|| ApiError::bad("id"))?;
-    let (item_id, ws, payload, request_comment): (i64, i64, String, Option<String>) = conn
+    let (item_id,ws,payload,request_comment,requester_id,stored_guid):(i64,i64,String,Option<String>,i64,Option<String>)=conn
         .query_row(
-            "SELECT item_id, workspace_id, payload, comment FROM change_requests WHERE id=?1",
+            "SELECT item_id,workspace_id,payload,comment,author_id,guid FROM change_requests WHERE id=?1",
             params![id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?)),
         )
         .optional()?
         .ok_or_else(|| ApiError::not_found("Заявка не найдена"))?;
@@ -5122,28 +5313,131 @@ fn decide_change_atomic(conn: &Connection, input: &Value, user_id: Option<i64>) 
     }
     let accept = b(input, "accept").unwrap_or(false);
     let status = if accept { "accepted" } else { "rejected" };
-    if accept {
+    let guid = stored_guid
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    conn.execute(
+        "UPDATE change_requests SET guid=?1 WHERE id=?2 AND (guid IS NULL OR guid='')",
+        params![guid, id],
+    )?;
+    let existing:Option<(String,i64,String,String,String,Option<String>)>=conn.query_row("SELECT record_hash,depth,patch_json,before_json,requester_guid,comment FROM change_request_records WHERE request_guid=?1 ORDER BY depth DESC,record_hash DESC LIMIT 1",[&guid],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?))).optional()?;
+    let raw_payload = serde_json::from_str::<Value>(&payload)
+        .map_err(|_| ApiError::bad("Заявка содержит некорректные данные"))?;
+    let (parent_hash, depth, patch_json, before_json, requester_guid, root_comment, event_type) =
+        if let Some((parent, depth, patch, before, requester, comment)) = existing {
+            (
+                Some(parent),
+                depth + 1,
+                patch,
+                before,
+                requester,
+                comment,
+                "change_decision",
+            )
+        } else {
+            let item = jsn::item_json(conn, item_id, false)
+                .ok_or_else(|| ApiError::not_found("Инструмент не найден"))?;
+            let before_source = Value::Object(
+                raw_payload
+                    .as_object()
+                    .ok_or_else(|| ApiError::bad("payload должен быть объектом"))?
+                    .keys()
+                    .map(|key| (key.clone(), item.get(key).cloned().unwrap_or(Value::Null)))
+                    .collect(),
+            );
+            let patch = portable_change_fields(conn, ws, &raw_payload)?;
+            let before = portable_change_fields(conn, ws, &before_source)?;
+            let requester = ledger::guid(conn, "users", requester_id)
+                .map_err(|e| ApiError::internal(e.to_string()))?;
+            (
+                None,
+                0,
+                patch.to_string(),
+                before.to_string(),
+                requester,
+                request_comment.clone(),
+                "change_adopt",
+            )
+        };
+    let created_at = now();
+    let reason = s(input, "reason");
+    if reason.as_deref().is_some_and(|v| v.chars().count() > 4_000) {
+        return Err(ApiError::bad("Причина длиннее 4000 символов"));
+    }
+    let workspace_guid =
+        ledger::guid(conn, "workspaces", ws).map_err(|e| ApiError::internal(e.to_string()))?;
+    let item_guid =
+        ledger::guid(conn, "items", item_id).map_err(|e| ApiError::internal(e.to_string()))?;
+    let actor_guid =
+        ledger::guid(conn, "users", uid).map_err(|e| ApiError::internal(e.to_string()))?;
+    let payload_hash = change_record_payload_hash(
+        &guid,
+        parent_hash.as_deref(),
+        depth,
+        &workspace_guid,
+        &item_guid,
+        &requester_guid,
+        &actor_guid,
+        &patch_json,
+        &before_json,
+        root_comment.as_deref(),
+        status,
+        reason.as_deref(),
+        &created_at,
+    );
+    let ledger_hash = if accept {
         // Правку применяем ДО отметки «принято»: если она не проходит проверки
         // (например, смена статуса без причины), заявка остаётся в работе,
         // а не «принятой», но не применённой.
-        let mut patch = serde_json::from_str::<Value>(&payload)
-            .map_err(|_| ApiError::bad("Заявка содержит некорректные данные"))?;
+        let mut patch = raw_payload;
         if let Value::Object(ref mut o) = patch {
             o.insert("id".into(), json!(item_id));
             if !o.contains_key("reason") {
-                let reason = s(input, "reason")
+                let reason = reason
+                    .clone()
                     .or(request_comment)
                     .unwrap_or_else(|| "Принята заявка на правку".into());
                 o.insert("reason".into(), json!(reason));
             }
         }
-        items_update_atomic(conn, &patch, Some(uid))?;
-    }
+        let updated = items_update_atomic_bound(
+            conn,
+            &patch,
+            Some(uid),
+            Some((event_type, &guid, &payload_hash)),
+        )?;
+        updated["ledgerHash"]
+            .as_str()
+            .ok_or_else(|| ApiError::internal("Ledger не вернул hash"))?
+            .to_string()
+    } else {
+        let event = ledger::append(
+            conn,
+            ws,
+            uid,
+            Some(item_id),
+            event_type,
+            Some(&guid),
+            Some(&payload_hash),
+            None,
+            reason.as_deref().or(Some("Заявка отклонена")),
+        )
+        .map_err(|e| ApiError::internal(format!("Ошибка журнала: {e}")))?;
+        event["opId"]
+            .as_str()
+            .ok_or_else(|| ApiError::internal("Ledger не вернул hash"))?
+            .to_string()
+    };
+    let record_hash = change_record_hash(&payload_hash, &ledger_hash);
+    conn.execute("INSERT INTO change_request_records(record_hash,request_guid,parent_hash,depth,workspace_guid,item_guid,requester_guid,actor_guid,patch_json,before_json,comment,status,reason,payload_hash,ledger_hash,created_at)
+        VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",params![record_hash,guid,parent_hash,depth,workspace_guid,item_guid,requester_guid,actor_guid,patch_json,before_json,root_comment,status,reason,payload_hash,ledger_hash,created_at])?;
     conn.execute(
         "UPDATE change_requests SET status=?1, reason=?2, decided_by=?3, decided_at=?4 WHERE id=?5 AND status='pending'",
-        params![status, s(input, "reason"), uid, now(), id],
+        params![status,reason,uid,created_at,id],
     )?;
-    Ok(json!({"ok": true, "id": id, "itemId": item_id, "status": status}))
+    Ok(
+        json!({"ok":true,"id":id,"guid":guid,"recordHash":record_hash,"ledgerHash":ledger_hash,"itemId":item_id,"status":status}),
+    )
 }
 
 fn chat_list(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
@@ -6295,6 +6589,8 @@ mod tests {
             )
             .unwrap();
         assert_eq!(status_id, Some(written_off));
+        let adopted:String=conn.query_row("SELECT h.type FROM change_request_records r JOIN history_entries h ON h.hash=r.ledger_hash WHERE r.request_guid=(SELECT guid FROM change_requests WHERE id=?1)",[change_id],|r|r.get(0)).unwrap();
+        assert_eq!(adopted, "change_adopt");
 
         // Повторное решение по той же заявке отклоняется.
         let again = dispatch(

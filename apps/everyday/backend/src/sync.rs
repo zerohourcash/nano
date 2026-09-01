@@ -119,6 +119,38 @@ fn fault_record_hash(payload_hash: &str, ledger_hash: &str) -> String {
     )
 }
 
+fn change_payload_hash(record: &Value) -> anyhow::Result<String> {
+    let get = |name: &str| {
+        record
+            .get(name)
+            .and_then(Value::as_str)
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("change record has no {name}"))
+    };
+    let payload = json!({"domain":"everyday/change-request-record/v1","requestGuid":get("requestGuid")?,
+        "parentHash":record.get("parentHash").filter(|v|!v.is_null()).and_then(Value::as_str),
+        "depth":record.get("depth").and_then(Value::as_i64).ok_or_else(||anyhow::anyhow!("change depth missing"))?,
+        "workspaceGuid":get("workspaceGuid")?,"itemGuid":get("itemGuid")?,"requesterGuid":get("requesterGuid")?,"actorGuid":get("actorGuid")?,
+        "patch":record.get("patch").filter(|v|v.is_object()).ok_or_else(||anyhow::anyhow!("change patch missing"))?,
+        "before":record.get("before").filter(|v|v.is_object()).ok_or_else(||anyhow::anyhow!("change before missing"))?,
+        "comment":record.get("comment").filter(|v|!v.is_null()).and_then(Value::as_str),"status":get("status")?,
+        "reason":record.get("reason").filter(|v|!v.is_null()).and_then(Value::as_str),"createdAt":get("createdAt")?});
+    Ok(format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&payload)?)
+    ))
+}
+
+fn change_record_hash(payload_hash: &str, ledger_hash: &str) -> String {
+    format!(
+        "{:x}",
+        Sha256::digest(
+            format!("everyday/change-request-record-ledger/v1\n{payload_hash}\n{ledger_hash}")
+                .as_bytes()
+        )
+    )
+}
+
 fn next_journal_sequence(conn: &Connection) -> u64 {
     let next = kv_get(conn, "sync_journal_sequence")
         .and_then(|value| value.parse::<u64>().ok())
@@ -841,6 +873,16 @@ pub fn export_journal_since(conn: &Connection, recipient_frontier: Option<&Value
             "resolution":r.get::<_,Option<String>>(12)?,"payloadHash":r.get::<_,String>(13)?,"ledgerHash":r.get::<_,String>(14)?,"createdAt":r.get::<_,String>(15)?,
         }))) { faults.extend(rows.flatten()); }
     }
+    let mut change_requests = Vec::new();
+    if let Ok(mut statement)=conn.prepare("SELECT record_hash,request_guid,parent_hash,depth,workspace_guid,item_guid,requester_guid,actor_guid,patch_json,before_json,comment,status,reason,payload_hash,ledger_hash,created_at FROM change_request_records ORDER BY request_guid,depth,record_hash") {
+        if let Ok(rows)=statement.query_map([],|r|{
+            let patch:String=r.get(8)?; let before:String=r.get(9)?;
+            Ok(json!({"recordHash":r.get::<_,String>(0)?,"requestGuid":r.get::<_,String>(1)?,"parentHash":r.get::<_,Option<String>>(2)?,"depth":r.get::<_,i64>(3)?,
+                "workspaceGuid":r.get::<_,String>(4)?,"itemGuid":r.get::<_,String>(5)?,"requesterGuid":r.get::<_,String>(6)?,"actorGuid":r.get::<_,String>(7)?,
+                "patch":serde_json::from_str::<Value>(&patch).unwrap_or(Value::Null),"before":serde_json::from_str::<Value>(&before).unwrap_or(Value::Null),
+                "comment":r.get::<_,Option<String>>(10)?,"status":r.get::<_,String>(11)?,"reason":r.get::<_,Option<String>>(12)?,"payloadHash":r.get::<_,String>(13)?,"ledgerHash":r.get::<_,String>(14)?,"createdAt":r.get::<_,String>(15)?}))
+        }) { change_requests.extend(rows.flatten()); }
+    }
     let mut messages = Vec::new();
     if let Ok(mut stmt) = conn.prepare(
         "SELECT guid,workspace_id,user_id,text,ledger_hash,created_at
@@ -920,6 +962,7 @@ pub fn export_journal_since(conn: &Connection, recipient_frontier: Option<&Value
         "itemTombstoneMode": "monotonic/v1",
         "itemCommentMode": "ledger-records/v1",
         "faultMode": "append-only-branches/v1",
+        "changeRequestMode":"portable-branches/v1",
         "historyMode": if recipient_frontier.is_some() { "delta" } else { "full" },
         "frontier": frontier(conn),
         "workspaces": workspaces,
@@ -934,6 +977,7 @@ pub fn export_journal_since(conn: &Connection, recipient_frontier: Option<&Value
         "itemTombstones": item_tombstones,
         "itemComments": item_comments,
         "faults": faults,
+        "changeRequests":change_requests,
         "messages": messages,
         "photos": photos,
         "documents": documents,
@@ -1001,6 +1045,7 @@ fn filter_journal_scope(journal: &mut Value, allowed: &HashSet<String>) {
         "itemTombstones",
         "itemComments",
         "faults",
+        "changeRequests",
         "messages",
         "frontier",
     ] {
@@ -1661,6 +1706,142 @@ fn rebuild_fault_state(conn: &Connection) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn local_change_fields(conn: &Connection, ws: i64, portable: &Value) -> anyhow::Result<Value> {
+    let mut local = serde_json::Map::new();
+    for (key, value) in portable
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("portable patch is not object"))?
+    {
+        if value.is_null() || !value.is_object() {
+            local.insert(key.clone(), value.clone());
+            continue;
+        }
+        let kind = value
+            .get("$ref")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("portable reference has no type"))?;
+        let id = match kind {
+            "user" => value
+                .get("guid")
+                .and_then(Value::as_str)
+                .and_then(|g| id_by_guid(conn, "users", g))
+                .ok_or_else(|| anyhow::anyhow!("change user unavailable"))?,
+            "status" => {
+                let slug = value
+                    .get("slug")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("change status has no slug"))?;
+                if let Some(id) = status_id(conn, ws, slug) {
+                    id
+                } else {
+                    let name = value.get("name").and_then(Value::as_str).unwrap_or(slug);
+                    conn.execute("INSERT INTO statuses(name,workspace_id,type,slug,color,bg) VALUES(?1,?2,'status',?3,'#5E629B','#EDEDF7')",params![name,ws,slug])?;
+                    conn.last_insert_rowid()
+                }
+            }
+            table @ ("categories" | "brands" | "building_sites" | "storages") => {
+                let name = value
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("change dictionary reference has no name"))?;
+                let sql = format!(
+                    "SELECT id FROM {table} WHERE workspace_id=?1 AND name=?2 ORDER BY id LIMIT 1"
+                );
+                if let Some(id) = conn
+                    .query_row(&sql, params![ws, name], |r| r.get(0))
+                    .optional()?
+                {
+                    id
+                } else {
+                    let insert = format!("INSERT INTO {table}(name,workspace_id) VALUES(?1,?2)");
+                    conn.execute(&insert, params![name, ws])?;
+                    conn.last_insert_rowid()
+                }
+            }
+            _ => anyhow::bail!("unsupported portable reference"),
+        };
+        local.insert(key.clone(), json!(id));
+    }
+    Ok(Value::Object(local))
+}
+
+fn apply_change_fields(conn: &Connection, item: i64, patch: &Value) -> anyhow::Result<()> {
+    conn.execute("UPDATE items SET title=CASE WHEN ?2 THEN ?3 ELSE title END,category_id=CASE WHEN ?4 THEN ?5 ELSE category_id END,brand_id=CASE WHEN ?6 THEN ?7 ELSE brand_id END,status_id=CASE WHEN ?8 THEN ?9 ELSE status_id END,responsible_user_id=CASE WHEN ?10 THEN ?11 ELSE responsible_user_id END,building_site_id=CASE WHEN ?12 THEN ?13 ELSE building_site_id END,storage_id=CASE WHEN ?14 THEN ?15 ELSE storage_id END,serial_number=CASE WHEN ?16 THEN ?17 ELSE serial_number END,cost=CASE WHEN ?18 THEN ?19 ELSE cost END,comment=CASE WHEN ?20 THEN ?21 ELSE comment END,qr_code=CASE WHEN ?22 THEN ?23 ELSE qr_code END,calibrated_until=CASE WHEN ?24 THEN ?25 ELSE calibrated_until END,min_quantity=CASE WHEN ?26 THEN ?27 ELSE min_quantity END WHERE id=?1",params![
+        item,patch.get("title").is_some(),patch.get("title").and_then(Value::as_str),patch.get("categoryId").is_some(),patch.get("categoryId").and_then(Value::as_i64),
+        patch.get("brandId").is_some(),patch.get("brandId").and_then(Value::as_i64),patch.get("statusId").is_some(),patch.get("statusId").and_then(Value::as_i64),
+        patch.get("responsibleUserId").is_some(),patch.get("responsibleUserId").and_then(Value::as_i64),patch.get("buildingSiteId").is_some(),patch.get("buildingSiteId").and_then(Value::as_i64),
+        patch.get("storageId").is_some(),patch.get("storageId").and_then(Value::as_i64),patch.get("serialNumber").is_some(),patch.get("serialNumber").and_then(Value::as_str),
+        patch.get("cost").is_some(),patch.get("cost").and_then(Value::as_f64),patch.get("comment").is_some(),patch.get("comment").and_then(Value::as_str),
+        patch.get("qrCode").is_some(),patch.get("qrCode").and_then(Value::as_str),patch.get("calibratedUntil").is_some(),patch.get("calibratedUntil").and_then(Value::as_str),
+        patch.get("minQuantity").is_some(),patch.get("minQuantity").and_then(Value::as_f64)])?;
+    Ok(())
+}
+
+fn rebuild_change_requests(conn: &Connection) -> anyhow::Result<()> {
+    let mut statement=conn.prepare("SELECT r.request_guid,r.item_guid,r.workspace_guid,r.requester_guid,r.actor_guid,r.patch_json,r.before_json,r.comment,r.status,r.reason,r.created_at,r.depth,(SELECT created_at FROM change_request_records root WHERE root.request_guid=r.request_guid AND root.depth=0 ORDER BY root.record_hash LIMIT 1) FROM change_request_records r WHERE r.record_hash=(SELECT record_hash FROM change_request_records w WHERE w.request_guid=r.request_guid ORDER BY depth DESC,record_hash DESC LIMIT 1) ORDER BY r.created_at,r.record_hash")?;
+    let rows = statement
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, String>(5)?,
+                r.get::<_, String>(6)?,
+                r.get::<_, Option<String>>(7)?,
+                r.get::<_, String>(8)?,
+                r.get::<_, Option<String>>(9)?,
+                r.get::<_, String>(10)?,
+                r.get::<_, i64>(11)?,
+                r.get::<_, String>(12)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    for (
+        guid,
+        item_g,
+        ws_g,
+        requester_g,
+        actor_g,
+        patch_json,
+        before_json,
+        comment,
+        status,
+        reason,
+        updated,
+        depth,
+        created,
+    ) in rows
+    {
+        let item = id_by_guid(conn, "items", &item_g)
+            .ok_or_else(|| anyhow::anyhow!("change item unavailable"))?;
+        let ws = id_by_guid(conn, "workspaces", &ws_g)
+            .ok_or_else(|| anyhow::anyhow!("change workspace unavailable"))?;
+        let requester = id_by_guid(conn, "users", &requester_g)
+            .ok_or_else(|| anyhow::anyhow!("change requester unavailable"))?;
+        let actor = id_by_guid(conn, "users", &actor_g)
+            .ok_or_else(|| anyhow::anyhow!("change actor unavailable"))?;
+        let portable_patch: Value = serde_json::from_str(&patch_json)?;
+        let portable_before: Value = serde_json::from_str(&before_json)?;
+        let local_patch = local_change_fields(conn, ws, &portable_patch)?;
+        conn.execute("INSERT OR IGNORE INTO change_requests(item_id,workspace_id,author_id,payload,comment,status,reason,decided_by,created_at,decided_at,guid) VALUES(?1,?2,?3,?4,?5,?6,?7,CASE WHEN ?6='pending' THEN NULL ELSE ?8 END,?9,CASE WHEN ?6='pending' THEN NULL ELSE ?10 END,?11)",params![item,ws,requester,local_patch.to_string(),comment,status,reason,actor,created,updated,guid])?;
+        conn.execute("UPDATE change_requests SET item_id=?1,workspace_id=?2,author_id=?3,payload=?4,comment=?5,status=?6,reason=?7,decided_by=CASE WHEN ?6='pending' THEN NULL ELSE ?8 END,decided_at=CASE WHEN ?6='pending' THEN NULL ELSE ?9 END WHERE guid=?10",params![item,ws,requester,local_patch.to_string(),comment,status,reason,actor,updated,guid])?;
+        if depth > 0 {
+            let newer_direct:i64=conn.query_row("SELECT count(*) FROM history_entries WHERE item_id=?1 AND type='update' AND created_at>?2",params![item,updated],|r|r.get(0))?;
+            if newer_direct == 0 {
+                let chosen = if status == "accepted" {
+                    local_patch
+                } else {
+                    local_change_fields(conn, ws, &portable_before)?
+                };
+                apply_change_fields(conn, item, &chosen)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn import_journal(conn: &Connection, journal: &Value) -> Value {
     let mut workspaces = 0u32;
     let mut users = 0u32;
@@ -2210,6 +2391,23 @@ pub fn import_journal(conn: &Connection, journal: &Value) -> Value {
             return json!({"ok":false,"error":format!("Не удалось восстановить неисправности: {error}")});
         }
     }
+    if let Some(records) = journal.get("changeRequests").and_then(Value::as_array) {
+        for record in records {
+            let inserted=conn.execute("INSERT OR IGNORE INTO change_request_records(record_hash,request_guid,parent_hash,depth,workspace_guid,item_guid,requester_guid,actor_guid,patch_json,before_json,comment,status,reason,payload_hash,ledger_hash,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",params![
+                record.get("recordHash").and_then(Value::as_str),record.get("requestGuid").and_then(Value::as_str),record.get("parentHash").and_then(Value::as_str),record.get("depth").and_then(Value::as_i64),
+                record.get("workspaceGuid").and_then(Value::as_str),record.get("itemGuid").and_then(Value::as_str),record.get("requesterGuid").and_then(Value::as_str),record.get("actorGuid").and_then(Value::as_str),
+                record.get("patch").map(Value::to_string),record.get("before").map(Value::to_string),record.get("comment").and_then(Value::as_str),record.get("status").and_then(Value::as_str),
+                record.get("reason").and_then(Value::as_str),record.get("payloadHash").and_then(Value::as_str),record.get("ledgerHash").and_then(Value::as_str),record.get("createdAt").and_then(Value::as_str)]).unwrap_or(0);
+            if inserted > 0 {
+                ops += 1
+            } else {
+                skipped += 1
+            }
+        }
+        if let Err(error) = rebuild_change_requests(conn) {
+            return json!({"ok":false,"error":format!("Не удалось восстановить заявки: {error}")});
+        }
+    }
     if let Some(arr) = journal.get("messages").and_then(Value::as_array) {
         for message in arr {
             let guid = message.get("guid").and_then(Value::as_str).unwrap_or("");
@@ -2631,6 +2829,9 @@ pub fn apply_remote_journal(conn: &Connection, journal: &Value, peer_url: &str) 
     if let Err(error) = verify_fault_records(conn, journal) {
         return json!({"ok":false,"error":format!("Проверка летописи неисправностей: {error}")});
     }
+    if let Err(error) = verify_change_records(conn, journal) {
+        return json!({"ok":false,"error":format!("Проверка заявок на изменение: {error}")});
+    }
     if let Err(error) = crate::accounting::verify_journal_links(conn, journal) {
         return json!({"ok":false,"error":format!("Проверка Bit-летописи: {error}")});
     }
@@ -2693,6 +2894,10 @@ pub fn apply_remote_journal(conn: &Connection, journal: &Value, peer_url: &str) 
     if let Err(error) = verify_stored_fault_records(conn) {
         let _ = conn.execute_batch("ROLLBACK TO verified_sync; RELEASE verified_sync");
         return json!({"ok":false,"error":format!("Проверка сохранённой летописи неисправностей: {error}")});
+    }
+    if let Err(error) = verify_stored_change_records(conn) {
+        let _ = conn.execute_batch("ROLLBACK TO verified_sync; RELEASE verified_sync");
+        return json!({"ok":false,"error":format!("Проверка сохранённых заявок на изменение: {error}")});
     }
     if let Err(error) = ledger::verify_chat_links(conn) {
         let _ = conn.execute_batch("ROLLBACK TO verified_sync; RELEASE verified_sync");
@@ -3374,6 +3579,174 @@ fn verify_membership_records(conn: &Connection, journal: &Value) -> anyhow::Resu
         }
     }
     Ok(())
+}
+
+fn valid_portable_change(value: &Value) -> bool {
+    let allowed = [
+        "title",
+        "categoryId",
+        "brandId",
+        "statusId",
+        "responsibleUserId",
+        "buildingSiteId",
+        "storageId",
+        "serialNumber",
+        "cost",
+        "comment",
+        "qrCode",
+        "calibratedUntil",
+        "minQuantity",
+    ];
+    value.as_object().is_some_and(|object| {
+        !object.is_empty()
+            && object.iter().all(|(key, value)| {
+                allowed.contains(&key.as_str())
+                    && (value.is_null()
+                        || !value.is_object()
+                        || value
+                            .get("$ref")
+                            .and_then(Value::as_str)
+                            .is_some_and(|kind| {
+                                matches!(
+                                    kind,
+                                    "user"
+                                        | "status"
+                                        | "categories"
+                                        | "brands"
+                                        | "building_sites"
+                                        | "storages"
+                                )
+                            }))
+            })
+    })
+}
+
+fn verify_change_records(conn: &Connection, journal: &Value) -> anyhow::Result<()> {
+    if journal.get("changeRequestMode").and_then(Value::as_str) != Some("portable-branches/v1") {
+        anyhow::bail!("journal does not provide portable change requests");
+    }
+    let records = journal
+        .get("changeRequests")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("journal has no change request array"))?;
+    let by_hash: HashMap<&str, &Value> = records
+        .iter()
+        .filter_map(|r| r.get("recordHash").and_then(Value::as_str).map(|h| (h, r)))
+        .collect();
+    if by_hash.len() != records.len() {
+        anyhow::bail!("duplicate change request record");
+    }
+    let history: HashMap<&str, &Value> = journal
+        .get("history")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.get("opId").and_then(Value::as_str).map(|h| (h, e)))
+        .collect();
+    for record in records {
+        let get = |name: &str| {
+            record
+                .get(name)
+                .and_then(Value::as_str)
+                .filter(|v| !v.is_empty())
+                .ok_or_else(|| anyhow::anyhow!("change record has no {name}"))
+        };
+        let hash = get("recordHash")?;
+        let ledger_hash = get("ledgerHash")?;
+        let payload_hash = get("payloadHash")?;
+        let request = get("requestGuid")?;
+        let workspace = get("workspaceGuid")?;
+        let item = get("itemGuid")?;
+        let actor = get("actorGuid")?;
+        let requester = get("requesterGuid")?;
+        let depth = record
+            .get("depth")
+            .and_then(Value::as_i64)
+            .ok_or_else(|| anyhow::anyhow!("change depth missing"))?;
+        let status = get("status")?;
+        if !matches!(status, "pending" | "accepted" | "rejected")
+            || !valid_portable_change(&record["patch"])
+            || !valid_portable_change(&record["before"])
+        {
+            anyhow::bail!("invalid portable change fields");
+        }
+        if change_payload_hash(record)? != payload_hash
+            || change_record_hash(payload_hash, ledger_hash) != hash
+        {
+            anyhow::bail!("change request hash mismatch");
+        }
+        let parent = record.get("parentHash").and_then(Value::as_str);
+        if depth == 0 {
+            if parent.is_some() {
+                anyhow::bail!("change root has parent");
+            }
+        } else {
+            let p = parent
+                .and_then(|h| by_hash.get(h).copied())
+                .ok_or_else(|| anyhow::anyhow!("change parent unavailable"))?;
+            if p.get("depth").and_then(Value::as_i64) != Some(depth - 1) {
+                anyhow::bail!("change depth does not follow parent");
+            }
+            for field in [
+                "requestGuid",
+                "workspaceGuid",
+                "itemGuid",
+                "requesterGuid",
+                "patch",
+                "before",
+                "comment",
+            ] {
+                if p.get(field) != record.get(field) {
+                    anyhow::bail!("change immutable field changed");
+                }
+            }
+        }
+        let event_type = if depth == 0 && status == "pending" && actor == requester {
+            "change_request"
+        } else if depth == 0 {
+            "change_adopt"
+        } else {
+            "change_decision"
+        };
+        if let Some(event) = history.get(ledger_hash) {
+            let proof = [
+                "requestDeviceId",
+                "requestPublicKey",
+                "requestNonce",
+                "requestSignature",
+                "requestHash",
+                "requestTimestamp",
+                "requestPath",
+            ];
+            if event.get("type").and_then(Value::as_str) != Some(event_type)
+                || event.get("workspaceGuid").and_then(Value::as_str) != Some(workspace)
+                || event.get("itemGuid").and_then(Value::as_str) != Some(item)
+                || event.get("actorGuid").and_then(Value::as_str) != Some(actor)
+                || event.get("fromLabel").and_then(Value::as_str) != Some(request)
+                || event.get("toLabel").and_then(Value::as_str) != Some(payload_hash)
+                || !proof.iter().all(|name| {
+                    event
+                        .get(*name)
+                        .and_then(Value::as_str)
+                        .is_some_and(|v| !v.is_empty())
+                })
+            {
+                anyhow::bail!("change request ledger evidence mismatch");
+            }
+        } else {
+            let exists:i64=conn.query_row("SELECT count(*) FROM history_entries h JOIN workspaces w ON w.id=h.workspace_id JOIN items i ON i.id=h.item_id JOIN users u ON u.id=h.actor_user_id WHERE h.hash=?1 AND h.type=?2 AND w.guid=?3 AND i.guid=?4 AND u.guid=?5 AND h.from_label=?6 AND h.to_label=?7 AND h.request_device_id IS NOT NULL AND h.request_signature IS NOT NULL",params![ledger_hash,event_type,workspace,item,actor,request,payload_hash],|r|r.get(0))?;
+            if exists == 0 {
+                anyhow::bail!("change request ledger event unavailable");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn verify_stored_change_records(conn: &Connection) -> anyhow::Result<usize> {
+    let snapshot = export_journal(conn);
+    verify_change_records(conn, &snapshot)?;
+    Ok(snapshot["changeRequests"].as_array().map_or(0, Vec::len))
 }
 
 fn verify_fault_records(conn: &Connection, journal: &Value) -> anyhow::Result<()> {
@@ -4086,6 +4459,7 @@ pub fn integrity_audit(conn: &Connection) -> Value {
     let item_tombstone_result = verify_stored_item_tombstones(conn);
     let item_comment_result = verify_stored_item_comments(conn);
     let fault_result = verify_stored_fault_records(conn);
+    let change_result = verify_stored_change_records(conn);
     let membership_result = verify_membership_records(conn, &snapshot);
 
     let count = |table: &str| -> i64 {
@@ -4167,6 +4541,7 @@ pub fn integrity_audit(conn: &Connection) -> Value {
         .map(ToString::to_string);
     let item_comment_error = item_comment_result.as_ref().err().map(ToString::to_string);
     let fault_error = fault_result.as_ref().err().map(ToString::to_string);
+    let change_error = change_result.as_ref().err().map(ToString::to_string);
     let membership_error = membership_result.as_ref().err().map(ToString::to_string);
     let healthy = database_check == "ok"
         && ledger_result.is_ok()
@@ -4179,6 +4554,7 @@ pub fn integrity_audit(conn: &Connection) -> Value {
         && item_tombstone_result.is_ok()
         && item_comment_result.is_ok()
         && fault_result.is_ok()
+        && change_result.is_ok()
         && membership_result.is_ok()
         && orphan_history == 0
         && missing_guids == 0
@@ -4196,6 +4572,7 @@ pub fn integrity_audit(conn: &Connection) -> Value {
         "itemTombstones": count("item_tombstones"),
         "itemComments": count("item_comment_records"),
         "faultRecords":count("fault_records"),
+        "changeRequestRecords":count("change_request_records"),
     });
     json!({
         "healthy": healthy,
@@ -4222,6 +4599,8 @@ pub fn integrity_audit(conn: &Connection) -> Value {
         "itemCommentsVerified": item_comment_result.unwrap_or(0),
         "faultError":fault_error,
         "faultRecordsVerified":fault_result.unwrap_or(0),
+        "changeRequestError":change_error,
+        "changeRequestRecordsVerified":change_result.unwrap_or(0),
         "membershipError": membership_error,
         "membershipVerified": membership_result.is_ok(),
         "snapshotHash": snapshot.get("journalHash"),
@@ -4524,7 +4903,7 @@ mod tests {
     }
 
     #[test]
-    fn portable_comment_and_fault_branches_reject_node_signed_falsification() {
+    fn portable_text_fault_and_change_branches_reject_falsification() {
         let paths = (0..3)
             .map(|kind| {
                 std::env::temp_dir()
@@ -4612,6 +4991,32 @@ mod tests {
             Some(owner),
         )
         .unwrap();
+        crate::device::set_pending(
+            &source,
+            owner,
+            &signed_device_proof(&key, device, "/api/trpc/items.requestChange"),
+        )
+        .unwrap();
+        let change = crate::api::dispatch(
+            &mut source,
+            "items.requestChange",
+            &json!({"itemId":item,"payload":{"title":"Drill v2"},"comment":"Уточнить модель"}),
+            Some(owner),
+        )
+        .unwrap();
+        crate::device::set_pending(
+            &source,
+            owner,
+            &signed_device_proof(&key, device, "/api/trpc/items.decideChange"),
+        )
+        .unwrap();
+        let accepted_change = crate::api::dispatch(
+            &mut source,
+            "items.decideChange",
+            &json!({"id":change["id"],"accept":true,"reason":"Подтверждено"}),
+            Some(owner),
+        )
+        .unwrap();
         let valid = export_journal(&source);
         let accepted = apply_remote_journal(&target, &valid, "");
         assert_eq!(accepted["ok"], true, "{accepted}");
@@ -4637,6 +5042,27 @@ mod tests {
             "resolved"
         );
         assert_eq!(verify_stored_fault_records(&target).unwrap(), 2);
+        assert_eq!(
+            target
+                .query_row(
+                    "SELECT status FROM change_requests WHERE guid=?1",
+                    [change["guid"].as_str().unwrap()],
+                    |r| r.get::<_, String>(0)
+                )
+                .unwrap(),
+            "accepted"
+        );
+        assert_eq!(
+            target
+                .query_row(
+                    "SELECT title FROM items WHERE guid='comment-item'",
+                    [],
+                    |r| r.get::<_, String>(0)
+                )
+                .unwrap(),
+            "Drill v2"
+        );
+        assert_eq!(verify_stored_change_records(&target).unwrap(), 2);
 
         // Два администратора могут принять разные решения от одного offline-parent.
         // Обе ветки сохраняются, а materialized state выбирается одинаково на всех нодах.
@@ -4702,6 +5128,96 @@ mod tests {
                 .unwrap(),
             3
         );
+        let change_root: String = source
+            .query_row(
+                "SELECT record_hash FROM change_request_records WHERE request_guid=?1 AND depth=0",
+                [change["guid"].as_str().unwrap()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let (change_patch,change_before,change_comment):(String,String,Option<String>)=source.query_row("SELECT patch_json,before_json,comment FROM change_request_records WHERE record_hash=?1",[&change_root],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+        let decision_at = chrono::Utc::now().to_rfc3339();
+        let mut rejected_branch = json!({"requestGuid":change["guid"],"parentHash":change_root,"depth":1,"workspaceGuid":"comment-workspace","itemGuid":"comment-item","requesterGuid":"comment-owner","actorGuid":"comment-owner","patch":serde_json::from_str::<Value>(&change_patch).unwrap(),"before":serde_json::from_str::<Value>(&change_before).unwrap(),"comment":change_comment,"status":"rejected","reason":"Отклонено параллельно","createdAt":decision_at});
+        let decision_payload = change_payload_hash(&rejected_branch).unwrap();
+        crate::device::set_pending(
+            &source,
+            owner,
+            &signed_device_proof(&key, device, "/api/trpc/items.decideChange"),
+        )
+        .unwrap();
+        let decision_event = ledger::append(
+            &source,
+            workspace,
+            owner,
+            Some(item),
+            "change_decision",
+            Some(change["guid"].as_str().unwrap()),
+            Some(&decision_payload),
+            None,
+            Some("Отклонено параллельно"),
+        )
+        .unwrap();
+        let decision_ledger = decision_event["opId"].as_str().unwrap();
+        let decision_hash = change_record_hash(&decision_payload, decision_ledger);
+        rejected_branch["payloadHash"] = json!(decision_payload);
+        rejected_branch["ledgerHash"] = json!(decision_ledger);
+        rejected_branch["recordHash"] = json!(decision_hash);
+        source.execute("INSERT INTO change_request_records(record_hash,request_guid,parent_hash,depth,workspace_guid,item_guid,requester_guid,actor_guid,patch_json,before_json,comment,status,reason,payload_hash,ledger_hash,created_at) VALUES(?1,?2,?3,1,'comment-workspace','comment-item','comment-owner','comment-owner',?4,?5,?6,'rejected','Отклонено параллельно',?7,?8,?9)",params![decision_hash,change["guid"].as_str(),change_root,change_patch,change_before,change_comment,decision_payload,decision_ledger,decision_at]).unwrap();
+        let change_branches = export_journal(&source);
+        let merged = apply_remote_journal(&target, &change_branches, "");
+        assert_eq!(merged["ok"], true, "{merged}");
+        let rejection_wins =
+            decision_hash.as_str() > accepted_change["recordHash"].as_str().unwrap();
+        assert_eq!(
+            target
+                .query_row(
+                    "SELECT status FROM change_requests WHERE guid=?1",
+                    [change["guid"].as_str().unwrap()],
+                    |r| r.get::<_, String>(0)
+                )
+                .unwrap(),
+            if rejection_wins {
+                "rejected"
+            } else {
+                "accepted"
+            }
+        );
+        assert_eq!(
+            target
+                .query_row(
+                    "SELECT title FROM items WHERE guid='comment-item'",
+                    [],
+                    |r| r.get::<_, String>(0)
+                )
+                .unwrap(),
+            if rejection_wins { "Drill" } else { "Drill v2" }
+        );
+        crate::device::set_pending(
+            &source,
+            owner,
+            &signed_device_proof(&key, device, "/api/trpc/items.update"),
+        )
+        .unwrap();
+        crate::api::dispatch(
+            &mut source,
+            "items.update",
+            &json!({"id":item,"title":"Drill final"}),
+            Some(owner),
+        )
+        .unwrap();
+        let after_direct = export_journal(&source);
+        let merged = apply_remote_journal(&target, &after_direct, "");
+        assert_eq!(merged["ok"], true, "{merged}");
+        assert_eq!(
+            target
+                .query_row(
+                    "SELECT title FROM items WHERE guid='comment-item'",
+                    [],
+                    |r| r.get::<_, String>(0)
+                )
+                .unwrap(),
+            "Drill final"
+        );
 
         let mut forged = valid.clone();
         forged["itemComments"][0]["text"] = json!("Поддельное указание");
@@ -4728,7 +5244,7 @@ mod tests {
                 .unwrap(),
             0
         );
-        let mut forged_fault = valid;
+        let mut forged_fault = valid.clone();
         let index = forged_fault["faults"]
             .as_array()
             .unwrap()
@@ -4754,6 +5270,26 @@ mod tests {
             .as_str()
             .unwrap_or_default()
             .contains("неисправност"));
+        let mut forged_change = valid;
+        forged_change["changeRequests"][0]["patch"]["title"] = json!("Поддельная модель");
+        let forged_payload = change_payload_hash(&forged_change["changeRequests"][0]).unwrap();
+        forged_change["changeRequests"][0]["payloadHash"] = json!(forged_payload);
+        let ledger = forged_change["changeRequests"][0]["ledgerHash"]
+            .as_str()
+            .unwrap();
+        forged_change["changeRequests"][0]["recordHash"] = json!(change_record_hash(
+            forged_change["changeRequests"][0]["payloadHash"]
+                .as_str()
+                .unwrap(),
+            ledger
+        ));
+        ledger::sign_journal(&source, &mut forged_change).unwrap();
+        let result = apply_remote_journal(&rejected, &forged_change, "");
+        assert_eq!(result["ok"], false, "{result}");
+        assert!(result["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("заяв"));
         drop((source, target, rejected));
         for path in paths {
             let _ = std::fs::remove_file(path);
