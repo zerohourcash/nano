@@ -242,9 +242,8 @@ export default function CreateTool() {
   const internalIdNum = watch('internalIdNum')
   const comment = watch('comment') ?? ''
 
-  // Фото уходят в items.create.photos парой «оригинал + миниатюра».
-  // Раньше здесь лежал URL.createObjectURL: такая ссылка живёт только до
-  // перезагрузки страницы, поэтому снимки на сервере оказывались битыми.
+  // Фото сначала загружаются в локальный CAS, затем карточка получает маленькую
+  // подписанную ссылку cas:sha256. Base64 никогда не попадает в Ledger.
   const [titlePhoto, setTitlePhoto] = useState<PreparedPhoto | null>(null)
   const [extraPhotos, setExtraPhotos] = useState<PreparedPhoto[]>([])
   const [samplesOpen, setSamplesOpen] = useState(false)
@@ -263,6 +262,8 @@ export default function CreateTool() {
   }, [title, brands])
 
   const create = trpc.items.create.useMutation()
+  const ingestContent = trpc.content.ingest.useMutation()
+  const addPhoto = trpc.items.addPhoto.useMutation()
 
   const doSubmit = (values: FormValues, andMore: boolean) => {
     const costNum = values.cost ? Number(values.cost.replace(/[^\d]/g, '')) : undefined
@@ -302,10 +303,31 @@ export default function CreateTool() {
         comment: values.comment?.trim() || undefined,
         metadata,
         qrCode: internalId || undefined,
-        photos: photos.length > 0 ? photos : undefined,
       },
       {
-        onSuccess: (item) => {
+        onSuccess: async (item) => {
+          try {
+            if (item) {
+              const itemGuid = (item as typeof item & { guid?: string }).guid
+              if (!itemGuid) throw new Error('Нода не вернула GUID карточки')
+              for (const [index, photo] of photos.entries()) {
+                const [original, thumbnail] = await Promise.all([
+                  ingestContent.mutateAsync({ workspaceId: item.workspaceId, dataUrl: photo.url }),
+                  ingestContent.mutateAsync({ workspaceId: item.workspaceId, dataUrl: photo.thumbUrl }),
+                ])
+                await addPhoto.mutateAsync({
+                  itemId: item.id,
+                  itemGuid,
+                  photoGuid: crypto.randomUUID(),
+                  url: original.url,
+                  thumbUrl: thumbnail.url,
+                  isTitle: index === 0,
+                })
+              }
+            }
+          } catch (error) {
+            setToast(error instanceof Error ? `Карточка создана, но фото не добавлено: ${error.message}` : 'Карточка создана, но фото не добавлено')
+          }
           utils.items.list.invalidate()
           utils.items.nextInternalId.invalidate()
           if (andMore) {

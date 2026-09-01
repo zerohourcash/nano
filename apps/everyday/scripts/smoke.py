@@ -1,6 +1,6 @@
 """Сценарии ТЗ через HTTP-API узла. Запускать через scripts/smoke_runner.py."""
 
-import json, os, urllib.error, urllib.parse, urllib.request, http.cookiejar
+import json, os, uuid, urllib.error, urllib.parse, urllib.request, http.cookiejar
 from device_test_signing import CRITICAL, DeviceSigner
 
 BASE = os.environ.get("MK_BASE", "http://127.0.0.1:8098")
@@ -184,6 +184,42 @@ check(
     and create_event.get("requestDeviceId") == owner.signer.device_id
     and bool(create_event.get("requestHash")),
     str(create_event)[:220],
+)
+
+uploaded = owner.call(
+    "content.ingest",
+    {"workspaceId": ws_id, "dataUrl": "data:image/png;base64,QUJD"},
+)
+photo_payload = {
+    "itemId": item_id,
+    "itemGuid": item.get("guid"),
+    "photoGuid": str(uuid.uuid4()),
+    "url": uploaded.get("url"),
+    "thumbUrl": uploaded.get("url"),
+    "isTitle": True,
+}
+unsigned_photo = owner.call("items.addPhoto", photo_payload, signed=False)
+check(
+    "unsigned photo attachment rejected",
+    unsigned_photo.get("__http") == 403
+    and "DEVICE_SIGNATURE_REQUIRED" in unsigned_photo.get("__body", ""),
+    str(unsigned_photo)[:160],
+)
+photo = owner.call("items.addPhoto", photo_payload)
+photo_card = owner.call("items.byId", {"id": item_id}, mutation=False)
+photo_event = next(
+    (entry for entry in photo_card.get("history", []) if entry.get("type") == "photo_add"),
+    {},
+)
+check(
+    "CAS photo is bound to signed V3 user intent",
+    photo.get("guid") == photo_payload["photoGuid"]
+    and photo.get("sha256") == uploaded.get("hash")
+    and photo_event.get("eventVersion") == 3
+    and photo_event.get("fromLabel") == photo_payload["photoGuid"]
+    and len(photo_event.get("toLabel") or "") == 64
+    and bool(photo_event.get("requestHash")),
+    str(photo_event)[:220],
 )
 
 lst = owner.call("items.list", {"workspaceId": ws_id}, mutation=False)

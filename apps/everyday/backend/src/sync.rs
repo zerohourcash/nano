@@ -1020,7 +1020,11 @@ pub fn export_journal_since(conn: &Connection, recipient_frontier: Option<&Value
     }
     let mut photos = Vec::new();
     if let Ok(mut statement) = conn.prepare(
-        "SELECT p.guid,p.item_id,p.url,p.thumb_url,p.sha256,p.is_title
+        "SELECT p.guid,p.item_id,p.url,p.thumb_url,p.sha256,p.is_title,
+                (SELECT h.hash FROM history_entries h
+                 WHERE h.item_id=p.item_id AND h.type='photo_add' AND h.from_label=p.guid
+                   AND h.event_version=3 AND h.request_body IS NOT NULL
+                 ORDER BY h.id DESC LIMIT 1)
          FROM item_photos p ORDER BY p.id",
     ) {
         if let Ok(rows) = statement.query_map([], |row| {
@@ -1032,6 +1036,7 @@ pub fn export_journal_since(conn: &Connection, recipient_frontier: Option<&Value
                 "thumbUrl": row.get::<_, Option<String>>(3)?,
                 "sha256": row.get::<_, Option<String>>(4)?,
                 "isTitle": row.get::<_, i64>(5)? != 0,
+                "ledgerHash": row.get::<_, Option<String>>(6)?,
             }))
         }) {
             photos.extend(rows.flatten());
@@ -1071,6 +1076,7 @@ pub fn export_journal_since(conn: &Connection, recipient_frontier: Option<&Value
         "custodyMode": "ledger-delta/v1",
         "itemTombstoneMode": "monotonic/v1",
         "itemCommentMode": "ledger-records/v1",
+        "photoMode": "intent-bound-with-explicit-legacy/v1",
         "faultMode": "append-only-branches/v1",
         "changeRequestMode":"portable-branches/v1",
         "configMode":"portable-branches/v1",
@@ -3282,6 +3288,9 @@ pub fn apply_remote_journal(conn: &Connection, journal: &Value, peer_url: &str) 
     if let Err(error) = verify_inventory_records(conn, journal) {
         return json!({"ok":false,"error":format!("Проверка летописи инвентаризации: {error}")});
     }
+    if let Err(error) = verify_photo_records(conn, journal) {
+        return json!({"ok":false,"error":format!("Проверка фото-летописи: {error}")});
+    }
     if let Err(error) = crate::accounting::verify_journal_links(conn, journal) {
         return json!({"ok":false,"error":format!("Проверка Bit-летописи: {error}")});
     }
@@ -3364,6 +3373,10 @@ pub fn apply_remote_journal(conn: &Connection, journal: &Value, peer_url: &str) 
     if let Err(error) = verify_stored_inventory_records(conn) {
         let _ = conn.execute_batch("ROLLBACK TO verified_sync; RELEASE verified_sync");
         return json!({"ok":false,"error":format!("Проверка сохранённой инвентаризации: {error}")});
+    }
+    if let Err(error) = verify_photo_records(conn, &export_journal(conn)) {
+        let _ = conn.execute_batch("ROLLBACK TO verified_sync; RELEASE verified_sync");
+        return json!({"ok":false,"error":format!("Проверка сохранённой фото-летописи: {error}")});
     }
     if let Err(error) = ledger::verify_chat_links(conn) {
         let _ = conn.execute_batch("ROLLBACK TO verified_sync; RELEASE verified_sync");
@@ -4447,6 +4460,14 @@ fn inventory_record_hash(payload_hash: &str, ledger_hash: &str) -> String {
     )
 }
 
+fn trpc_request_input(envelope: &Value) -> anyhow::Result<&Value> {
+    envelope
+        .get("0")
+        .and_then(|value| value.get("json"))
+        .or_else(|| envelope.get("json"))
+        .ok_or_else(|| anyhow::anyhow!("signed tRPC request input unavailable"))
+}
+
 fn verify_inventory_intent(record: &Value, event: &Value) -> anyhow::Result<()> {
     if event.get("eventVersion").and_then(Value::as_i64) != Some(3) {
         anyhow::bail!("inventory event has no signed request body")
@@ -4477,10 +4498,7 @@ fn verify_inventory_intent(record: &Value, event: &Value) -> anyhow::Result<()> 
         anyhow::bail!("inventory request path mismatch")
     }
     let envelope: Value = serde_json::from_str(body)?;
-    let input = envelope
-        .get("0")
-        .and_then(|v| v.get("json"))
-        .ok_or_else(|| anyhow::anyhow!("inventory request input unavailable"))?;
+    let input = trpc_request_input(&envelope)?;
     if procedure == "check" {
         let fields = &record["fields"];
         let requested_checked = input
@@ -4493,6 +4511,134 @@ fn verify_inventory_intent(record: &Value, event: &Value) -> anyhow::Result<()> 
         {
             anyhow::bail!("inventory result differs from signed user intent")
         }
+    }
+    Ok(())
+}
+
+fn photo_commitment(photo: &Value) -> anyhow::Result<String> {
+    let required = |field: &str| {
+        photo
+            .get(field)
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("photo has no {field}"))
+    };
+    let guid = required("guid")?;
+    let item = required("itemGuid")?;
+    let url = required("url")?;
+    let thumb = required("thumbUrl")?;
+    let checksum = required("sha256")?;
+    if url.strip_prefix("cas:") != Some(checksum) {
+        anyhow::bail!("photo CAS hash mismatch")
+    }
+    let payload = json!({
+        "domain":"everyday/item-photo/v1","guid":guid,"itemGuid":item,
+        "url":url,"thumbUrl":thumb,"sha256":checksum,
+        "isTitle":photo.get("isTitle").and_then(Value::as_bool).unwrap_or(false),
+    });
+    Ok(hex::encode(Sha256::digest(serde_json::to_vec(&payload)?)))
+}
+
+fn verify_photo_intent(photo: &Value, event: &Value) -> anyhow::Result<()> {
+    let payload_hash = photo_commitment(photo)?;
+    let guid = photo["guid"].as_str().unwrap_or_default();
+    let item = photo["itemGuid"].as_str().unwrap_or_default();
+    if event.get("eventVersion").and_then(Value::as_i64) != Some(3)
+        || event.get("type").and_then(Value::as_str) != Some("photo_add")
+        || event.get("itemGuid").and_then(Value::as_str) != Some(item)
+        || event.get("fromLabel").and_then(Value::as_str) != Some(guid)
+        || event.get("toLabel").and_then(Value::as_str) != Some(payload_hash.as_str())
+        || event.get("requestPath").and_then(Value::as_str) != Some("/api/trpc/items.addPhoto")
+    {
+        anyhow::bail!("photo ledger evidence mismatch")
+    }
+    let body = event
+        .get("requestBody")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("photo event has no signed intent"))?;
+    if event.get("requestHash").and_then(Value::as_str)
+        != Some(hex::encode(Sha256::digest(body.as_bytes())).as_str())
+    {
+        anyhow::bail!("photo request body hash mismatch")
+    }
+    let envelope: Value = serde_json::from_str(body)?;
+    let input = trpc_request_input(&envelope)?;
+    let requested_url = input.get("url").and_then(Value::as_str);
+    let requested_thumb = input
+        .get("thumbUrl")
+        .and_then(Value::as_str)
+        .or(requested_url);
+    if input.get("itemGuid").and_then(Value::as_str) != Some(item)
+        || input.get("photoGuid").and_then(Value::as_str) != Some(guid)
+        || requested_url != photo.get("url").and_then(Value::as_str)
+        || requested_thumb != photo.get("thumbUrl").and_then(Value::as_str)
+        || input
+            .get("isTitle")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+            != photo
+                .get("isTitle")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+    {
+        anyhow::bail!("photo differs from signed user intent")
+    }
+    Ok(())
+}
+
+fn verify_photo_records(conn: &Connection, journal: &Value) -> anyhow::Result<()> {
+    if journal.get("photoMode").and_then(Value::as_str)
+        != Some("intent-bound-with-explicit-legacy/v1")
+    {
+        anyhow::bail!("journal does not declare photo verification mode")
+    }
+    let history: HashMap<&str, &Value> = journal
+        .get("history")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|event| {
+            event
+                .get("opId")
+                .and_then(Value::as_str)
+                .map(|hash| (hash, event))
+        })
+        .collect();
+    for photo in journal
+        .get("photos")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let Some(ledger_hash) = photo.get("ledgerHash").and_then(Value::as_str) else {
+            // Снимки, созданные до photo_add/v1, остаются явно legacy и не
+            // получают несуществовавшую пользовательскую подпись задним числом.
+            continue;
+        };
+        if let Some(event) = history.get(ledger_hash) {
+            verify_photo_intent(photo, event)?;
+            continue;
+        }
+        let stored: Option<Value> = conn
+            .query_row(
+                "SELECT h.event_version,i.guid,h.type,h.from_label,h.to_label,
+                        h.request_hash,h.request_path,h.request_body
+                 FROM history_entries h JOIN items i ON i.id=h.item_id WHERE h.hash=?1",
+                [ledger_hash],
+                |row| Ok(json!({
+                    "eventVersion":row.get::<_,i64>(0)?,"itemGuid":row.get::<_,String>(1)?,
+                    "type":row.get::<_,String>(2)?,"fromLabel":row.get::<_,Option<String>>(3)?,
+                    "toLabel":row.get::<_,Option<String>>(4)?,"requestHash":row.get::<_,Option<String>>(5)?,
+                    "requestPath":row.get::<_,Option<String>>(6)?,"requestBody":row.get::<_,Option<String>>(7)?,
+                })),
+            )
+            .optional()?;
+        verify_photo_intent(
+            photo,
+            stored
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("photo ledger event unavailable"))?,
+        )?;
     }
     Ok(())
 }
@@ -5972,6 +6118,7 @@ pub fn integrity_audit(conn: &Connection) -> Value {
     let item_state_result = verify_stored_item_state_versions(conn);
     let organization_node_result = verify_stored_organization_node_versions(conn);
     let inventory_result = verify_stored_inventory_records(conn);
+    let photo_result = verify_photo_records(conn, &snapshot);
     let membership_result = verify_membership_records(conn, &snapshot);
 
     let count = |table: &str| -> i64 {
@@ -6067,6 +6214,7 @@ pub fn integrity_audit(conn: &Connection) -> Value {
         .err()
         .map(ToString::to_string);
     let inventory_error = inventory_result.as_ref().err().map(ToString::to_string);
+    let photo_error = photo_result.as_ref().err().map(ToString::to_string);
     let membership_error = membership_result.as_ref().err().map(ToString::to_string);
     let healthy = database_check == "ok"
         && ledger_result.is_ok()
@@ -6084,6 +6232,7 @@ pub fn integrity_audit(conn: &Connection) -> Value {
         && item_state_result.is_ok()
         && organization_node_result.is_ok()
         && inventory_result.is_ok()
+        && photo_result.is_ok()
         && membership_result.is_ok()
         && orphan_history == 0
         && missing_guids == 0
@@ -6106,6 +6255,7 @@ pub fn integrity_audit(conn: &Connection) -> Value {
         "itemStateVersions":count("item_state_versions"),
         "organizationNodeVersions":count("organization_node_versions"),
         "inventoryRecords":count("inventory_records"),
+        "photos":count("item_photos"),
     });
     let mut audit = json!({
         "healthy": healthy,
@@ -6159,6 +6309,11 @@ pub fn integrity_audit(conn: &Connection) -> Value {
             "inventoryRecordsVerified".into(),
             json!(inventory_result.unwrap_or(0)),
         );
+        object.insert(
+            "photoError".into(),
+            photo_error.map(Value::String).unwrap_or(Value::Null),
+        );
+        object.insert("photoIntentVerified".into(), json!(photo_result.is_ok()));
         object.insert(
             "organizationNodeError".into(),
             organization_node_error
@@ -7781,6 +7936,64 @@ mod tests {
             &json!([{"workspaceGuid":"ws","publicKey":"key-a","head":"unknown"}]),
         );
         assert_eq!(divergent, original);
+    }
+
+    #[test]
+    fn photo_intent_rejects_trusted_node_snapshot_rewrite() {
+        let path = std::env::temp_dir().join(format!("photo-intent-{}.db", uuid::Uuid::new_v4()));
+        let conn = crate::db::open(&path).unwrap();
+        let created = chrono::Utc::now().to_rfc3339();
+        conn.execute("INSERT INTO workspaces(name,internal_id_prefix,created_at,guid) VALUES('Photo org','P-',?1,'photo-workspace')",[&created]).unwrap();
+        let workspace = conn.last_insert_rowid();
+        conn.execute("INSERT INTO users(full_name,phone,status,role_rights,created_at,guid) VALUES('Owner','+70000000991','active',?1,?2,'photo-owner')",params![crate::db::owner_rights().to_string(),created]).unwrap();
+        let owner = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO user_workspaces(user_id,workspace_id,rights_json) VALUES(?1,?2,?3)",
+            params![owner, workspace, crate::db::owner_rights().to_string()],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO items(internal_id,title,workspace_id,qr_code,created_at,guid) VALUES('P-1','Camera',?1,'P-1',?2,'photo-item')",params![workspace,created]).unwrap();
+        let item = conn.last_insert_rowid();
+        let key = SigningKey::generate(&mut OsRng);
+        let device = "photo-device-0001";
+        crate::device::register(&conn,owner,&json!({"deviceId":device,"name":"Camera phone","publicKey":URL_SAFE_NO_PAD.encode(key.verifying_key().to_bytes())})).unwrap();
+        let cas = crate::content::ingest_data_url(&conn, "data:image/png;base64,QUJD")
+            .unwrap()
+            .unwrap();
+        let photo_guid = uuid::Uuid::new_v4().to_string();
+        let checksum = cas.trim_start_matches("cas:");
+        conn.execute("INSERT INTO item_photos(item_id,url,thumb_url,sha256,is_title,guid) VALUES(?1,?2,?2,?3,1,?4)",params![item,cas,checksum,photo_guid]).unwrap();
+        let photo = json!({"guid":photo_guid,"itemGuid":"photo-item","url":cas,
+            "thumbUrl":cas,"sha256":checksum,"isTitle":true});
+        let payload_hash = photo_commitment(&photo).unwrap();
+        let body = json!({"json":{"itemId":item,"itemGuid":"photo-item",
+            "photoGuid":photo_guid,"url":cas,"isTitle":true}});
+        let proof = signed_device_proof_body(&key, device, "/api/trpc/items.addPhoto", &body);
+        crate::device::set_pending(&conn, owner, &proof).unwrap();
+        ledger::append(
+            &conn,
+            workspace,
+            owner,
+            Some(item),
+            "photo_add",
+            Some(&photo_guid),
+            Some(&payload_hash),
+            None,
+            Some("Photo added"),
+        )
+        .unwrap();
+
+        let valid = export_journal(&conn);
+        verify_photo_records(&conn, &valid).unwrap();
+        let mut forged = valid;
+        forged["photos"][0]["isTitle"] = json!(false);
+        ledger::sign_journal(&conn, &mut forged).unwrap();
+        ledger::verify_journal(&forged).unwrap();
+        let error = verify_photo_records(&conn, &forged).unwrap_err();
+        assert!(error.to_string().contains("ledger evidence mismatch"));
+
+        drop(conn);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

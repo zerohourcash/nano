@@ -210,7 +210,10 @@ export const itemsRouter = createRouter({
     .input(
       z.object({
         itemId: z.number().int().positive(),
+        itemGuid: z.string().uuid(),
+        photoGuid: z.string().uuid(),
         url: z.string().min(1),
+        thumbUrl: z.string().min(1).optional(),
         isTitle: z.boolean().default(false),
       }),
     )

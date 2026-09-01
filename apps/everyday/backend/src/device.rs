@@ -62,6 +62,7 @@ pub fn requires_signature(procedure: &str) -> bool {
             | "sync.clearDiagnostics"
             | "sync.reportTransportStatus"
             | "content.setMode"
+            | "content.ingest"
             | "content.pin"
             | "content.unpin"
             | "backup.export"
@@ -239,8 +240,8 @@ pub fn verify_request(
         request_hash: body_hash,
         timestamp: timestamp.to_owned(),
         path: path.to_owned(),
-        request_body: path
-            .starts_with("/api/trpc/inventory.")
+        request_body: (path.starts_with("/api/trpc/inventory.")
+            || path == "/api/trpc/items.addPhoto")
             .then(|| String::from_utf8(body.to_vec()))
             .transpose()?,
     })

@@ -110,6 +110,7 @@ const CRITICAL = [
   'sync.clearDiagnostics',
   'sync.reportTransportStatus',
   'content.setMode',
+  'content.ingest',
   'content.pin',
   'content.unpin',
   'backup.export',

@@ -458,7 +458,7 @@ fn required_admin_right(procedure: &str) -> Option<&'static str> {
         Some("manageDictionaries")
     } else if procedure.starts_with("sync.")
         || procedure.starts_with("backup.")
-        || procedure.starts_with("content.")
+        || (procedure.starts_with("content.") && procedure != "content.ingest")
     {
         Some("manageWorkspaces")
     } else {
@@ -497,6 +497,8 @@ fn required_right(procedure: &str) -> Option<&'static str> {
         Some("useBit")
     } else if procedure == "bit.transactions" {
         Some("viewAccounting")
+    } else if procedure == "content.ingest" {
+        Some("createItems")
     } else if procedure == "knowledge.save" {
         Some("editKnowledge")
     } else if procedure.starts_with("knowledge.") {
@@ -951,6 +953,19 @@ fn dispatch_inner(
             Ok(crate::sync::node_keys(conn))
         }
         "content.status" => Ok(crate::content::status(conn)),
+        "content.ingest" => {
+            let source = s(input, "dataUrl").ok_or_else(|| ApiError::bad("dataUrl"))?;
+            let url = crate::content::ingest_data_url(conn, &source)
+                .map_err(|error| ApiError::bad(format!("Некорректное вложение: {error}")))?
+                .ok_or_else(|| ApiError::bad("Ожидается base64 data URL"))?;
+            let hash = url.trim_start_matches("cas:");
+            let (mime, size): (String, i64) = conn.query_row(
+                "SELECT mime,size FROM content_catalog WHERE hash=?1",
+                [hash],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            Ok(json!({"url":url,"hash":hash,"mime":mime,"size":size}))
+        }
         "content.setMode" => {
             let mode = s(input, "mode").ok_or_else(|| ApiError::bad("mode"))?;
             crate::content::set_mode(conn, &mode)
@@ -1909,7 +1924,7 @@ fn items_create_atomic(conn: &Connection, input: &Value, user_id: Option<i64>) -
                 _ => (None, None),
             };
             if let Some(url) = url {
-                insert_photo(conn, id, &url, thumb.as_deref(), i == 0)?;
+                insert_photo(conn, id, &url, thumb.as_deref(), i == 0, None)?;
             }
         }
     }
@@ -2167,6 +2182,7 @@ fn insert_photo(
     url: &str,
     thumb: Option<&str>,
     is_title: bool,
+    guid: Option<&str>,
 ) -> Result<i64, ApiError> {
     let stored_url = crate::content::ingest_data_url(conn, url)
         .map_err(|error| ApiError::bad(format!("Некорректное фото: {error}")))?
@@ -2187,7 +2203,8 @@ fn insert_photo(
             stored_thumb,
             checksum,
             is_title as i64,
-            uuid::Uuid::new_v4().to_string()
+            guid.map(str::to_owned)
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string())
         ],
     )?;
     Ok(conn.last_insert_rowid())
@@ -2202,18 +2219,61 @@ fn items_add_photo_atomic(conn: &Connection, input: &Value, user_id: Option<i64>
     let item_id = i64v(input, "itemId").ok_or_else(|| ApiError::bad("itemId"))?;
     let ws = require_item_access(conn, uid, item_id)?;
     require_can_in_workspace(conn, uid, ws, "editItems")?;
+    let item_guid = s(input, "itemGuid").ok_or_else(|| ApiError::bad("itemGuid"))?;
+    let expected_item_guid = ledger::guid(conn, "items", item_id)
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    if item_guid != expected_item_guid {
+        return Err(ApiError::bad("itemGuid не соответствует карточке"));
+    }
+    let photo_guid = s(input, "photoGuid").ok_or_else(|| ApiError::bad("photoGuid"))?;
+    Uuid::parse_str(&photo_guid).map_err(|_| ApiError::bad("Некорректный photoGuid"))?;
     let url = s(input, "url").ok_or_else(|| ApiError::bad("url"))?;
+    if !url.starts_with("cas:") {
+        return Err(ApiError::bad(
+            "Сначала загрузите фото через content.ingest; в летопись передаётся только cas:hash",
+        ));
+    }
+    let validate_cas = |value: &str| -> Result<(), ApiError> {
+        let hash = value.strip_prefix("cas:").unwrap_or_default();
+        if hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(ApiError::bad("Некорректная CAS-ссылка"));
+        }
+        let known: i64 = conn.query_row(
+            "SELECT count(*) FROM content_catalog WHERE hash=?1",
+            [hash],
+            |row| row.get(0),
+        )?;
+        if known != 1 {
+            return Err(ApiError::bad("CAS-объект не загружен на эту ноду"));
+        }
+        Ok(())
+    };
+    validate_cas(&url)?;
     let is_title = b(input, "isTitle").unwrap_or(false);
     let thumb = s(input, "thumbUrl");
-    let id = insert_photo(conn, item_id, &url, thumb.as_deref(), is_title)?;
+    if thumb
+        .as_deref()
+        .is_some_and(|value| !value.starts_with("cas:"))
+    {
+        return Err(ApiError::bad("thumbUrl должен быть ссылкой cas:hash"));
+    }
+    if let Some(value) = thumb.as_deref() {
+        validate_cas(value)?;
+    }
+    let id = insert_photo(
+        conn,
+        item_id,
+        &url,
+        thumb.as_deref(),
+        is_title,
+        Some(&photo_guid),
+    )?;
     let (guid, stored_url, stored_thumb, checksum): (String, String, Option<String>, String) = conn
         .query_row(
             "SELECT guid,url,thumb_url,sha256 FROM item_photos WHERE id=?1",
             [id],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )?;
-    let item_guid = ledger::guid(conn, "items", item_id)
-        .map_err(|error| ApiError::internal(error.to_string()))?;
     let commitment = json!({
         "domain":"everyday/item-photo/v1","guid":guid,"itemGuid":item_guid,
         "url":stored_url,"thumbUrl":stored_thumb,"sha256":checksum,"isTitle":is_title,
@@ -7520,10 +7580,18 @@ mod tests {
     fn adding_a_photo_is_atomic_and_ledger_bound() {
         let (mut conn, path, users, ws) = test_db();
         let item = insert_item(&conn, ws, None, false, None);
+        let item_guid = ledger::guid(&conn, "items", item).unwrap();
+        let uploaded = dispatch(
+            &mut conn,
+            "content.ingest",
+            &json!({"workspaceId":ws,"dataUrl":"data:image/png;base64,QUJD"}),
+            Some(users[0]),
+        )
+        .unwrap();
         let added = dispatch(
             &mut conn,
             "items.addPhoto",
-            &json!({"itemId":item,"url":"data:image/png;base64,QUJD","isTitle":true}),
+            &json!({"itemId":item,"itemGuid":item_guid,"photoGuid":Uuid::new_v4().to_string(),"url":uploaded["url"],"isTitle":true}),
             Some(users[0]),
         )
         .unwrap();
@@ -7539,10 +7607,13 @@ mod tests {
         assert_eq!(event.1.len(), 64);
 
         break_ledger(&conn);
+        let uploaded = crate::content::ingest_data_url(&conn, "data:image/png;base64,REVG")
+            .unwrap()
+            .unwrap();
         let failed = dispatch(
             &mut conn,
             "items.addPhoto",
-            &json!({"itemId":item,"url":"data:image/png;base64,REVG"}),
+            &json!({"itemId":item,"itemGuid":item_guid,"photoGuid":Uuid::new_v4().to_string(),"url":uploaded}),
             Some(users[0]),
         );
         assert!(failed.is_err());

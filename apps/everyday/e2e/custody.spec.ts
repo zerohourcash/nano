@@ -9,12 +9,53 @@ async function trpc<T>(
   return page.evaluate(
     async ({ procedure, input, mutation }) => {
       const envelope = JSON.stringify({ 0: { json: input } });
+      const signedHeaders: Record<string, string> = {};
+      if (mutation) {
+        type Identity = { deviceId: string; privateKey: CryptoKey; publicKey: Uint8Array };
+        const state = window as typeof window & { __everydayE2EIdentity?: Identity };
+        if (!state.__everydayE2EIdentity) {
+          const pair = (await crypto.subtle.generateKey('Ed25519', true, ['sign', 'verify'])) as CryptoKeyPair;
+          state.__everydayE2EIdentity = {
+            deviceId: `e2e-browser-${crypto.randomUUID()}`,
+            privateKey: pair.privateKey,
+            publicKey: new Uint8Array(await crypto.subtle.exportKey('raw', pair.publicKey)),
+          };
+        }
+        const identity = state.__everydayE2EIdentity;
+        const encode = (bytes: Uint8Array) => {
+          let binary = '';
+          for (const byte of bytes) binary += String.fromCharCode(byte);
+          return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+        };
+        const registration = await fetch('/api/trpc/auth.registerDevice', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ json: {
+            deviceId: identity.deviceId,
+            name: 'Playwright browser',
+            publicKey: encode(identity.publicKey),
+          } }),
+        });
+        if (!registration.ok) throw new Error(`device registration: HTTP ${registration.status}`);
+        const timestamp = Math.floor(Date.now() / 1000).toString();
+        const nonce = crypto.randomUUID();
+        const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(envelope)));
+        const hash = Array.from(digest, byte => byte.toString(16).padStart(2, '0')).join('');
+        const message = ['everyday/device-request/v1', 'POST', `/api/trpc/${procedure}`, timestamp, nonce, hash].join('\n');
+        const signature = new Uint8Array(await crypto.subtle.sign('Ed25519', identity.privateKey, new TextEncoder().encode(message)));
+        Object.assign(signedHeaders, {
+          'x-everyday-device': identity.deviceId,
+          'x-everyday-timestamp': timestamp,
+          'x-everyday-nonce': nonce,
+          'x-everyday-signature': encode(signature),
+        });
+      }
       const suffix = mutation
         ? '?batch=1'
         : `?batch=1&input=${encodeURIComponent(envelope)}`;
       const response = await fetch(`/api/trpc/${procedure}${suffix}`, {
         method: mutation ? 'POST' : 'GET',
-        headers: mutation ? { 'content-type': 'application/json' } : undefined,
+        headers: mutation ? { 'content-type': 'application/json', ...signedHeaders } : undefined,
         body: mutation ? envelope : undefined,
       });
       if (!response.ok)
@@ -72,6 +113,14 @@ test('browser signs a real custody transaction and ledger retains its proof', as
     .getByPlaceholder('Например: Перфоратор Bosch GBH 8-45 DV')
     .fill('Перфоратор E2E');
   await page.locator('select').first().selectOption(String(category.id));
+  await page.locator('input[type="file"]').first().setInputFiles({
+    name: 'tool.png',
+    mimeType: 'image/png',
+    buffer: Buffer.from(
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
+      'base64'
+    ),
+  });
   await page.getByRole('button', { name: 'Создать инструмент' }).click();
   await expect(page).toHaveURL(/\/tool\/\d+/, { timeout: 10_000 });
   const itemId = Number(page.url().match(/\/tool\/(\d+)/)?.[1]);
@@ -103,6 +152,10 @@ test('browser signs a real custody transaction and ledger retains its proof', as
   expect(event?.requestDeviceId).toBeTruthy();
   expect(event?.requestNonce).toBeTruthy();
   expect(event?.requestHash).toMatch(/^[a-f0-9]{64}$/);
+  const photoEvent = itemAfterTake.history.find(entry => entry.type === 'photo_add');
+  expect(photoEvent).toMatchObject({ eventVersion: 3 });
+  expect(photoEvent?.requestDeviceId).toBeTruthy();
+  expect(photoEvent?.requestHash).toMatch(/^[a-f0-9]{64}$/);
 
   await page.goto('/create');
   await page
@@ -119,7 +172,7 @@ test('browser signs a real custody transaction and ledger retains its proof', as
     history: Array<{ type: string; requestDeviceId?: string }>;
   }>(page, 'items.byId', { id: qrItemId }, false);
   expect(
-    qrItem.history.find(entry => entry.type === 'create')?.requestDeviceId
+    qrItem.history.find(entry => entry.type === 'item_state_create')?.requestDeviceId
   ).toBeTruthy();
   await page.goto('/scan');
   const manualCode = page.getByPlaceholder('Или вставьте ссылку / токен');
@@ -204,6 +257,14 @@ test('browser signs a real custody transaction and ledger retains its proof', as
   expect(JSON.stringify(transportBundle)).not.toContain('Безопасность E2E');
   const forgedBundle = structuredClone(transportBundle);
   forgedBundle.ciphertext = `${forgedBundle.ciphertext.startsWith('A') ? 'B' : 'A'}${forgedBundle.ciphertext.slice(1)}`;
+
+  const integrity = await trpc<{ healthy: boolean; photoError?: string | null }>(
+    page,
+    'sync.audit',
+    null,
+    false
+  );
+  expect(integrity.healthy, JSON.stringify(integrity)).toBe(true);
 
   await page.goto('/admin');
   await page.getByRole('button', { name: 'Пространства', exact: true }).click();
