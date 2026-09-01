@@ -193,6 +193,22 @@ fn item_state_version_hash(payload_hash: &str, ledger_hash: &str) -> String {
         )
     )
 }
+fn organization_node_payload_hash(record: &Value) -> anyhow::Result<String> {
+    let payload = json!({"domain":"everyday/organization-node/v1","nodeGuid":record.get("nodeGuid"),"parentHash":record.get("parentHash"),"depth":record.get("depth"),"workspaceGuid":record.get("workspaceGuid"),"actorGuid":record.get("actorGuid"),"active":record.get("active"),"fields":record.get("fields"),"updatedAt":record.get("updatedAt")});
+    Ok(format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&payload)?)
+    ))
+}
+fn organization_node_version_hash(payload_hash: &str, ledger_hash: &str) -> String {
+    format!(
+        "{:x}",
+        Sha256::digest(
+            format!("everyday/organization-node-ledger/v1\n{payload_hash}\n{ledger_hash}")
+                .as_bytes()
+        )
+    )
+}
 
 fn next_journal_sequence(conn: &Connection) -> u64 {
     let next = kv_get(conn, "sync_journal_sequence")
@@ -639,6 +655,8 @@ pub fn export_journal_since(conn: &Connection, recipient_frontier: Option<&Value
             organization_nodes.push(row);
         }
     }
+    let mut organization_node_versions = Vec::new();
+    if let Ok(mut statement)=conn.prepare("SELECT version_hash,node_guid,parent_hash,depth,workspace_guid,actor_guid,active,fields_json,payload_hash,ledger_hash,updated_at FROM organization_node_versions ORDER BY node_guid,depth,version_hash"){if let Ok(rows)=statement.query_map([],|r|{let fields:String=r.get(7)?;Ok(json!({"versionHash":r.get::<_,String>(0)?,"nodeGuid":r.get::<_,String>(1)?,"parentHash":r.get::<_,Option<String>>(2)?,"depth":r.get::<_,i64>(3)?,"workspaceGuid":r.get::<_,String>(4)?,"actorGuid":r.get::<_,String>(5)?,"active":r.get::<_,i64>(6)?!=0,"fields":serde_json::from_str::<Value>(&fields).unwrap_or(Value::Null),"payloadHash":r.get::<_,String>(8)?,"ledgerHash":r.get::<_,String>(9)?,"updatedAt":r.get::<_,String>(10)?}))}){organization_node_versions.extend(rows.flatten());}}
     let mut users = Vec::new();
     if let Ok(mut stmt) = conn.prepare("SELECT id, full_name, position, phone, status, role_rights, checkout_policy, guid, password_hash FROM users") {
         for row in stmt.query_map([], |r| {
@@ -957,6 +975,12 @@ pub fn export_journal_since(conn: &Connection, recipient_frontier: Option<&Value
                 .and_then(Value::as_str)
                 .is_some_and(|hash| sent.contains(hash))
         });
+        organization_node_versions.retain(|record| {
+            record
+                .get("ledgerHash")
+                .and_then(Value::as_str)
+                .is_some_and(|hash| sent.contains(hash))
+        });
     }
     let mut messages = Vec::new();
     if let Ok(mut stmt) = conn.prepare(
@@ -1066,6 +1090,13 @@ pub fn export_journal_since(conn: &Connection, recipient_frontier: Option<&Value
         "accounting": crate::accounting::export(conn),
         "knowledge": crate::knowledge::export(conn),
     });
+    if let Some(object) = journal.as_object_mut() {
+        object.insert("organizationNodeMode".into(), json!("portable-branches/v1"));
+        object.insert(
+            "organizationNodeVersions".into(),
+            Value::Array(organization_node_versions),
+        );
+    }
     if let Err(error) = ledger::sign_journal(conn, &mut journal) {
         return json!({"ok": false, "error": format!("Не удалось подписать журнал: {error}")});
     }
@@ -1116,6 +1147,7 @@ fn filter_journal_scope(journal: &mut Value, allowed: &HashSet<String>) {
     }
     for key in [
         "organizationNodes",
+        "organizationNodeVersions",
         "items",
         "history",
         "invites",
@@ -2080,6 +2112,66 @@ fn rebuild_item_state(conn: &Connection) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn rebuild_organization_nodes(conn: &Connection) -> anyhow::Result<()> {
+    let mut statement=conn.prepare("SELECT node_guid,workspace_guid,active,fields_json FROM organization_node_versions v WHERE version_hash=(SELECT version_hash FROM organization_node_versions w WHERE w.node_guid=v.node_guid ORDER BY depth DESC,version_hash DESC LIMIT 1) ORDER BY node_guid")?;
+    let rows = statement
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)? != 0,
+                r.get::<_, String>(3)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    let parsed: Vec<(String, String, bool, Value)> = rows
+        .into_iter()
+        .map(|(guid, ws, active, raw)| Ok((guid, ws, active, serde_json::from_str(&raw)?)))
+        .collect::<anyhow::Result<_>>()?;
+    let parents: HashMap<&str, Option<&str>> = parsed
+        .iter()
+        .map(|(guid, _, _, fields)| {
+            (
+                guid.as_str(),
+                fields.get("parentGuid").and_then(Value::as_str),
+            )
+        })
+        .collect();
+    for start in parents.keys() {
+        let mut seen = HashSet::new();
+        let mut cursor = Some(*start);
+        while let Some(node) = cursor {
+            if !seen.insert(node) {
+                anyhow::bail!("organization structure cycle detected");
+            }
+            cursor = parents.get(node).copied().flatten();
+        }
+    }
+    for (guid, workspace, active, fields) in &parsed {
+        let ws = id_by_guid(conn, "workspaces", workspace)
+            .ok_or_else(|| anyhow::anyhow!("organization workspace unavailable"))?;
+        let responsible = fields
+            .get("responsibleGuid")
+            .and_then(Value::as_str)
+            .and_then(|guid| id_by_guid(conn, "users", guid));
+        if id_by_guid(conn, "organization_nodes", guid).is_none() {
+            conn.execute("INSERT INTO organization_nodes(guid,workspace_id,kind,name,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?5)",params![guid,ws,fields.get("kind").and_then(Value::as_str).unwrap_or("section"),fields.get("name").and_then(Value::as_str).unwrap_or("Раздел"),chrono::Utc::now().to_rfc3339()])?;
+        }
+        conn.execute("UPDATE organization_nodes SET workspace_id=?1,kind=?2,name=?3,tab_label=?4,responsible_user_id=?5,display_order=?6,color=?7,icon=?8,archived=?9,updated_at=?10 WHERE guid=?11",params![ws,fields.get("kind").and_then(Value::as_str),fields.get("name").and_then(Value::as_str),fields.get("tabLabel").and_then(Value::as_str),responsible,fields.get("displayOrder").and_then(Value::as_i64).unwrap_or(0),fields.get("color").and_then(Value::as_str),fields.get("icon").and_then(Value::as_str),(!*active) as i64,chrono::Utc::now().to_rfc3339(),guid])?;
+    }
+    for (guid, _, _, fields) in &parsed {
+        let parent = fields
+            .get("parentGuid")
+            .and_then(Value::as_str)
+            .and_then(|guid| id_by_guid(conn, "organization_nodes", guid));
+        conn.execute(
+            "UPDATE organization_nodes SET parent_id=?1 WHERE guid=?2",
+            params![parent, guid],
+        )?;
+    }
+    Ok(())
+}
+
 pub fn import_journal(conn: &Connection, journal: &Value) -> Value {
     let mut workspaces = 0u32;
     let mut users = 0u32;
@@ -2175,6 +2267,19 @@ pub fn import_journal(conn: &Connection, journal: &Value) -> Value {
             }
         }
     }
+    if let Some(records) = journal
+        .get("organizationNodeVersions")
+        .and_then(Value::as_array)
+    {
+        for record in records {
+            let inserted=conn.execute("INSERT OR IGNORE INTO organization_node_versions(version_hash,node_guid,parent_hash,depth,workspace_guid,actor_guid,active,fields_json,payload_hash,ledger_hash,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",params![record.get("versionHash").and_then(Value::as_str),record.get("nodeGuid").and_then(Value::as_str),record.get("parentHash").and_then(Value::as_str),record.get("depth").and_then(Value::as_i64),record.get("workspaceGuid").and_then(Value::as_str),record.get("actorGuid").and_then(Value::as_str),record.get("active").and_then(Value::as_bool).map(i64::from),record.get("fields").map(Value::to_string),record.get("payloadHash").and_then(Value::as_str),record.get("ledgerHash").and_then(Value::as_str),record.get("updatedAt").and_then(Value::as_str)]).unwrap_or(0);
+            if inserted > 0 {
+                ops += 1
+            } else {
+                skipped += 1
+            }
+        }
+    }
     if let Some(arr) = journal.get("organizationNodes").and_then(|v| v.as_array()) {
         // Первый проход создаёт узлы без родителей, чтобы порядок входящего
         // массива не имел значения. Второй восстанавливает связи по GUID.
@@ -2209,6 +2314,9 @@ pub fn import_journal(conn: &Connection, journal: &Value) -> Value {
                 params![parent, guid],
             );
         }
+    }
+    if let Err(error) = rebuild_organization_nodes(conn) {
+        return json!({"ok":false,"error":format!("Не удалось восстановить структуру организации: {error}")});
     }
     if let Some(arr) = journal.get("items").and_then(|v| v.as_array()) {
         for it in arr {
@@ -3136,6 +3244,9 @@ pub fn apply_remote_journal(conn: &Connection, journal: &Value, peer_url: &str) 
     if let Err(error) = verify_config_versions(conn, journal) {
         return json!({"ok":false,"error":format!("Проверка летописи справочников: {error}")});
     }
+    if let Err(error) = verify_organization_node_versions(conn, journal) {
+        return json!({"ok":false,"error":format!("Проверка летописи структуры: {error}")});
+    }
     if let Err(error) = verify_item_state_versions(conn, journal) {
         return json!({"ok":false,"error":format!("Проверка master-летописи ТМЦ: {error}")});
     }
@@ -3209,6 +3320,10 @@ pub fn apply_remote_journal(conn: &Connection, journal: &Value, peer_url: &str) 
     if let Err(error) = verify_stored_config_versions(conn) {
         let _ = conn.execute_batch("ROLLBACK TO verified_sync; RELEASE verified_sync");
         return json!({"ok":false,"error":format!("Проверка сохранённой летописи справочников: {error}")});
+    }
+    if let Err(error) = verify_stored_organization_node_versions(conn) {
+        let _ = conn.execute_batch("ROLLBACK TO verified_sync; RELEASE verified_sync");
+        return json!({"ok":false,"error":format!("Проверка сохранённой структуры: {error}")});
     }
     if let Err(error) = verify_stored_item_state_versions(conn) {
         let _ = conn.execute_batch("ROLLBACK TO verified_sync; RELEASE verified_sync");
@@ -4062,6 +4177,222 @@ fn verify_stored_change_records(conn: &Connection) -> anyhow::Result<usize> {
     let snapshot = export_journal(conn);
     verify_change_records(conn, &snapshot)?;
     Ok(snapshot["changeRequests"].as_array().map_or(0, Vec::len))
+}
+
+fn verify_organization_node_versions(conn: &Connection, journal: &Value) -> anyhow::Result<()> {
+    if journal.get("organizationNodeMode").and_then(Value::as_str) != Some("portable-branches/v1") {
+        anyhow::bail!("journal does not provide portable organization structure");
+    }
+    let records = journal
+        .get("organizationNodeVersions")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("journal has no organization node versions"))?;
+    let by_hash: HashMap<&str, &Value> = records
+        .iter()
+        .filter_map(|record| {
+            record
+                .get("versionHash")
+                .and_then(Value::as_str)
+                .map(|hash| (hash, record))
+        })
+        .collect();
+    if by_hash.len() != records.len() {
+        anyhow::bail!("duplicate organization node version");
+    }
+    let history: HashMap<&str, &Value> = journal
+        .get("history")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|event| {
+            event
+                .get("opId")
+                .and_then(Value::as_str)
+                .map(|hash| (hash, event))
+        })
+        .collect();
+    for record in records {
+        let get = |key: &str| {
+            record
+                .get(key)
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| anyhow::anyhow!("organization node version has no {key}"))
+        };
+        let version = get("versionHash")?;
+        let node = get("nodeGuid")?;
+        let workspace = get("workspaceGuid")?;
+        let actor = get("actorGuid")?;
+        let payload = get("payloadHash")?;
+        let ledger_hash = get("ledgerHash")?;
+        let depth = record
+            .get("depth")
+            .and_then(Value::as_i64)
+            .ok_or_else(|| anyhow::anyhow!("organization node depth missing"))?;
+        let active = record
+            .get("active")
+            .and_then(Value::as_bool)
+            .ok_or_else(|| anyhow::anyhow!("organization node active missing"))?;
+        let fields = record
+            .get("fields")
+            .ok_or_else(|| anyhow::anyhow!("organization node fields missing"))?;
+        if fields
+            .get("name")
+            .and_then(Value::as_str)
+            .is_none_or(|name| name.is_empty() || name.chars().count() > 120)
+            || fields
+                .get("kind")
+                .and_then(Value::as_str)
+                .is_none_or(|kind| kind.is_empty() || kind.chars().count() > 40)
+        {
+            anyhow::bail!("invalid organization node fields");
+        }
+        if organization_node_payload_hash(record)? != payload
+            || organization_node_version_hash(payload, ledger_hash) != version
+        {
+            anyhow::bail!("organization node version hash mismatch");
+        }
+        let parent = record.get("parentHash").and_then(Value::as_str);
+        if depth == 0 {
+            if parent.is_some() {
+                anyhow::bail!("organization node root has parent");
+            }
+        } else {
+            let valid = if let Some(previous) = parent.and_then(|hash| by_hash.get(hash).copied()) {
+                previous.get("depth").and_then(Value::as_i64) == Some(depth - 1)
+                    && previous.get("nodeGuid") == record.get("nodeGuid")
+                    && previous.get("workspaceGuid") == record.get("workspaceGuid")
+            } else if let Some(parent) = parent {
+                conn.query_row("SELECT count(*) FROM organization_node_versions WHERE version_hash=?1 AND depth=?2 AND node_guid=?3 AND workspace_guid=?4",params![parent,depth-1,node,workspace],|r|r.get::<_,i64>(0))?==1
+            } else {
+                false
+            };
+            if !valid {
+                anyhow::bail!("organization node parent unavailable or mismatched");
+            }
+        }
+        let validate = |event: &&Value| {
+            let ty = event.get("type").and_then(Value::as_str);
+            let type_ok = if depth == 0 {
+                matches!(
+                    ty,
+                    Some("organization_node_create" | "organization_node_adopt")
+                )
+            } else if !active {
+                ty == Some("organization_node_archive")
+            } else {
+                ty == Some("organization_node_update")
+            };
+            let proof = [
+                "requestDeviceId",
+                "requestPublicKey",
+                "requestNonce",
+                "requestSignature",
+                "requestHash",
+                "requestTimestamp",
+                "requestPath",
+            ];
+            type_ok
+                && event.get("workspaceGuid").and_then(Value::as_str) == Some(workspace)
+                && event.get("actorGuid").and_then(Value::as_str) == Some(actor)
+                && event.get("fromLabel").and_then(Value::as_str) == Some(node)
+                && event.get("toLabel").and_then(Value::as_str) == Some(payload)
+                && proof.iter().all(|key| {
+                    event
+                        .get(*key)
+                        .and_then(Value::as_str)
+                        .is_some_and(|value| !value.is_empty())
+                })
+        };
+        if let Some(event) = history.get(ledger_hash) {
+            if !validate(event) {
+                anyhow::bail!("organization node ledger evidence mismatch");
+            }
+        } else {
+            let exists:i64=conn.query_row("SELECT count(*) FROM history_entries h JOIN workspaces w ON w.id=h.workspace_id JOIN users u ON u.id=h.actor_user_id WHERE h.hash=?1 AND w.guid=?2 AND u.guid=?3 AND h.from_label=?4 AND h.to_label=?5 AND h.type IN ('organization_node_create','organization_node_adopt','organization_node_update','organization_node_archive') AND h.request_device_id IS NOT NULL AND h.request_signature IS NOT NULL",params![ledger_hash,workspace,actor,node,payload],|r|r.get(0))?;
+            if exists == 0 {
+                anyhow::bail!("organization node ledger event unavailable");
+            }
+        }
+    }
+    let snapshots: HashMap<&str, &Value> = journal
+        .get("organizationNodes")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|node| {
+            node.get("guid")
+                .and_then(Value::as_str)
+                .map(|guid| (guid, node))
+        })
+        .collect();
+    let mut winners: HashMap<&str, &Value> = HashMap::new();
+    for record in records {
+        let node = record["nodeGuid"].as_str().unwrap_or_default();
+        let candidate = (
+            record["depth"].as_i64().unwrap_or(-1),
+            record["versionHash"].as_str().unwrap_or_default(),
+        );
+        if winners.get(node).is_none_or(|current| {
+            candidate
+                > (
+                    current["depth"].as_i64().unwrap_or(-1),
+                    current["versionHash"].as_str().unwrap_or_default(),
+                )
+        }) {
+            winners.insert(node, record);
+        }
+    }
+    let mut parents = HashMap::new();
+    for (guid, winner) in &winners {
+        let snapshot = snapshots
+            .get(guid)
+            .ok_or_else(|| anyhow::anyhow!("organization node snapshot unavailable"))?;
+        let fields = &winner["fields"];
+        for (snapshot_key, field_key) in [
+            ("parentGuid", "parentGuid"),
+            ("kind", "kind"),
+            ("name", "name"),
+            ("tabLabel", "tabLabel"),
+            ("responsibleGuid", "responsibleGuid"),
+            ("displayOrder", "displayOrder"),
+            ("color", "color"),
+            ("icon", "icon"),
+        ] {
+            if snapshot.get(snapshot_key).unwrap_or(&Value::Null)
+                != fields.get(field_key).unwrap_or(&Value::Null)
+            {
+                anyhow::bail!("organization node snapshot mismatch for {field_key}");
+            }
+        }
+        if snapshot.get("archived").and_then(Value::as_bool)
+            != winner
+                .get("active")
+                .and_then(Value::as_bool)
+                .map(|active| !active)
+        {
+            anyhow::bail!("organization node archive mismatch");
+        }
+        parents.insert(*guid, fields.get("parentGuid").and_then(Value::as_str));
+    }
+    for start in parents.keys() {
+        let mut seen = HashSet::new();
+        let mut cursor = Some(*start);
+        while let Some(node) = cursor {
+            if !seen.insert(node) {
+                anyhow::bail!("organization node cycle");
+            }
+            cursor = parents.get(node).copied().flatten();
+        }
+    }
+    Ok(())
+}
+fn verify_stored_organization_node_versions(conn: &Connection) -> anyhow::Result<usize> {
+    let snapshot = export_journal(conn);
+    verify_organization_node_versions(conn, &snapshot)?;
+    Ok(snapshot["organizationNodeVersions"]
+        .as_array()
+        .map_or(0, Vec::len))
 }
 
 fn verify_config_versions(conn: &Connection, journal: &Value) -> anyhow::Result<()> {
@@ -5287,6 +5618,7 @@ pub fn integrity_audit(conn: &Connection) -> Value {
     let change_result = verify_stored_change_records(conn);
     let config_result = verify_stored_config_versions(conn);
     let item_state_result = verify_stored_item_state_versions(conn);
+    let organization_node_result = verify_stored_organization_node_versions(conn);
     let membership_result = verify_membership_records(conn, &snapshot);
 
     let count = |table: &str| -> i64 {
@@ -5376,6 +5708,10 @@ pub fn integrity_audit(conn: &Connection) -> Value {
     let change_error = change_result.as_ref().err().map(ToString::to_string);
     let config_error = config_result.as_ref().err().map(ToString::to_string);
     let item_state_error = item_state_result.as_ref().err().map(ToString::to_string);
+    let organization_node_error = organization_node_result
+        .as_ref()
+        .err()
+        .map(ToString::to_string);
     let membership_error = membership_result.as_ref().err().map(ToString::to_string);
     let healthy = database_check == "ok"
         && ledger_result.is_ok()
@@ -5391,6 +5727,7 @@ pub fn integrity_audit(conn: &Connection) -> Value {
         && change_result.is_ok()
         && config_result.is_ok()
         && item_state_result.is_ok()
+        && organization_node_result.is_ok()
         && membership_result.is_ok()
         && orphan_history == 0
         && missing_guids == 0
@@ -5411,8 +5748,9 @@ pub fn integrity_audit(conn: &Connection) -> Value {
         "changeRequestRecords":count("change_request_records"),
         "configVersions":count("config_versions"),
         "itemStateVersions":count("item_state_versions"),
+        "organizationNodeVersions":count("organization_node_versions"),
     });
-    json!({
+    let mut audit = json!({
         "healthy": healthy,
         "checkedAt": chrono::Utc::now().to_rfc3339(),
         "database": database_check,
@@ -5454,7 +5792,20 @@ pub fn integrity_audit(conn: &Connection) -> Value {
         "pendingDownloads": pending_downloads,
         "counts": counts,
         "ledgerHeads": heads,
-    })
+    });
+    if let Some(object) = audit.as_object_mut() {
+        object.insert(
+            "organizationNodeError".into(),
+            organization_node_error
+                .map(Value::String)
+                .unwrap_or(Value::Null),
+        );
+        object.insert(
+            "organizationNodeVersionsVerified".into(),
+            json!(organization_node_result.unwrap_or(0)),
+        );
+    }
+    audit
 }
 
 /// Used from api.rs without making find_user_phone public — thin wrapper filled in api.
@@ -7114,6 +7465,158 @@ mod tests {
             .as_str()
             .unwrap_or_default()
             .contains("справочников"));
+        drop((source, target, rejected));
+        for path in [source_path, target_path, rejected_path] {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    #[test]
+    fn signed_organization_tree_replication_rejects_snapshot_rewrite() {
+        let source_path =
+            std::env::temp_dir().join(format!("org-tree-source-{}.db", uuid::Uuid::new_v4()));
+        let target_path =
+            std::env::temp_dir().join(format!("org-tree-target-{}.db", uuid::Uuid::new_v4()));
+        let rejected_path =
+            std::env::temp_dir().join(format!("org-tree-rejected-{}.db", uuid::Uuid::new_v4()));
+        let mut source = crate::db::open(&source_path).unwrap();
+        let mut target = crate::db::open(&target_path).unwrap();
+        let rejected = crate::db::open(&rejected_path).unwrap();
+        let created = chrono::Utc::now().to_rfc3339();
+        source.execute("INSERT INTO workspaces(name,internal_id_prefix,created_at,guid) VALUES('Tree org','T-',?1,'tree-workspace')",[&created]).unwrap();
+        let workspace = source.last_insert_rowid();
+        source.execute("INSERT INTO users(full_name,phone,status,role_rights,created_at,guid) VALUES('Owner','+70000000077','active',?1,?2,'tree-owner')",params![crate::db::owner_rights().to_string(),created]).unwrap();
+        let owner = source.last_insert_rowid();
+        source
+            .execute(
+                "INSERT INTO user_workspaces(user_id,workspace_id,rights_json) VALUES(?1,?2,?3)",
+                params![owner, workspace, crate::db::owner_rights().to_string()],
+            )
+            .unwrap();
+        record_membership_version(&source, workspace, owner, true, None, true).unwrap();
+        let key = SigningKey::generate(&mut OsRng);
+        let device = "tree-device-0001";
+        crate::device::register(&source,owner,&json!({"deviceId":device,"name":"Owner phone","publicKey":URL_SAFE_NO_PAD.encode(key.verifying_key().to_bytes())})).unwrap();
+
+        crate::device::set_pending(
+            &source,
+            owner,
+            &signed_device_proof(&key, device, "/api/trpc/admin.organizationNodes.create"),
+        )
+        .unwrap();
+        let division = crate::api::dispatch(
+            &mut source,
+            "admin.organizationNodes.create",
+            &json!({"workspaceId":workspace,"kind":"division","name":"Production"}),
+            Some(owner),
+        )
+        .unwrap();
+        crate::device::set_pending(
+            &source,
+            owner,
+            &signed_device_proof(&key, device, "/api/trpc/admin.organizationNodes.create"),
+        )
+        .unwrap();
+        crate::api::dispatch(&mut source,"admin.organizationNodes.create",&json!({"workspaceId":workspace,"parentId":division["id"],"kind":"warehouse","name":"Offline warehouse"}),Some(owner)).unwrap();
+
+        let valid = export_journal(&source);
+        assert_eq!(
+            valid["organizationNodeVersions"].as_array().unwrap().len(),
+            2
+        );
+        let accepted = apply_remote_journal(&target, &valid, "");
+        assert_eq!(accepted["ok"], true, "{accepted}");
+        assert_eq!(target.query_row("SELECT count(*) FROM organization_nodes WHERE name IN ('Production','Offline warehouse')",[],|r|r.get::<_,i64>(0)).unwrap(),2);
+        assert_eq!(
+            verify_stored_organization_node_versions(&target).unwrap(),
+            2
+        );
+
+        let target_owner = id_by_guid(&target, "users", "tree-owner").unwrap();
+        let target_division = id_by_guid(
+            &target,
+            "organization_nodes",
+            division["guid"].as_str().unwrap(),
+        )
+        .unwrap();
+        crate::device::set_pending(
+            &source,
+            owner,
+            &signed_device_proof(&key, device, "/api/trpc/admin.organizationNodes.update"),
+        )
+        .unwrap();
+        crate::api::dispatch(
+            &mut source,
+            "admin.organizationNodes.update",
+            &json!({"id":division["id"],"name":"Offline branch A"}),
+            Some(owner),
+        )
+        .unwrap();
+        crate::device::set_pending(
+            &target,
+            target_owner,
+            &signed_device_proof(&key, device, "/api/trpc/admin.organizationNodes.update"),
+        )
+        .unwrap();
+        crate::api::dispatch(
+            &mut target,
+            "admin.organizationNodes.update",
+            &json!({"id":target_division,"name":"Offline branch B"}),
+            Some(target_owner),
+        )
+        .unwrap();
+        assert_eq!(
+            apply_remote_journal(&target, &export_journal(&source), "")["ok"],
+            true
+        );
+        let target_branch = export_journal(&target);
+        assert_eq!(
+            apply_remote_journal(&source, &target_branch, "")["ok"],
+            false
+        );
+        approve_node_key(
+            &source,
+            target_branch["journalPublicKey"].as_str().unwrap(),
+            Some("offline target"),
+            owner,
+        )
+        .unwrap();
+        assert_eq!(
+            apply_remote_journal(&source, &target_branch, "")["ok"],
+            true
+        );
+        let source_name: String = source
+            .query_row(
+                "SELECT name FROM organization_nodes WHERE guid=?1",
+                [division["guid"].as_str().unwrap()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let target_name: String = target
+            .query_row(
+                "SELECT name FROM organization_nodes WHERE guid=?1",
+                [division["guid"].as_str().unwrap()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(source_name, target_name, "offline branches must converge");
+        assert_eq!(
+            verify_stored_organization_node_versions(&source).unwrap(),
+            4
+        );
+
+        let mut forged = valid;
+        forged["organizationNodes"][0]["name"] = json!("Forged division");
+        ledger::sign_journal(&source, &mut forged).unwrap();
+        let result = apply_remote_journal(&rejected, &forged, "");
+        assert_eq!(result["ok"], false, "{result}");
+        assert!(
+            result["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("структуры"),
+            "{result}"
+        );
         drop((source, target, rejected));
         for path in [source_path, target_path, rejected_path] {
             let _ = std::fs::remove_file(path);

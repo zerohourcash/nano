@@ -565,6 +565,17 @@ fn migrate(conn: &Connection) -> Result<()> {
          CREATE INDEX IF NOT EXISTS item_state_version_item_idx
            ON item_state_versions(item_guid,depth DESC,version_hash DESC);",
     )?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS organization_node_versions(
+           version_hash TEXT PRIMARY KEY,node_guid TEXT NOT NULL,parent_hash TEXT,
+           depth INTEGER NOT NULL CHECK(depth>=0),workspace_guid TEXT NOT NULL,
+           actor_guid TEXT NOT NULL,active INTEGER NOT NULL CHECK(active IN(0,1)),
+           fields_json TEXT NOT NULL,payload_hash TEXT NOT NULL,
+           ledger_hash TEXT NOT NULL UNIQUE,updated_at TEXT NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS organization_node_version_idx
+           ON organization_node_versions(node_guid,depth DESC,version_hash DESC);",
+    )?;
     let _ = conn.execute("ALTER TABLE chat_messages ADD COLUMN guid TEXT", []);
     let _ = conn.execute("ALTER TABLE chat_messages ADD COLUMN ledger_hash TEXT", []);
     conn.execute_batch(

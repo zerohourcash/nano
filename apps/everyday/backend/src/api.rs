@@ -4879,6 +4879,77 @@ fn validate_node_parent(
     Ok(())
 }
 
+fn organization_node_version_hash(payload_hash: &str, ledger_hash: &str) -> String {
+    format!(
+        "{:x}",
+        Sha256::digest(
+            format!("everyday/organization-node-ledger/v1\n{payload_hash}\n{ledger_hash}")
+                .as_bytes()
+        )
+    )
+}
+fn record_organization_node_version(
+    conn: &Connection,
+    id: i64,
+    uid: i64,
+    operation: &str,
+) -> Result<Value, ApiError> {
+    let node =
+        organization_node_json(conn, id).ok_or_else(|| ApiError::not_found("Раздел не найден"))?;
+    let ws = node["workspaceId"]
+        .as_i64()
+        .ok_or_else(|| ApiError::internal("Нет организации"))?;
+    let guid = node["guid"]
+        .as_str()
+        .ok_or_else(|| ApiError::internal("Нет GUID раздела"))?;
+    validate_config_responsible(conn, ws, node["responsibleUserId"].as_i64())?;
+    let parent_guid = node["parentId"]
+        .as_i64()
+        .and_then(|parent| ledger::guid(conn, "organization_nodes", parent).ok());
+    let responsible_guid = node["responsibleUserId"]
+        .as_i64()
+        .and_then(|user| ledger::guid(conn, "users", user).ok());
+    let fields = json!({"parentGuid":parent_guid,"kind":node["kind"],"name":node["name"],"tabLabel":node["tabLabel"],"responsibleGuid":responsible_guid,"displayOrder":node["displayOrder"],"color":node["color"],"icon":node["icon"]});
+    let parent:Option<(String,i64)>=conn.query_row("SELECT version_hash,depth FROM organization_node_versions WHERE node_guid=?1 ORDER BY depth DESC,version_hash DESC LIMIT 1",[guid],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+    let (parent_hash, depth, event_type) = match (parent, operation) {
+        (Some((hash, depth)), "archive") => (Some(hash), depth + 1, "organization_node_archive"),
+        (Some((hash, depth)), _) => (Some(hash), depth + 1, "organization_node_update"),
+        (None, "create") => (None, 0, "organization_node_create"),
+        (None, _) => (None, 0, "organization_node_adopt"),
+    };
+    let workspace_guid = ledger::guid(conn, "workspaces", ws)
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    let actor_guid =
+        ledger::guid(conn, "users", uid).map_err(|error| ApiError::internal(error.to_string()))?;
+    let updated_at = now();
+    let payload = json!({"domain":"everyday/organization-node/v1","nodeGuid":guid,"parentHash":parent_hash,"depth":depth,"workspaceGuid":workspace_guid,"actorGuid":actor_guid,"active":!node["archived"].as_bool().unwrap_or(false),"fields":fields,"updatedAt":updated_at});
+    let payload_hash = format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&payload).expect("JSON serialization"))
+    );
+    let event = ledger::append(
+        conn,
+        ws,
+        uid,
+        None,
+        event_type,
+        Some(guid),
+        Some(&payload_hash),
+        None,
+        Some(&format!(
+            "Структура: {}",
+            node["name"].as_str().unwrap_or("раздел")
+        )),
+    )
+    .map_err(|error| ApiError::internal(format!("Ошибка журнала: {error}")))?;
+    let ledger_hash = event["opId"]
+        .as_str()
+        .ok_or_else(|| ApiError::internal("Ledger не вернул hash"))?;
+    let version_hash = organization_node_version_hash(&payload_hash, ledger_hash);
+    conn.execute("INSERT INTO organization_node_versions(version_hash,node_guid,parent_hash,depth,workspace_guid,actor_guid,active,fields_json,payload_hash,ledger_hash,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",params![version_hash,guid,parent_hash,depth,workspace_guid,actor_guid,!node["archived"].as_bool().unwrap_or(false),fields.to_string(),payload_hash,ledger_hash,updated_at])?;
+    Ok(json!({"versionHash":version_hash,"ledgerHash":ledger_hash}))
+}
+
 fn organization_node_create(conn: &mut Connection, input: &Value, actor: Option<i64>) -> ApiResult {
     atomic(conn, |conn| {
         organization_node_create_atomic(conn, input, actor)
@@ -4905,19 +4976,11 @@ fn organization_node_create_atomic(
         params![uuid::Uuid::new_v4().to_string(),ws,parent,kind,name,s(input,"tabLabel"),i64v(input,"responsibleUserId"),i64v(input,"displayOrder").unwrap_or(0),s(input,"color"),s(input,"icon"),timestamp],
     )?;
     let id = conn.last_insert_rowid();
-    ledger::append(
-        conn,
-        ws,
-        uid,
-        None,
-        "organization_node_create",
-        None,
-        Some(&name),
-        None,
-        Some(&format!("Создан раздел типа {kind}")),
-    )
-    .map_err(|e| ApiError::internal(format!("Ошибка журнала: {e}")))?;
-    organization_node_json(conn, id).ok_or_else(|| ApiError::internal("Раздел не создан"))
+    let proof = record_organization_node_version(conn, id, uid, "create")?;
+    let mut result =
+        organization_node_json(conn, id).ok_or_else(|| ApiError::internal("Раздел не создан"))?;
+    result["versionHash"] = proof["versionHash"].clone();
+    Ok(result)
 }
 
 fn organization_node_update(conn: &mut Connection, input: &Value, actor: Option<i64>) -> ApiResult {
@@ -4954,21 +5017,9 @@ fn organization_node_update_atomic(
     )?;
     let updated =
         organization_node_json(conn, id).ok_or_else(|| ApiError::not_found("Раздел не найден"))?;
-    ledger::append(
-        conn,
-        ws,
-        uid,
-        None,
-        "organization_node_update",
-        old["name"].as_str(),
-        updated["name"].as_str(),
-        None,
-        Some(&format!(
-            "Изменена структура: {}",
-            updated["name"].as_str().unwrap_or("раздел")
-        )),
-    )
-    .map_err(|e| ApiError::internal(format!("Ошибка журнала: {e}")))?;
+    let proof = record_organization_node_version(conn, id, uid, "update")?;
+    let mut updated = updated;
+    updated["versionHash"] = proof["versionHash"].clone();
     Ok(updated)
 }
 
@@ -4985,8 +5036,7 @@ fn organization_node_remove_atomic(
 ) -> ApiResult {
     let uid = require_user(conn, actor)?;
     let id = i64v(input, "id").ok_or_else(|| ApiError::bad("id"))?;
-    let node =
-        organization_node_json(conn, id).ok_or_else(|| ApiError::not_found("Раздел не найден"))?;
+    organization_node_json(conn, id).ok_or_else(|| ApiError::not_found("Раздел не найден"))?;
     let occupied: i64 = conn.query_row(
         "SELECT (SELECT COUNT(*) FROM organization_nodes WHERE parent_id=?1 AND archived=0) + (SELECT COUNT(*) FROM items WHERE organization_node_id=?1)",
         [id], |r| r.get(0),
@@ -5000,20 +5050,8 @@ fn organization_node_remove_atomic(
         "UPDATE organization_nodes SET archived=1,updated_at=?2 WHERE id=?1",
         params![id, now()],
     )?;
-    let ws = node["workspaceId"].as_i64().unwrap_or(0);
-    ledger::append(
-        conn,
-        ws,
-        uid,
-        None,
-        "organization_node_archive",
-        node["name"].as_str(),
-        None,
-        None,
-        Some("Раздел архивирован"),
-    )
-    .map_err(|e| ApiError::internal(format!("Ошибка журнала: {e}")))?;
-    Ok(json!({"ok":true,"archived":true,"id":id}))
+    let proof = record_organization_node_version(conn, id, uid, "archive")?;
+    Ok(json!({"ok":true,"archived":true,"id":id,"versionHash":proof["versionHash"]}))
 }
 
 fn dict_table(kind: &str) -> Result<&'static str, ApiError> {
