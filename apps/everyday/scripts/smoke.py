@@ -128,6 +128,17 @@ show("storages", storages)
 st_id = storages[0]["id"] if isinstance(storages, list) and storages else None
 nid = owner.call("items.nextInternalId", {"workspaceId": ws_id}, mutation=False)
 show("nextInternalId", nid)
+unsigned_item = owner.call(
+    "items.create",
+    {"workspaceId": ws_id, "title": "Неподписанная карточка"},
+    signed=False,
+)
+check(
+    "unsigned item creation rejected",
+    unsigned_item.get("__http") == 403
+    and "DEVICE_SIGNATURE_REQUIRED" in unsigned_item.get("__body", ""),
+    str(unsigned_item)[:160],
+)
 item = owner.call("items.create", {
     "workspaceId": ws_id, "title": "Перфоратор Bosch GBH", "internalId": nid if isinstance(nid, str) else "ВН-0001",
     "categoryId": cat.get("id") if isinstance(cat, dict) else None,
@@ -150,6 +161,17 @@ check(
     str(item.get("metadata") if isinstance(item, dict) else item)[:180],
 )
 item_id = item.get("id") if isinstance(item, dict) else None
+create_event = next(
+    (entry for entry in item.get("history", []) if entry.get("type") == "create"),
+    {},
+) if isinstance(item, dict) else {}
+check(
+    "item master record is bound to device proof",
+    create_event.get("eventVersion") == 2
+    and create_event.get("requestDeviceId") == owner.signer.device_id
+    and bool(create_event.get("requestHash")),
+    str(create_event)[:220],
+)
 
 lst = owner.call("items.list", {"workspaceId": ws_id}, mutation=False)
 check("items.list returns the item", isinstance(lst, (list, dict)) and json.dumps(lst, ensure_ascii=False).find("Перфоратор") >= 0)

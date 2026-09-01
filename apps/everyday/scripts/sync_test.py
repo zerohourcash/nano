@@ -334,6 +334,19 @@ def main() -> int:
             and all(event.get("requestSignature") for event in administrative_events),
             str(administrative_events)[:300],
         )
+        item_events = [
+            event
+            for event in journal.get("history", [])
+            if event.get("type") in {"create", "update"}
+            and event.get("itemGuid") == server_item.get("guid")
+        ]
+        check(
+            "создание и изменение карточки имеют переносимый device-proof",
+            len(item_events) == 2
+            and all(event.get("requestDeviceId") for event in item_events)
+            and all(event.get("requestSignature") for event in item_events),
+            str(item_events)[:300],
+        )
 
         node.call("sync.pullNow", {})
 

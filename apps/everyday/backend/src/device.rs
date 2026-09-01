@@ -23,7 +23,9 @@ pub struct Proof {
 pub fn requires_signature(procedure: &str) -> bool {
     matches!(
         procedure,
-        "transfers.take"
+        "items.create"
+            | "items.update"
+            | "transfers.take"
             | "transfers.takeMany"
             | "transfers.returnItem"
             | "transfers.prepare"
@@ -310,6 +312,15 @@ mod tests {
         }
         assert!(!requires_signature("admin.users.list"));
         assert!(!requires_signature("admin.organizationNodes.list"));
+    }
+
+    #[test]
+    fn inventory_master_data_changes_require_device_signature() {
+        for procedure in ["items.create", "items.update", "items.addDocument"] {
+            assert!(requires_signature(procedure), "unsigned {procedure}");
+        }
+        assert!(!requires_signature("items.list"));
+        assert!(!requires_signature("items.byCode"));
     }
 
     #[test]

@@ -201,10 +201,26 @@ async fn trpc(
     let batched = calls.len() > 1 || q.get("batch").map(|s| s.as_str()) == Some("1");
     let mut conn = state.db.lock();
     let uid = auth::resolve_session(&conn, token.as_deref());
-    if calls
+    let signed_call_count = calls
         .iter()
-        .any(|(procedure, _)| device::requires_signature(procedure))
-    {
+        .filter(|(procedure, _)| device::requires_signature(procedure))
+        .count();
+    // pending_device_proofs хранит одно доказательство на пользователя. Если
+    // разрешить batch, первый ledger::append заберёт proof, а последующие
+    // события останутся только node-signed. Один HTTP-запрос = одна
+    // пользовательская транзакция сохраняет точную и проверяемую связь.
+    if signed_call_count > 0 && calls.len() != 1 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(err_payload(&api::ApiError::new(
+                "SIGNED_BATCH_FORBIDDEN",
+                400,
+                "Подписываемые операции должны отправляться отдельными запросами",
+            ))),
+        )
+            .into_response();
+    }
+    if signed_call_count == 1 {
         let verified = uid.ok_or("Войдите в систему").and_then(|user_id| {
             let proof = device::verify_request(
                 &conn,
