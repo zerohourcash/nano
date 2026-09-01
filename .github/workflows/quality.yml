@@ -32,8 +32,6 @@ jobs:
           cache-dependency-path: apps/everyday/package-lock.json
       - uses: android-actions/setup-android@v3
       - uses: gradle/actions/setup-gradle@v4
-        with:
-          gradle-version: '8.7'
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-linux-android,x86_64-linux-android
@@ -47,7 +45,7 @@ jobs:
         run: npm ci && npm run build:web
       - name: Build autonomous Android debug APK
         working-directory: apps/everyday
-        run: gradle -p android assembleDebug
+        run: node scripts/run-gradle.mjs assembleDebug
       - name: Verify Rust libraries and APK
         working-directory: apps/everyday
         run: |
@@ -69,4 +67,4 @@ jobs:
           arch: x86_64
           working-directory: apps/everyday/android
           emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim -camera-back none
-          script: gradle connectedDebugAndroidTest
+          script: ./gradlew connectedDebugAndroidTest

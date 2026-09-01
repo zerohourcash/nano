@@ -80,8 +80,8 @@ final class BleBundleSpool {
             byte[] bytes = readBounded(claimed);
             return new String(bytes, StandardCharsets.UTF_8);
         } catch (IOException error) {
-            File corrupt = new File(directory, "incoming-corrupt.bundle");
-            discard(corrupt);
+            File corrupt = new File(directory, "quarantine-corrupt-"
+                    + System.currentTimeMillis() + "-" + UUID.randomUUID() + ".bundle");
             if (!claimed.renameTo(corrupt)) discard(claimed);
             syncDirectory(directory);
             throw error;

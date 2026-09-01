@@ -81,6 +81,9 @@ public class BleBundleSpoolTest {
             fail("empty claim must be rejected");
         } catch (java.io.IOException expected) {
             assertEquals(0, BleBundleSpool.pendingIncoming(context));
+            File[] quarantined = directory.listFiles((dir, name) ->
+                    name.startsWith("quarantine-corrupt-") && name.endsWith(".bundle"));
+            assertEquals(1, quarantined == null ? 0 : quarantined.length);
         }
     }
 

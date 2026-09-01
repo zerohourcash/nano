@@ -457,7 +457,7 @@ cargo clippy --manifest-path backend/Cargo.toml --all-targets -- -D warnings
 cargo test --manifest-path backend/Cargo.toml
 ```
 
-Android CI дополнительно запускает `gradle connectedDebugAndroidTest` на API 34
+Android CI дополнительно запускает `./gradlew connectedDebugAndroidTest` на API 34
 x86_64 emulator. Этот gate исполняет durable BLE spool: восстановление после
 незавершённой замены, bounded-очередь, quarantine повреждения и цикл
 `claim → reject/retry → accept`. Реальный BLE RF всё равно проверяется по

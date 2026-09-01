@@ -61,11 +61,16 @@ required = {
         and "BleBundleSpool.takeIncoming" in activity
         and "BleBundleSpool.acknowledgeIncoming" in activity
         and "acknowledgePendingSyncBundle" in activity,
+    "corrupt BLE bundles leave the delivery namespace": '"quarantine-corrupt-"' in ble_spool
+        and 'name.startsWith("incoming-")' in ble_spool
+        and 'name.startsWith("quarantine-corrupt-")' in (android / "src/androidTest/java/ru/meshkeeper/app/BleBundleSpoolTest.java").read_text(encoding="utf-8"),
     "connected-device foreground declaration": "FOREGROUND_SERVICE_CONNECTED_DEVICE" in manifest
         and 'foregroundServiceType="dataSync|connectedDevice"' in manifest,
     "BLE spool instrumentation regression": (android / "src/androidTest/java/ru/meshkeeper/app/BleBundleSpoolTest.java").is_file()
         and "testInstrumentationRunner" in gradle
         and "connectedDebugAndroidTest" in quality_workflow
+        and "script: ./gradlew connectedDebugAndroidTest" in quality_workflow
+        and "run: node scripts/run-gradle.mjs assembleDebug" in quality_workflow
         and "reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d" in quality_workflow,
     "Android backup and device transfer disabled": "dataExtractionRules" in manifest
         and (android / "src/main/res/xml/data_extraction_rules.xml").is_file(),
