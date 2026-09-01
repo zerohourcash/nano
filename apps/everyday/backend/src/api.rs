@@ -10772,10 +10772,12 @@ mod tests {
         let division = dispatch(
             &mut conn,
             "admin.organizationNodes.create",
-            &json!({"workspaceId":ws,"kind":"division","name":"Сервис","tabLabel":"Сервис"}),
+            &json!({"workspaceId":ws,"kind":"мастерская","name":"Сервис","tabLabel":"Сервис","responsibleUserId":users[0]}),
             Some(users[0]),
         )
         .unwrap();
+        assert_eq!(division["kind"], "мастерская");
+        assert_eq!(division["responsible"]["id"], users[0]);
         let room = dispatch(
             &mut conn,
             "admin.organizationNodes.create",

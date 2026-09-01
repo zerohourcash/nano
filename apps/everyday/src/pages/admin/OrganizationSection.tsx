@@ -10,6 +10,8 @@ type Node = {
   name: string
   tabLabel: string | null
   displayOrder: number
+  responsibleUserId: number | null
+  responsible?: { id: number; fullName: string } | null
 }
 
 const KINDS = [
@@ -18,8 +20,10 @@ const KINDS = [
   ['warehouse', 'Склад'],
   ['floor', 'Этаж'],
   ['room', 'Кабинет'],
-  ['section', 'Произвольный раздел'],
+  ['section', 'Раздел'],
 ] as const
+
+const kindLabel = (kind: string) => KINDS.find(([value]) => value === kind)?.[1] ?? kind
 
 function flatten(nodes: Node[], parentId: number | null = null, depth = 0): Array<Node & { depth: number }> {
   return nodes
@@ -46,18 +50,21 @@ export default function OrganizationSection() {
   const toast = useToast()
   const utils = trpc.useUtils()
   const { data = [], isLoading } = trpc.admin.organizationNodes.list.useQuery({})
+  const usersQ = trpc.admin.users.list.useQuery({})
   const nodes = data as Node[]
   const rows = useMemo(() => flatten(nodes), [nodes])
   const [name, setName] = useState('')
   const [kind, setKind] = useState('division')
   const [parentId, setParentId] = useState('')
   const [tabLabel, setTabLabel] = useState('')
+  const [responsibleUserId, setResponsibleUserId] = useState('')
   const [editingId, setEditingId] = useState<number | null>(null)
   const resetForm = () => {
     setName('')
     setKind('division')
     setParentId('')
     setTabLabel('')
+    setResponsibleUserId('')
     setEditingId(null)
   }
   const create = trpc.admin.organizationNodes.create.useMutation({
@@ -88,6 +95,7 @@ export default function OrganizationSection() {
     setKind(node.kind)
     setParentId(node.parentId ? String(node.parentId) : '')
     setTabLabel(node.tabLabel ?? '')
+    setResponsibleUserId(node.responsibleUserId ? String(node.responsibleUserId) : '')
     window.scrollTo({ top: 0, behavior: 'smooth' })
   }
 
@@ -101,7 +109,7 @@ export default function OrganizationSection() {
         </p>
       </div>
       <form
-        className={cardCls + ' grid gap-3 p-4 md:grid-cols-2 xl:grid-cols-5'}
+        className={cardCls + ' grid gap-3 p-4 md:grid-cols-2 xl:grid-cols-3'}
         onSubmit={(event) => {
           event.preventDefault()
           if (!name.trim()) return
@@ -110,22 +118,43 @@ export default function OrganizationSection() {
             kind,
             parentId: parentId ? Number(parentId) : null,
             tabLabel: tabLabel.trim() || null,
+            responsibleUserId: responsibleUserId ? Number(responsibleUserId) : null,
           }
           if (editingId === null) create.mutate(fields)
           else update.mutate({ id: editingId, ...fields })
         }}
       >
         <input className={inputCls} aria-label="Название раздела" placeholder="Например, кабинет 204" value={name} onChange={(e) => setName(e.target.value)} />
-        <select className={inputCls} aria-label="Тип раздела" value={kind} onChange={(e) => setKind(e.target.value)}>
+        <select
+          className={inputCls}
+          aria-label="Тип раздела"
+          value={KINDS.some(([value]) => value === kind) ? kind : '__custom__'}
+          onChange={(e) => setKind(e.target.value === '__custom__' ? '' : e.target.value)}
+        >
           {KINDS.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
+          <option value="__custom__">Собственный тип…</option>
         </select>
+        {!KINDS.some(([value]) => value === kind) && (
+          <input
+            className={inputCls}
+            aria-label="Собственный тип раздела"
+            placeholder="Например, мастерская"
+            maxLength={40}
+            value={kind}
+            onChange={(event) => setKind(event.target.value)}
+          />
+        )}
         <select className={inputCls} aria-label="Родительский раздел" value={parentId} onChange={(e) => setParentId(e.target.value)}>
           <option value="">Верхний уровень</option>
           {rows.filter((node) => !forbiddenParents.has(node.id)).map((node) => <option key={node.id} value={node.id}>{'— '.repeat(node.depth)}{node.name}</option>)}
         </select>
         <input className={inputCls} aria-label="Название вкладки" placeholder="Название вкладки (необязательно)" value={tabLabel} onChange={(e) => setTabLabel(e.target.value)} />
+        <select className={inputCls} aria-label="Ответственный за раздел" value={responsibleUserId} onChange={(event) => setResponsibleUserId(event.target.value)}>
+          <option value="">Без ответственного</option>
+          {(usersQ.data ?? []).map((user) => <option key={user.id} value={user.id}>{user.fullName}</option>)}
+        </select>
         <div className="flex gap-2">
-          <button className={`${btnPrimaryCls} flex-1`} type="submit" disabled={!name.trim() || create.isPending || update.isPending}>
+          <button className={`${btnPrimaryCls} flex-1`} type="submit" disabled={!name.trim() || !kind.trim() || create.isPending || update.isPending}>
             {editingId === null ? <><Plus size={17} /> Добавить</> : <><Check size={17} /> Сохранить</>}
           </button>
           {editingId !== null && (
@@ -152,7 +181,11 @@ export default function OrganizationSection() {
                 {node.depth > 0 && <ChevronRight size={15} className="text-ink-300" />}
                 <div className="min-w-0 flex-1">
                   <p className="truncate font-semibold text-ink-900">{node.name}</p>
-                  <p className="text-xs text-ink-500">{node.kind}{node.tabLabel ? ' · вкладка «' + node.tabLabel + '»' : ''}</p>
+                  <p className="text-xs text-ink-500">
+                    {kindLabel(node.kind)}
+                    {node.tabLabel ? ' · вкладка «' + node.tabLabel + '»' : ''}
+                    {node.responsible?.fullName ? ' · ответственный: ' + node.responsible.fullName : ''}
+                  </p>
                 </div>
                 <div className="flex gap-2">
                   <button

@@ -59,6 +59,7 @@ export type OrganizationNodeDto = {
   name: string
   tabLabel: string | null
   responsibleUserId: number | null
+  responsible?: { id: number; fullName: string } | null
   displayOrder: number
   color: string | null
   icon: string | null

@@ -174,8 +174,12 @@ test('browser signs a real custody transaction and ledger retains its proof', as
   await page.getByRole('button', { name: 'Структура', exact: true }).first().click();
   await page.getByRole('button', { name: 'Изменить Сервисное подразделение' }).click();
   await page.getByLabel('Название вкладки').fill('Ремонт E2E');
+  await page.getByLabel('Тип раздела').selectOption('__custom__');
+  await page.getByLabel('Собственный тип раздела').fill('мастерская');
+  await page.getByLabel('Ответственный за раздел').selectOption({ label: 'Елена Владелец' });
   await page.getByRole('button', { name: 'Сохранить', exact: true }).click();
   await expect(page.getByText('Изменения раздела подписаны и сохранены')).toBeVisible();
+  await expect(page.getByText(/мастерская.*ответственный: Елена Владелец/)).toBeVisible();
   await page.goto('/');
   await expect(page.getByRole('button', { name: 'Ремонт E2E', exact: true })).toBeVisible();
   await page.goto(`/tool/${itemId}`);
