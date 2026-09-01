@@ -134,8 +134,41 @@ def main() -> int:
         check("отправитель получил hash летописи получателя, но не внутреннюю базу",
               receipt is not None
               and receipt["acceptanceLedgerHash"] == accepted["ledgerHash"]
-              and len(receipt["receiptEnvelopeId"]) == 36,
+              and len(receipt["receiptEnvelopeId"]) == 36
+              and receipt["acceptanceProofVerified"] is True
+              and receipt["acceptanceProof"]["type"] == "interorg_accept"
+              and receipt["acceptanceProof"]["toLabel"] == transaction_id
+              and receipt["acceptanceProof"]["requestPath"] == "/api/trpc/interorg.accept",
               str(receipt))
+        audit = a.call("sync.audit", None, mutation=False)
+        check("общий аудит повторно проверил межорганизационное device+node proof",
+              audit.get("healthy") is True
+              and audit.get("interorgReceiptsVerified", 0) >= 1,
+              str(audit.get("interorgReceiptError")))
+        with sqlite3.connect(a.db) as database:
+            original_proof = database.execute(
+                "SELECT acceptance_proof_json FROM interorg_outbox WHERE transaction_id=?",
+                (transaction_id,),
+            ).fetchone()[0]
+            forged_proof = json.loads(original_proof)
+            forged_proof["toLabel"] = str(uuid.uuid4())
+            database.execute(
+                "UPDATE interorg_outbox SET acceptance_proof_json=? WHERE transaction_id=?",
+                (json.dumps(forged_proof), transaction_id),
+            )
+            database.commit()
+        forged_audit = a.call("sync.audit", None, mutation=False)
+        forged_outbox = a.call("interorg.outbox", {"workspaceId": ws_a["id"]}, mutation=False)
+        check("локальная подмена сохранённой квитанции обнаружена при чтении и полном аудите",
+              forged_audit.get("healthy") is False
+              and "proof mismatch" in (forged_audit.get("interorgReceiptError") or "")
+              and forged_outbox[0]["acceptanceProofVerified"] is False)
+        with sqlite3.connect(a.db) as database:
+            database.execute(
+                "UPDATE interorg_outbox SET acceptance_proof_json=? WHERE transaction_id=?",
+                (original_proof, transaction_id),
+            )
+            database.commit()
         with sqlite3.connect(b.db) as database:
             accepted_rows = database.execute(
                 "SELECT COUNT(*) FROM history_entries WHERE type='interorg_accept' AND to_label=?",

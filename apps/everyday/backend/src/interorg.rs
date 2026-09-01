@@ -26,6 +26,53 @@ const MAX_PER_SENDER: i64 = 128;
 const AAD: &[u8] = b"everyday/interorg-envelope/v1";
 const IDENTITY_AAD: &[u8] = b"everyday/interorg-identity/v1";
 
+fn same_public_key(left: &str, right: &str) -> bool {
+    let decode = |value: &str| B64.decode(value).or_else(|_| STANDARD_NO_PAD.decode(value));
+    matches!((decode(left), decode(right)), (Ok(left), Ok(right)) if left.len() == 32 && left == right)
+}
+
+fn acceptance_proof_matches(
+    event: &serde_json::Value,
+    sender_key: &str,
+    remote_workspace: &str,
+    original_transaction: &str,
+    original_envelope: &str,
+    ledger_hash: &str,
+    accepted_at: &str,
+) -> bool {
+    let signed_input = event
+        .get("requestBody")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|body| serde_json::from_str::<serde_json::Value>(body).ok())
+        .and_then(|body| {
+            body.get("0")
+                .and_then(|value| value.get("json"))
+                .or_else(|| body.get("json"))
+                .cloned()
+        });
+    crate::ledger::verify_portable_v3_event(event).is_ok()
+        && event
+            .get("pubkey")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|key| same_public_key(key, sender_key))
+        && event
+            .get("workspaceGuid")
+            .and_then(serde_json::Value::as_str)
+            == Some(remote_workspace)
+        && event.get("type").and_then(serde_json::Value::as_str) == Some("interorg_accept")
+        && event.get("toLabel").and_then(serde_json::Value::as_str) == Some(original_transaction)
+        && event.get("fromLabel").and_then(serde_json::Value::as_str) == Some(original_envelope)
+        && event.get("opId").and_then(serde_json::Value::as_str) == Some(ledger_hash)
+        && event.get("createdAt").and_then(serde_json::Value::as_str) == Some(accepted_at)
+        && event.get("requestPath").and_then(serde_json::Value::as_str)
+            == Some("/api/trpc/interorg.accept")
+        && signed_input
+            .as_ref()
+            .and_then(|input| input.get("envelopeId"))
+            .and_then(serde_json::Value::as_str)
+            == Some(original_envelope)
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct Envelope {
@@ -89,9 +136,21 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
            kind TEXT NOT NULL, created_at TEXT NOT NULL,
            status TEXT NOT NULL DEFAULT 'queued',
            accepted_at TEXT, acceptance_ledger_hash TEXT, receipt_envelope_id TEXT,
+           acceptance_proof_json TEXT,
            PRIMARY KEY(workspace_id,transaction_id)
          );",
     )?;
+    let has_acceptance_proof = conn
+        .prepare("PRAGMA table_info(interorg_outbox)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .flatten()
+        .any(|name| name == "acceptance_proof_json");
+    if !has_acceptance_proof {
+        conn.execute(
+            "ALTER TABLE interorg_outbox ADD COLUMN acceptance_proof_json TEXT",
+            [],
+        )?;
+    }
     let replay_index_exists: bool = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name='interorg_transaction_replay_idx')",
         [],
@@ -325,18 +384,65 @@ pub fn send_to_contact(
 pub fn outbox(conn: &Connection, workspace_id: i64) -> Result<serde_json::Value> {
     let mut statement = conn.prepare(
         "SELECT o.transaction_id,o.envelope_id,o.kind,o.created_at,o.status,o.accepted_at,
-                o.acceptance_ledger_hash,o.receipt_envelope_id,c.guid,c.name,c.remote_workspace_guid
+                o.acceptance_ledger_hash,o.receipt_envelope_id,o.acceptance_proof_json,c.guid,c.name,c.remote_workspace_guid,c.signing_key
          FROM interorg_outbox o JOIN interorg_contacts c ON c.guid=o.contact_guid
          WHERE o.workspace_id=?1 ORDER BY o.created_at DESC",
     )?;
-    let rows = statement.query_map([workspace_id], |row| Ok(serde_json::json!({
-        "transactionId":row.get::<_,String>(0)?, "envelopeId":row.get::<_,String>(1)?,
-        "kind":row.get::<_,String>(2)?, "createdAt":row.get::<_,String>(3)?,
-        "status":row.get::<_,String>(4)?, "acceptedAt":row.get::<_,Option<String>>(5)?,
-        "acceptanceLedgerHash":row.get::<_,Option<String>>(6)?, "receiptEnvelopeId":row.get::<_,Option<String>>(7)?,
-        "contact":{"guid":row.get::<_,String>(8)?,"name":row.get::<_,String>(9)?,"remoteWorkspaceGuid":row.get::<_,String>(10)?}
-    })))?;
+    let rows = statement.query_map([workspace_id], |row| {
+        let transaction_id = row.get::<_, String>(0)?;
+        let envelope_id = row.get::<_, String>(1)?;
+        let accepted_at = row.get::<_, Option<String>>(5)?;
+        let ledger_hash = row.get::<_, Option<String>>(6)?;
+        let proof = row
+            .get::<_, Option<String>>(8)?
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok());
+        let remote_workspace = row.get::<_, String>(11)?;
+        let signing_key = row.get::<_, String>(12)?;
+        let proof_verified = proof.as_ref().is_some_and(|event| {
+            acceptance_proof_matches(
+                event,
+                &signing_key,
+                &remote_workspace,
+                &transaction_id,
+                &envelope_id,
+                ledger_hash.as_deref().unwrap_or_default(),
+                accepted_at.as_deref().unwrap_or_default(),
+            )
+        });
+        Ok(serde_json::json!({
+            "transactionId":transaction_id, "envelopeId":envelope_id,
+            "kind":row.get::<_,String>(2)?, "createdAt":row.get::<_,String>(3)?,
+            "status":row.get::<_,String>(4)?, "acceptedAt":accepted_at,
+            "acceptanceLedgerHash":ledger_hash, "receiptEnvelopeId":row.get::<_,Option<String>>(7)?,
+            "acceptanceProof":proof, "acceptanceProofVerified":proof_verified,
+            "contact":{"guid":row.get::<_,String>(9)?,"name":row.get::<_,String>(10)?,"remoteWorkspaceGuid":remote_workspace}
+        }))
+    })?;
     Ok(serde_json::Value::Array(rows.flatten().collect()))
+}
+
+pub fn verify_outbox(conn: &Connection) -> Result<usize> {
+    let mut workspaces = conn.prepare("SELECT DISTINCT workspace_id FROM interorg_outbox")?;
+    let ids: Vec<i64> = workspaces
+        .query_map([], |row| row.get(0))?
+        .flatten()
+        .collect();
+    let mut verified = 0;
+    for workspace_id in ids {
+        for row in outbox(conn, workspace_id)?.as_array().into_iter().flatten() {
+            if row.get("status").and_then(serde_json::Value::as_str) == Some("accepted") {
+                if row
+                    .get("acceptanceProofVerified")
+                    .and_then(serde_json::Value::as_bool)
+                    != Some(true)
+                {
+                    bail!("interorg acceptance proof mismatch")
+                }
+                verified += 1;
+            }
+        }
+    }
+    Ok(verified)
 }
 
 /// Marks an inbox transaction accepted and emits a separately encrypted,
@@ -347,7 +453,7 @@ pub fn accept_with_receipt(
     conn: &Connection,
     workspace_id: i64,
     envelope_id: &str,
-    acceptance_ledger_hash: &str,
+    acceptance_event: &serde_json::Value,
     work_bits: u8,
 ) -> Result<Envelope> {
     let (contact_guid, original_transaction): (String, String) = conn.query_row(
@@ -356,7 +462,15 @@ pub fn accept_with_receipt(
         params![envelope_id, workspace_id],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
-    let accepted_at = Utc::now().to_rfc3339();
+    crate::ledger::verify_portable_v3_event(acceptance_event)?;
+    let acceptance_ledger_hash = acceptance_event
+        .get("opId")
+        .and_then(serde_json::Value::as_str)
+        .context("acceptance event hash missing")?;
+    let accepted_at = acceptance_event
+        .get("createdAt")
+        .and_then(serde_json::Value::as_str)
+        .context("acceptance event timestamp missing")?;
     conn.execute(
         "UPDATE interorg_inbox SET accepted=1 WHERE envelope_id=?1 AND workspace_id=?2 AND accepted=0",
         params![envelope_id, workspace_id],
@@ -371,6 +485,7 @@ pub fn accept_with_receipt(
             "originalTransactionId": original_transaction,
             "acceptedAt": accepted_at,
             "acceptanceLedgerHash": acceptance_ledger_hash,
+            "acceptanceEvent": acceptance_event,
         }),
         work_bits,
     )
@@ -448,24 +563,45 @@ pub fn receive_local(conn: &Connection, work_bits: u8) -> Result<usize> {
                     .body
                     .get("acceptanceLedgerHash")
                     .and_then(serde_json::Value::as_str);
+                let acceptance_event = payload.body.get("acceptanceEvent");
                 let valid = original.is_some_and(|value| uuid::Uuid::parse_str(value).is_ok())
                     && accepted_at.is_some_and(|value| DateTime::parse_from_rfc3339(value).is_ok())
                     && ledger_hash.is_some_and(|value| {
                         value.len() == 64 && hex::decode(value).is_ok_and(|bytes| bytes.len() == 32)
+                    })
+                    && acceptance_event.is_some_and(|event| {
+                        acceptance_proof_matches(
+                            event,
+                            &envelope.sender_signing_key,
+                            &remote_workspace,
+                            original.unwrap_or_default(),
+                            event
+                                .get("fromLabel")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or_default(),
+                            ledger_hash.unwrap_or_default(),
+                            accepted_at.unwrap_or_default(),
+                        )
                     });
                 let changed = if valid {
+                    let proof = serde_json::to_string(acceptance_event.expect("checked above"))?;
                     conn.execute(
                         "UPDATE interorg_outbox SET status='accepted',accepted_at=?1,
-                           acceptance_ledger_hash=?2,receipt_envelope_id=?3
-                         WHERE workspace_id=?4 AND contact_guid=?5 AND transaction_id=?6
+                           acceptance_ledger_hash=?2,receipt_envelope_id=?3,acceptance_proof_json=?4
+                         WHERE workspace_id=?5 AND contact_guid=?6 AND transaction_id=?7
+                           AND envelope_id=?8
                            AND status='queued'",
                         params![
                             accepted_at,
                             ledger_hash,
                             envelope.id,
+                            proof,
                             workspace_id,
                             contact_guid,
-                            original
+                            original,
+                            acceptance_event
+                                .and_then(|event| event.get("fromLabel"))
+                                .and_then(serde_json::Value::as_str)
                         ],
                     )?
                 } else {
@@ -988,6 +1124,14 @@ mod tests {
                kind TEXT NOT NULL, body_json TEXT NOT NULL,
                received_at TEXT NOT NULL, accepted INTEGER NOT NULL DEFAULT 0
              );
+             CREATE TABLE interorg_outbox(
+               workspace_id INTEGER NOT NULL, transaction_id TEXT NOT NULL,
+               envelope_id TEXT NOT NULL, contact_guid TEXT NOT NULL,
+               kind TEXT NOT NULL, created_at TEXT NOT NULL,
+               status TEXT NOT NULL DEFAULT 'queued', accepted_at TEXT,
+               acceptance_ledger_hash TEXT, receipt_envelope_id TEXT,
+               PRIMARY KEY(workspace_id,transaction_id)
+             );
              INSERT INTO interorg_inbox VALUES
                ('first',1,'contact','tx','invoice','{\"amount\":1}','2026-01-01T00:00:00Z',1),
                ('forged',1,'contact','tx','invoice','{\"amount\":999}','2026-01-02T00:00:00Z',0);",
@@ -1002,6 +1146,9 @@ mod tests {
             )
             .unwrap();
         assert_eq!(retained, ("first".into(), "{\"amount\":1}".into(), true));
+        assert!(db
+            .prepare("SELECT acceptance_proof_json FROM interorg_outbox")
+            .is_ok());
         assert!(db
             .execute(
                 "INSERT INTO interorg_inbox VALUES('new',1,'contact','tx','invoice','{}','2026-01-03T00:00:00Z',0)",
@@ -1103,22 +1250,8 @@ mod tests {
             .unwrap();
         assert_eq!(replay_state, 2);
 
-        // Acceptance creates an opaque return receipt. Until that independent
-        // envelope crosses the partition, A only knows the operation is queued.
-        let acceptance_hash = "ab".repeat(32);
-        let receipt =
-            accept_with_receipt(&b, 1, envelope.id.as_str(), &acceptance_hash, 8).unwrap();
-        assert_eq!(outbox(&a, 1).unwrap()[0]["status"], "queued");
-        assert!(relay_store(&a, &receipt, 8).unwrap());
-        assert_eq!(receive_local(&a, 8).unwrap(), 1);
-        let sent = outbox(&a, 1).unwrap();
-        assert_eq!(sent[0]["status"], "accepted");
-        assert_eq!(sent[0]["acceptanceLedgerHash"], acceptance_hash);
-        assert_eq!(sent[0]["receiptEnvelopeId"], receipt.id);
-        assert_eq!(receive_local(&a, 8).unwrap(), 0);
-
-        // Even a cryptographically valid receipt from the trusted organization
-        // cannot acknowledge a transaction that A never sent to that contact.
+        // A node-signed receipt without a verifiable V3 user acceptance proof
+        // cannot acknowledge a transaction, even from a trusted contact.
         let forged_receipt = send_to_contact(
             &b,
             1,
@@ -1129,6 +1262,7 @@ mod tests {
                 "originalTransactionId": uuid::Uuid::new_v4().to_string(),
                 "acceptedAt": Utc::now().to_rfc3339(),
                 "acceptanceLedgerHash": "cd".repeat(32),
+                "acceptanceEvent": null,
             }),
             8,
         )

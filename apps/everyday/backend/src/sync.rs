@@ -6906,6 +6906,7 @@ pub fn integrity_audit(conn: &Connection) -> Value {
     let chat_intent_result = verify_chat_records(conn, &snapshot);
     let sale_offer_result = verify_sale_offers(&snapshot);
     let membership_result = verify_membership_records(conn, &snapshot);
+    let interorg_receipt_result = crate::interorg::verify_outbox(conn);
 
     let count = |table: &str| -> i64 {
         conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
@@ -7009,6 +7010,10 @@ pub fn integrity_audit(conn: &Connection) -> Value {
     let chat_intent_error = chat_intent_result.as_ref().err().map(ToString::to_string);
     let membership_error = membership_result.as_ref().err().map(ToString::to_string);
     let sale_offer_error = sale_offer_result.as_ref().err().map(ToString::to_string);
+    let interorg_receipt_error = interorg_receipt_result
+        .as_ref()
+        .err()
+        .map(ToString::to_string);
     let healthy = database_check == "ok"
         && ledger_result.is_ok()
         && chat_result.is_ok()
@@ -7031,6 +7036,7 @@ pub fn integrity_audit(conn: &Connection) -> Value {
         && chat_intent_result.is_ok()
         && membership_result.is_ok()
         && sale_offer_result.is_ok()
+        && interorg_receipt_result.is_ok()
         && orphan_history == 0
         && missing_guids == 0
         && missing_blobs == 0
@@ -7054,6 +7060,7 @@ pub fn integrity_audit(conn: &Connection) -> Value {
         "inventoryRecords":count("inventory_records"),
         "photos":count("item_photos"),
         "documents":count("item_documents"),
+        "interorgOutbox":count("interorg_outbox"),
     });
     let mut audit = json!({
         "healthy": healthy,
@@ -7106,6 +7113,16 @@ pub fn integrity_audit(conn: &Connection) -> Value {
         object.insert(
             "saleOfferError".into(),
             sale_offer_error.map(Value::String).unwrap_or(Value::Null),
+        );
+        object.insert(
+            "interorgReceiptsVerified".into(),
+            json!(interorg_receipt_result.as_ref().copied().unwrap_or(0)),
+        );
+        object.insert(
+            "interorgReceiptError".into(),
+            interorg_receipt_error
+                .map(Value::String)
+                .unwrap_or(Value::Null),
         );
         object.insert(
             "inventoryError".into(),

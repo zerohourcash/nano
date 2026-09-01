@@ -333,6 +333,7 @@ pub fn append(
     )?;
     Ok(json!({
         "id":conn.last_insert_rowid(),"opId":hash,"workspaceId":workspace_id,
+        "workspaceGuid":workspace_guid,"actorGuid":actor_guid,"itemGuid":item_guid,
         "itemId":item_id,"type":op_type,"actorUserId":actor_id,"fromLabel":from_label,
         "toLabel":to_label,"quantityDelta":quantity_delta,"comment":comment,
         "prevHash":prev_hash,"signature":signature,"pubkey":pubkey,"eventVersion":event_version,
@@ -342,6 +343,79 @@ pub fn append(
         "requestTimestamp":proof.timestamp,"requestPath":proof.path,"requestBody":proof.body,
         "createdAt":ts,"guid":nonce
     }))
+}
+
+/// Verifies a self-contained V3 event received outside the organization's
+/// journal. This proves both the gateway's Ledger signature and the end-user
+/// device signature over the exact retained HTTP request body. Authorization
+/// remains the remote organization's responsibility; the caller must also
+/// check the event's semantic fields against its local transaction.
+pub fn verify_portable_v3_event(event: &Value) -> anyhow::Result<()> {
+    let required = |name: &str| -> anyhow::Result<&str> {
+        event
+            .get(name)
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("portable ledger event missing {name}"))
+    };
+    if event.get("eventVersion").and_then(Value::as_i64) != Some(3) {
+        bail!("portable ledger event must be V3")
+    }
+    let optional = |name: &str| event.get(name).and_then(Value::as_str);
+    let quantity_delta = match event.get("quantityDelta") {
+        Some(Value::Null) | None => None,
+        Some(value) => Some(
+            value
+                .as_f64()
+                .filter(|number| number.is_finite())
+                .ok_or_else(|| anyhow!("invalid portable quantity"))?,
+        ),
+    };
+    let bytes = serde_json::to_vec(&EventV3 {
+        domain: DOMAIN_V3,
+        workspace_guid: required("workspaceGuid")?,
+        actor_guid: required("actorGuid")?,
+        item_guid: optional("itemGuid"),
+        op_type: required("type")?,
+        from_label: optional("fromLabel"),
+        to_label: optional("toLabel"),
+        quantity_delta,
+        comment: optional("comment"),
+        created_at: required("createdAt")?,
+        nonce: required("guid")?,
+        prev_hash: optional("prevHash"),
+        request_device_id: optional("requestDeviceId"),
+        request_public_key: optional("requestPublicKey"),
+        request_nonce: optional("requestNonce"),
+        request_signature: optional("requestSignature"),
+        request_hash: optional("requestHash"),
+        request_timestamp: optional("requestTimestamp"),
+        request_path: optional("requestPath"),
+        request_body: optional("requestBody"),
+    })?;
+    if digest(&bytes) != required("opId")? {
+        bail!("portable ledger event hash mismatch")
+    }
+    verify_node_signature(required("pubkey")?, required("signature")?, &bytes)?;
+
+    let body = required("requestBody")?;
+    let request_hash = required("requestHash")?;
+    if digest(body.as_bytes()) != request_hash {
+        bail!("portable device request body hash mismatch")
+    }
+    let path = required("requestPath")?;
+    let timestamp = required("requestTimestamp")?;
+    let nonce = required("requestNonce")?;
+    let message =
+        format!("everyday/device-request/v1\nPOST\n{path}\n{timestamp}\n{nonce}\n{request_hash}");
+    let public_key: [u8; 32] = URL_SAFE_NO_PAD
+        .decode(required("requestPublicKey")?)?
+        .try_into()
+        .map_err(|_| anyhow!("invalid portable device public key"))?;
+    let signature = Signature::from_slice(&URL_SAFE_NO_PAD.decode(required("requestSignature")?)?)?;
+    VerifyingKey::from_bytes(&public_key)?
+        .verify(message.as_bytes(), &signature)
+        .context("invalid portable device proof")?;
+    Ok(())
 }
 
 fn verify_node_signature(pubkey: &str, signature: &str, bytes: &[u8]) -> anyhow::Result<()> {

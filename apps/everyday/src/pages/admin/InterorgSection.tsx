@@ -130,8 +130,10 @@ export default function InterorgSection() {
                 <p className="mt-1 truncate font-mono text-xs text-ink-500">{item.transactionId}</p>
                 {item.acceptanceLedgerHash && <p className="mt-1 truncate font-mono text-[11px] text-ink-500" title={item.acceptanceLedgerHash}>Летопись получателя: {item.acceptanceLedgerHash}</p>}
               </div>
-              {item.status === 'accepted'
-                ? <span className="inline-flex items-center gap-1 text-sm font-semibold text-teal"><Check size={16} /> Принято контрагентом</span>
+              {item.status === 'accepted' && item.acceptanceProofVerified
+                ? <span className="inline-flex items-center gap-1 text-sm font-semibold text-teal"><Check size={16} /> Принято · device-proof проверен</span>
+                : item.status === 'accepted'
+                  ? <span className="text-sm font-semibold text-danger">Доказательство повреждено</span>
                 : <span className="text-sm font-medium text-ink-500">Ожидает квитанцию</span>}
             </article>
           ))}

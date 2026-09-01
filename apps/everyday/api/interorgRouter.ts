@@ -7,6 +7,7 @@ type OutboxEntry = {
   transactionId: string; envelopeId: string; kind: string; createdAt: string
   status: 'queued' | 'accepted'; acceptedAt: string | null
   acceptanceLedgerHash: string | null; receiptEnvelopeId: string | null
+  acceptanceProof: Record<string, unknown> | null; acceptanceProofVerified: boolean
   contact: { guid: string; name: string; remoteWorkspaceGuid: string }
 }
 

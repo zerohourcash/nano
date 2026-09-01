@@ -7202,14 +7202,14 @@ fn interorg_accept(conn: &mut Connection, input: &Value, user_id: Option<i64>) -
             Some(&kind),
         )
         .map_err(|error| ApiError::internal(error.to_string()))?;
-        let ledger_hash = event["opId"]
+        event["opId"]
             .as_str()
             .ok_or_else(|| ApiError::internal("Летопись не вернула hash"))?;
         let receipt = crate::interorg::accept_with_receipt(
             tx,
             ws,
             &envelope_id,
-            ledger_hash,
+            &event,
             crate::interorg_work_bits(),
         )
         .map_err(|error| ApiError::internal(error.to_string()))?;
@@ -9943,8 +9943,11 @@ mod tests {
 
     #[test]
     fn interorg_directory_and_send_are_workspace_scoped_and_ledger_bound() {
-        use base64::{engine::general_purpose::STANDARD, Engine};
-        use ed25519_dalek::SigningKey;
+        use base64::{
+            engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+            Engine,
+        };
+        use ed25519_dalek::{Signer, SigningKey};
         use rand::rngs::OsRng;
         use x25519_dalek::{PublicKey, StaticSecret};
 
@@ -10001,6 +10004,22 @@ mod tests {
             params![incoming_id, ws, contact["guid"].as_str().unwrap(), Uuid::new_v4().to_string(), now()],
         )
         .unwrap();
+        let device = SigningKey::generate(&mut OsRng);
+        let request_body =
+            json!({"0":{"json":{"workspaceId":ws,"envelopeId":incoming_id}}}).to_string();
+        let request_hash = hex::encode(sha2::Sha256::digest(request_body.as_bytes()));
+        let request_timestamp = chrono::Utc::now().to_rfc3339();
+        let request_nonce = Uuid::new_v4().to_string();
+        let request_path = "/api/trpc/interorg.accept";
+        let request_message = format!(
+            "everyday/device-request/v1\nPOST\n{request_path}\n{request_timestamp}\n{request_nonce}\n{request_hash}"
+        );
+        conn.execute(
+            "INSERT INTO pending_device_proofs(user_id,device_id,public_key,nonce,signature,request_hash,request_timestamp,request_path,request_body)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            params![users[0],Uuid::new_v4().to_string(),URL_SAFE_NO_PAD.encode(device.verifying_key().as_bytes()),request_nonce,
+                URL_SAFE_NO_PAD.encode(device.sign(request_message.as_bytes()).to_bytes()),request_hash,request_timestamp,request_path,request_body],
+        ).unwrap();
         let accepted = dispatch(
             &mut conn,
             "interorg.accept",
@@ -10013,6 +10032,36 @@ mod tests {
         assert!(accepted["receiptEnvelopeId"]
             .as_str()
             .is_some_and(|value| Uuid::parse_str(value).is_ok()));
+        let receipt_json: String = conn
+            .query_row(
+                "SELECT envelope_json FROM interorg_envelopes WHERE id=?1",
+                [accepted["receiptEnvelopeId"].as_str().unwrap()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let receipt: crate::interorg::Envelope = serde_json::from_str(&receipt_json).unwrap();
+        let receipt_payload = crate::interorg::open(
+            &receipt,
+            remote_secret.as_bytes(),
+            crate::interorg_work_bits(),
+        )
+        .unwrap();
+        let acceptance_proof = &receipt_payload.body["acceptanceEvent"];
+        crate::ledger::verify_portable_v3_event(acceptance_proof).unwrap();
+        assert_eq!(acceptance_proof["type"], "interorg_accept");
+        assert_eq!(
+            acceptance_proof["toLabel"],
+            receipt_payload.body["originalTransactionId"]
+        );
+        assert_eq!(acceptance_proof["requestPath"], "/api/trpc/interorg.accept");
+        let mut forged_proof = acceptance_proof.clone();
+        forged_proof["toLabel"] = json!(Uuid::new_v4().to_string());
+        assert!(crate::ledger::verify_portable_v3_event(&forged_proof).is_err());
+        conn.execute(
+            "DELETE FROM pending_device_proofs WHERE user_id=?1",
+            [users[0]],
+        )
+        .unwrap();
         let outbox = dispatch(
             &mut conn,
             "interorg.outbox",
