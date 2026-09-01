@@ -195,8 +195,27 @@ export default function Catalog() {
     workspace,
   } = useStore()
 
+  const [activeOrganizationNodeId, setActiveOrganizationNodeId] = useState<number | null>(null)
+  const organizationNodesQ = trpc.admin.organizationNodes.list.useQuery(
+    { workspaceId: workspace?.id },
+    { enabled: Boolean(workspace?.id) },
+  )
+  const organizationTabs = useMemo(
+    () => (organizationNodesQ.data ?? [])
+      .filter((node) => Boolean(node.tabLabel?.trim()))
+      .sort((left, right) => left.displayOrder - right.displayOrder || left.id - right.id),
+    [organizationNodesQ.data],
+  )
+  const activeOrganizationTab = organizationTabs.find((node) => node.id === activeOrganizationNodeId) ?? null
+
   const listQ = trpc.items.list.useQuery(
-    { page: 1, limit: FETCH_LIMIT, sort: 'createdAt_desc', workspaceId: workspace?.id },
+    {
+      page: 1,
+      limit: FETCH_LIMIT,
+      sort: 'createdAt_desc',
+      workspaceId: workspace?.id,
+      organizationNodeId: activeOrganizationTab?.id,
+    },
     { enabled: Boolean(workspace?.id) },
   )
   const usersQ = trpc.admin.users.list.useQuery({})
@@ -520,7 +539,7 @@ export default function Catalog() {
           transition={{ duration: 0.28, ease: [0.22, 1, 0.36, 1] }}
         >
           <h1 className="text-2xl lg:text-[28px] leading-9 font-bold tracking-[-0.01em] text-ink-900">
-            Все ТМЦ{' '}
+            {activeOrganizationTab?.tabLabel ?? 'Все ТМЦ'}{' '}
             <span className="font-mono-num text-ink-500 font-semibold">({listQ.data?.total ?? tools.length} ед.)</span>
           </h1>
         </motion.div>
@@ -554,6 +573,42 @@ export default function Catalog() {
           </Link>
         </motion.div>
       </div>
+
+      {organizationTabs.length > 0 && (
+        <nav
+          className="flex max-w-full gap-2 overflow-x-auto rounded-card border border-brand-100/60 bg-surface p-2 shadow-card"
+          aria-label="Разделы организации"
+          data-testid="organization-catalog-tabs"
+        >
+          <button
+            type="button"
+            onClick={() => setActiveOrganizationNodeId(null)}
+            className={cn(
+              'shrink-0 rounded-xl px-4 py-2 text-sm font-semibold transition-colors',
+              !activeOrganizationTab ? 'bg-brand-600 text-white' : 'text-ink-500 hover:bg-brand-50',
+            )}
+          >
+            Все
+          </button>
+          {organizationTabs.map((node) => (
+            <button
+              key={node.id}
+              type="button"
+              onClick={() => setActiveOrganizationNodeId(node.id)}
+              className={cn(
+                'shrink-0 rounded-xl px-4 py-2 text-sm font-semibold transition-colors',
+                activeOrganizationTab?.id === node.id
+                  ? 'bg-brand-600 text-white'
+                  : 'text-ink-500 hover:bg-brand-50',
+              )}
+              title={`Поддерево: ${node.name}`}
+              data-testid={`organization-tab-${node.id}`}
+            >
+              {node.tabLabel}
+            </button>
+          ))}
+        </nav>
+      )}
 
       {/* Чипы активных фильтров */}
       <AnimatePresence>

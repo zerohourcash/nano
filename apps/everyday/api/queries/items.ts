@@ -12,6 +12,7 @@ export type ItemListFilter = {
   categoryId?: number;
   brandId?: number;
   statusId?: number;
+  organizationNodeId?: number;
   hasQr?: boolean;
   onlyMineUserId?: number;
   page?: number;
@@ -35,6 +36,11 @@ export async function findItems(filter: ItemListFilter) {
   if (filter.categoryId) conds.push(eq(items.categoryId, filter.categoryId));
   if (filter.brandId) conds.push(eq(items.brandId, filter.brandId));
   if (filter.statusId) conds.push(eq(items.statusId, filter.statusId));
+  if (filter.organizationNodeId) {
+    // Compatibility-only TypeScript backend has no organization_nodes table;
+    // the shipped Rust node expands this filter to the full signed subtree.
+    conds.push(eq(items.organizationNodeId, filter.organizationNodeId));
+  }
   if (filter.hasQr === true) conds.push(isNotNull(items.qrCode));
   if (filter.hasQr === false) conds.push(isNull(items.qrCode));
 

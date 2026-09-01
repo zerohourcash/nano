@@ -110,6 +110,27 @@ test('browser signs a real custody transaction and ledger retains its proof', as
       name: 'Электроинструмент',
     }
   );
+  const organizationDivision = await trpc<{ id: number }>(
+    page,
+    'admin.organizationNodes.create',
+    {
+      workspaceId: workspaces[0].id,
+      kind: 'division',
+      name: 'Сервисное подразделение',
+      tabLabel: 'Сервис E2E',
+      displayOrder: 10,
+    }
+  );
+  const organizationRoom = await trpc<{ id: number }>(
+    page,
+    'admin.organizationNodes.create',
+    {
+      workspaceId: workspaces[0].id,
+      parentId: organizationDivision.id,
+      kind: 'room',
+      name: 'Кабинет 204',
+    }
+  );
 
   await page.goto('/create');
   await page
@@ -140,6 +161,16 @@ test('browser signs a real custody transaction and ledger retains its proof', as
   await expect(page).toHaveURL(/\/tool\/\d+/, { timeout: 10_000 });
   const itemId = Number(page.url().match(/\/tool\/(\d+)/)?.[1]);
   expect(itemId).toBeGreaterThan(0);
+  await trpc(page, 'items.update', {
+    id: itemId,
+    organizationNodeId: organizationRoom.id,
+  });
+  await page.goto('/');
+  await expect(page.getByTestId('organization-catalog-tabs')).toBeVisible();
+  await page.getByRole('button', { name: 'Сервис E2E', exact: true }).click();
+  await expect(page.getByRole('heading', { name: /Сервис E2E \(1 ед\.\)/ })).toBeVisible();
+  await expect(page.getByText('Перфоратор E2E', { exact: true })).toBeVisible();
+  await page.goto(`/tool/${itemId}`);
   await page
     .getByRole('button', { name: 'Взять', exact: true })
     .first()

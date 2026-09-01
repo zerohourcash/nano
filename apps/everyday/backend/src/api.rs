@@ -1941,9 +1941,37 @@ fn items_list(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiResu
     let limit = i64v(input, "limit").unwrap_or(20).clamp(1, 500);
     let search = s(input, "search").map(|q| q.to_lowercase());
     let only_mine = b(input, "onlyMine").unwrap_or(false);
-    let mut stmt = conn.prepare("SELECT id, title, internal_id, serial_number, responsible_user_id FROM items WHERE workspace_id=?1 AND archived=0 ORDER BY created_at DESC, id DESC")?;
+    let organization_node = i64v(input, "organizationNodeId");
+    if let Some(node_id) = organization_node {
+        let valid: bool = conn
+            .query_row(
+                "SELECT 1 FROM organization_nodes WHERE id=?1 AND workspace_id=?2 AND archived=0",
+                params![node_id, ws],
+                |_| Ok(true),
+            )
+            .optional()?
+            .unwrap_or(false);
+        if !valid {
+            return Err(ApiError::bad(
+                "organizationNodeId относится к другому рабочему пространству или архивирован",
+            ));
+        }
+    }
+    let mut stmt = conn.prepare(
+        "WITH RECURSIVE descendants(id) AS (
+           SELECT id FROM organization_nodes WHERE id=?2 AND workspace_id=?1 AND archived=0
+           UNION ALL
+           SELECT n.id FROM organization_nodes n JOIN descendants d ON n.parent_id=d.id
+           WHERE n.workspace_id=?1 AND n.archived=0
+         )
+         SELECT id,title,internal_id,serial_number,responsible_user_id
+         FROM items
+         WHERE workspace_id=?1 AND archived=0
+           AND (?2 IS NULL OR organization_node_id IN (SELECT id FROM descendants))
+         ORDER BY created_at DESC,id DESC",
+    )?;
     let mut ids: Vec<i64> = Vec::new();
-    let rows = stmt.query_map(params![ws], |r| {
+    let rows = stmt.query_map(params![ws, organization_node], |r| {
         Ok((
             r.get::<_, i64>(0)?,
             r.get::<_, String>(1)?,
@@ -10741,10 +10769,17 @@ mod tests {
     #[test]
     fn item_location_uses_tree_and_rejects_foreign_workspace_node() {
         let (mut conn, path, users, ws) = test_db();
+        let division = dispatch(
+            &mut conn,
+            "admin.organizationNodes.create",
+            &json!({"workspaceId":ws,"kind":"division","name":"Сервис","tabLabel":"Сервис"}),
+            Some(users[0]),
+        )
+        .unwrap();
         let room = dispatch(
             &mut conn,
             "admin.organizationNodes.create",
-            &json!({"workspaceId":ws,"kind":"room","name":"Кабинет 204"}),
+            &json!({"workspaceId":ws,"parentId":division["id"],"kind":"room","name":"Кабинет 204"}),
             Some(users[0]),
         )
         .unwrap();
@@ -10756,6 +10791,15 @@ mod tests {
         )
         .unwrap();
         assert_eq!(item["organizationNode"]["name"], "Кабинет 204");
+        let subtree = dispatch(
+            &mut conn,
+            "items.list",
+            &json!({"workspaceId":ws,"organizationNodeId":division["id"],"page":1,"limit":20}),
+            Some(users[0]),
+        )
+        .unwrap();
+        assert_eq!(subtree["total"], 1);
+        assert_eq!(subtree["rows"][0]["id"], item["id"]);
 
         let other_ws = ws_create(
             &mut conn,
@@ -10780,6 +10824,17 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.http, 400);
         assert!(error.message.contains("другому рабочему пространству"));
+        let foreign_filter = dispatch(
+            &mut conn,
+            "items.list",
+            &json!({"workspaceId":ws,"organizationNodeId":foreign["id"]}),
+            Some(users[0]),
+        )
+        .unwrap_err();
+        assert_eq!(foreign_filter.http, 400);
+        assert!(foreign_filter
+            .message
+            .contains("другому рабочему пространству"));
         cleanup(conn, path);
     }
 
