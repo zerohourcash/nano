@@ -102,6 +102,7 @@ pub fn is_mutation(procedure: &str) -> bool {
             | "bit.transactions"
             | "bit.myTransactions"
             | "bit.recipients"
+            | "bit.offers"
             | "knowledge.list"
             | "knowledge.bySlug"
             | "interorg.identity"
@@ -505,7 +506,15 @@ fn required_right(procedure: &str) -> Option<&'static str> {
         Some("manageAccounting")
     } else if matches!(
         procedure,
-        "bit.transfer" | "bit.sale" | "bit.balance" | "bit.myTransactions" | "bit.recipients"
+        "bit.transfer"
+            | "bit.sale"
+            | "bit.offer"
+            | "bit.acceptSale"
+            | "bit.rejectSale"
+            | "bit.offers"
+            | "bit.balance"
+            | "bit.myTransactions"
+            | "bit.recipients"
     ) {
         Some("useBit")
     } else if procedure == "bit.transactions" {
@@ -1002,6 +1011,10 @@ fn dispatch_inner(
         "bit.recipients" => bit_recipients(conn, input, user_id),
         "bit.transfer" => bit_transfer(conn, input, user_id),
         "bit.sale" => bit_sale(conn, input, user_id),
+        "bit.offer" => bit_offer(conn, input, user_id),
+        "bit.offers" => bit_offers(conn, input, user_id),
+        "bit.acceptSale" => bit_decide_sale(conn, input, user_id, true),
+        "bit.rejectSale" => bit_decide_sale(conn, input, user_id, false),
         "bit.mint" => bit_mint(conn, input, user_id),
         "knowledge.list" => knowledge_list(conn, input, user_id),
         "knowledge.bySlug" => knowledge_by_slug(conn, input, user_id),
@@ -3083,6 +3096,28 @@ fn transfers_prepare_atomic(conn: &Connection, input: &Value, user_id: Option<i6
     } else {
         item["responsibleUserId"].as_i64() == Some(uid)
     };
+    let bit_amount = i64v(input, "bitAmount");
+    if let Some(amount) = bit_amount {
+        require_can_in_workspace(conn, uid, ws, "useBit")?;
+        if amount <= 0 {
+            return Err(ApiError::bad(
+                "Цена должна быть целым положительным числом Bit",
+            ));
+        }
+        if to == uid {
+            return Err(ApiError::bad("Нельзя продать ТМЦ самому себе"));
+        }
+        if item["quantitative"].as_bool().unwrap_or(false) {
+            return Err(ApiError::bad(
+                "Двухфазная продажа партий материалов пока не поддерживается",
+            ));
+        }
+        if !source_custody {
+            return Err(ApiError::conflict(
+                "Предложение продажи может создать только ответственный за ТМЦ",
+            ));
+        }
+    }
     let status = if b(input, "asDraft").unwrap_or(false) {
         "draft"
     } else {
@@ -3090,9 +3125,9 @@ fn transfers_prepare_atomic(conn: &Connection, input: &Value, user_id: Option<i6
     };
     let code = next_transfer_code(conn, ws);
     conn.execute(
-        "INSERT INTO transfers (code, item_id, from_user_id, to_user_id, to_storage_id, building_site_id, workspace_id, quantity, status, comment, no_confirmation,source_custody,created_at)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
-        params![code, item_id, uid, to, i64v(input,"toStorageId"), i64v(input,"buildingSiteId"), ws, quantity, status, s(input,"comment"), b(input,"noConfirmation").unwrap_or(false) as i64,source_custody as i64,now()],
+        "INSERT INTO transfers (code, item_id, from_user_id, to_user_id, to_storage_id, building_site_id, workspace_id, quantity, status, comment, no_confirmation,source_custody,bit_amount,created_at)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+        params![code, item_id, uid, to, i64v(input,"toStorageId"), i64v(input,"buildingSiteId"), ws, quantity, status, s(input,"comment"), b(input,"noConfirmation").unwrap_or(false) as i64,source_custody as i64,bit_amount,now()],
     )?;
     let tid = conn.last_insert_rowid();
     let from_guid = ledger::guid(conn, "users", uid)
@@ -3108,7 +3143,10 @@ fn transfers_prepare_atomic(conn: &Connection, input: &Value, user_id: Option<i6
         Some(&from_guid),
         Some(&to_guid),
         quantity,
-        Some(&format!("Передача {code} оформлена")),
+        Some(&match bit_amount {
+            Some(amount) => format!("Предложение продажи {code}: {amount} Bit"),
+            None => format!("Передача {code} оформлена"),
+        }),
     )
     .map_err(|e| ApiError::internal(format!("Ошибка журнала: {e}")))?;
     conn.execute(
@@ -3153,10 +3191,10 @@ fn transfers_accept_atomic(
         .as_i64()
         .ok_or_else(|| ApiError::bad("Некорректная передача"))?;
     require_member(conn, uid, ws)?;
-    let (needs_admin, source_custody, prepare_ledger_hash): (bool, bool, Option<String>) = conn.query_row(
-        "SELECT needs_admin != 0,source_custody != 0,prepare_ledger_hash FROM transfers WHERE id=?1",
+    let (needs_admin, source_custody, prepare_ledger_hash, bit_amount): (bool, bool, Option<String>, Option<i64>) = conn.query_row(
+        "SELECT needs_admin != 0,source_custody != 0,prepare_ledger_hash,bit_amount FROM transfers WHERE id=?1",
         params![id],
-        |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+        |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)),
     )?;
     if needs_admin {
         require_can(conn, uid, "manageUsers")?;
@@ -3170,6 +3208,46 @@ fn transfers_accept_atomic(
     let st = t["status"].as_str().unwrap_or("");
     if st != "pending" && st != "draft" {
         return Err(ApiError::bad("Передача уже завершена"));
+    }
+    let mut sale_transaction = None;
+    if accept {
+        if let Some(amount) = bit_amount {
+            require_can_in_workspace(conn, uid, ws, "useBit")?;
+            let item_id = t["itemId"]
+                .as_i64()
+                .ok_or_else(|| ApiError::bad("В продаже нет ТМЦ"))?;
+            let seller = t["fromUserId"]
+                .as_i64()
+                .ok_or_else(|| ApiError::bad("В продаже нет продавца"))?;
+            let item = jsn::item_json(conn, item_id, false)
+                .ok_or_else(|| ApiError::not_found("ТМЦ не найден"))?;
+            if item["responsibleUserId"].as_i64() != Some(seller) {
+                return Err(ApiError::conflict(
+                    "Продажа устарела: продавец больше не отвечает за этот ТМЦ",
+                ));
+            }
+            let item_guid = item["guid"]
+                .as_str()
+                .ok_or_else(|| ApiError::bad("У ТМЦ нет GUID"))?;
+            let posted = crate::accounting::post(
+                conn,
+                ws,
+                uid,
+                "sale",
+                Some(uid),
+                seller,
+                amount,
+                t["comment"].as_str(),
+                Some(item_guid),
+            )
+            .map_err(|error| ApiError::bad(error.to_string()))?;
+            if posted["status"] != "posted" {
+                return Err(ApiError::conflict(
+                    "Недостаточно подтверждённых Bit для принятия предложения",
+                ));
+            }
+            sale_transaction = Some(posted);
+        }
     }
     let new_st = if accept { "accepted" } else { "rejected" };
     conn.execute(
@@ -3264,6 +3342,29 @@ fn transfers_accept_atomic(
         "UPDATE transfers SET accept_ledger_hash=?1 WHERE id=?2",
         params![event["opId"].as_str(), id],
     )?;
+    if let Some(posted) = sale_transaction {
+        let amount = bit_amount.expect("sale transaction requires amount");
+        let sale_event = ledger::append(
+            conn,
+            ws,
+            uid,
+            t["itemId"].as_i64(),
+            "bit_sale",
+            posted["senderAccountGuid"].as_str(),
+            posted["txHash"].as_str(),
+            Some(amount as f64),
+            t["comment"].as_str(),
+        )
+        .map_err(|error| ApiError::internal(format!("Ошибка Bit-летописи: {error}")))?;
+        let transaction_guid = posted["guid"]
+            .as_str()
+            .ok_or_else(|| ApiError::internal("Bit-транзакция не имеет GUID"))?;
+        conn.execute(
+            "UPDATE transfers SET bit_transaction_guid=?1 WHERE id=?2",
+            params![transaction_guid, id],
+        )?;
+        let _ = sale_event;
+    }
     if accept {
         let item_id = t["itemId"]
             .as_i64()
@@ -4556,6 +4657,58 @@ fn bit_sale(conn: &mut Connection, input: &Value, user_id: Option<i64>) -> ApiRe
         .map_err(|e| ApiError::internal(e.to_string()))?;
         Ok(posted)
     })
+}
+
+fn bit_offer(conn: &mut Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
+    let uid = require_user(conn, user_id)?;
+    let item_id = i64v(input, "itemId").ok_or_else(|| ApiError::bad("itemId"))?;
+    let item =
+        jsn::item_json(conn, item_id, false).ok_or_else(|| ApiError::not_found("ТМЦ не найден"))?;
+    let ws = item["workspaceId"]
+        .as_i64()
+        .ok_or_else(|| ApiError::bad("У ТМЦ нет организации"))?;
+    require_can_in_workspace(conn, uid, ws, "transferItems")?;
+    transfers_prepare(conn, input, user_id)
+}
+
+fn bit_offers(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
+    let uid = require_user(conn, user_id)?;
+    let ws = i64v(input, "workspaceId").unwrap_or_else(|| ws_fallback(conn));
+    require_member(conn, uid, ws)?;
+    let mut statement = conn.prepare(
+        "SELECT id FROM transfers
+         WHERE workspace_id=?1 AND bit_amount IS NOT NULL AND (from_user_id=?2 OR to_user_id=?2)
+         ORDER BY id DESC LIMIT 200",
+    )?;
+    let ids: Vec<i64> = statement
+        .query_map(params![ws, uid], |row| row.get(0))?
+        .flatten()
+        .collect();
+    Ok(Value::Array(
+        ids.into_iter()
+            .filter_map(|id| jsn::transfer_json(conn, id))
+            .collect(),
+    ))
+}
+
+fn bit_decide_sale(
+    conn: &mut Connection,
+    input: &Value,
+    user_id: Option<i64>,
+    accept: bool,
+) -> ApiResult {
+    let uid = require_user(conn, user_id)?;
+    let id = i64v(input, "id").ok_or_else(|| ApiError::bad("id"))?;
+    let offer = jsn::transfer_json(conn, id)
+        .ok_or_else(|| ApiError::not_found("Предложение продажи не найдено"))?;
+    if offer["bitAmount"].as_i64().is_none() {
+        return Err(ApiError::bad("Передача не является предложением продажи"));
+    }
+    let ws = offer["workspaceId"]
+        .as_i64()
+        .ok_or_else(|| ApiError::bad("У предложения нет организации"))?;
+    require_can_in_workspace(conn, uid, ws, "acceptTransfers")?;
+    transfers_accept(conn, input, user_id, accept)
 }
 
 fn knowledge_visible(rights: &Value, page: &Value) -> bool {
@@ -9040,6 +9193,129 @@ mod tests {
             bit_balance(&conn, &json!({"workspaceId":ws}), Some(users[1])).unwrap()["balance"],
             50
         );
+        let offered_item = insert_item(&conn, ws, Some(users[0]), false, None);
+        let offer = dispatch(
+            &mut conn,
+            "bit.offer",
+            &json!({"itemId":offered_item,"toUserId":users[1],"bitAmount":15,"comment":"Двухфазная продажа"}),
+            Some(users[0]),
+        )
+        .unwrap();
+        assert_eq!(offer["status"], "pending");
+        assert_eq!(offer["bitAmount"], 15);
+        assert_eq!(
+            jsn::item_json(&conn, offered_item, false).unwrap()["responsibleUserId"],
+            users[0],
+            "предложение не должно передавать ТМЦ до подписи покупателя"
+        );
+        assert_eq!(
+            bit_balance(&conn, &json!({"workspaceId":ws}), Some(users[0])).unwrap()["balance"],
+            50,
+            "предложение не должно резервировать или переводить Bit"
+        );
+        let accepted = dispatch(
+            &mut conn,
+            "bit.acceptSale",
+            &json!({"id":offer["id"]}),
+            Some(users[1]),
+        )
+        .unwrap();
+        assert_eq!(accepted["status"], "accepted");
+        assert!(accepted["bitTransactionGuid"].as_str().is_some());
+        assert_eq!(
+            jsn::item_json(&conn, offered_item, false).unwrap()["responsibleUserId"],
+            users[1]
+        );
+        assert_eq!(
+            bit_balance(&conn, &json!({"workspaceId":ws}), Some(users[0])).unwrap()["balance"],
+            65
+        );
+        assert_eq!(
+            bit_balance(&conn, &json!({"workspaceId":ws}), Some(users[1])).unwrap()["balance"],
+            35
+        );
+        let replay = dispatch(
+            &mut conn,
+            "bit.acceptSale",
+            &json!({"id":offer["id"]}),
+            Some(users[1]),
+        )
+        .unwrap_err();
+        assert_eq!(replay.http, 400);
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM accounting_transactions WHERE kind='sale'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            2,
+            "повтор принятия не должен создавать вторую оплату"
+        );
+        let expensive_item = insert_item(&conn, ws, Some(users[0]), false, None);
+        let expensive_offer = dispatch(
+            &mut conn,
+            "bit.offer",
+            &json!({"itemId":expensive_item,"toUserId":users[1],"bitAmount":1000}),
+            Some(users[0]),
+        )
+        .unwrap();
+        let transactions_before_rejection: i64 = conn
+            .query_row("SELECT count(*) FROM accounting_transactions", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            dispatch(
+                &mut conn,
+                "bit.acceptSale",
+                &json!({"id":expensive_offer["id"]}),
+                Some(users[1]),
+            )
+            .unwrap_err()
+            .http,
+            409
+        );
+        assert_eq!(
+            jsn::transfer_json(&conn, expensive_offer["id"].as_i64().unwrap()).unwrap()["status"],
+            "pending"
+        );
+        assert_eq!(
+            jsn::item_json(&conn, expensive_item, false).unwrap()["responsibleUserId"],
+            users[0]
+        );
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM accounting_transactions", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+            transactions_before_rejection,
+            "недостаток Bit не должен оставлять оплату или завершать предложение"
+        );
+        let stale_item = insert_item(&conn, ws, Some(users[0]), false, None);
+        let stale_offer = dispatch(
+            &mut conn,
+            "bit.offer",
+            &json!({"itemId":stale_item,"toUserId":users[1],"bitAmount":1}),
+            Some(users[0]),
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE items SET responsible_user_id=?1 WHERE id=?2",
+            params![users[2], stale_item],
+        )
+        .unwrap();
+        assert_eq!(
+            dispatch(
+                &mut conn,
+                "bit.acceptSale",
+                &json!({"id":stale_offer["id"]}),
+                Some(users[1]),
+            )
+            .unwrap_err()
+            .http,
+            409
+        );
         let recipients = dispatch(
             &mut conn,
             "bit.recipients",
@@ -9060,7 +9336,7 @@ mod tests {
             Some(users[1]),
         )
         .unwrap();
-        assert_eq!(personal.as_array().unwrap().len(), 2);
+        assert_eq!(personal.as_array().unwrap().len(), 3);
         assert!(personal.as_array().unwrap().iter().all(|transaction| {
             transaction["senderUserId"] == users[1] || transaction["recipientUserId"] == users[1]
         }));
@@ -9075,6 +9351,51 @@ mod tests {
             .http,
             403,
             "обычный участник не должен читать чужую бухгалтерскую летопись"
+        );
+        conn.execute(
+            "INSERT INTO workspaces(name,internal_id_prefix,created_at) VALUES('Bit tenant B','B-',?1)",
+            [now()],
+        )
+        .unwrap();
+        let other_ws = conn.last_insert_rowid();
+        for user in [users[0], users[1]] {
+            conn.execute(
+                "INSERT INTO user_workspaces(user_id,workspace_id,rights_json) VALUES(?1,?2,?3)",
+                params![user, other_ws, db::default_rights().to_string()],
+            )
+            .unwrap();
+        }
+        let other_item = insert_item(&conn, other_ws, Some(users[0]), false, None);
+        conn.execute(
+            "INSERT INTO transfers(code,item_id,from_user_id,to_user_id,workspace_id,status,no_confirmation,source_custody,bit_amount,created_at)
+             VALUES('B-SALE',?1,?2,?3,?4,'pending',0,1,7,?5)",
+            params![other_item, users[0], users[1], other_ws, now()],
+        )
+        .unwrap();
+        let scoped_offers = dispatch(
+            &mut conn,
+            "bit.offers",
+            &json!({"workspaceId":ws}),
+            Some(users[1]),
+        )
+        .unwrap();
+        assert!(scoped_offers
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|offer| offer["workspaceId"] == ws));
+        assert_eq!(
+            dispatch(
+                &mut conn,
+                "bit.offers",
+                &json!({"workspaceId":other_ws}),
+                Some(users[1]),
+            )
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .len(),
+            1
         );
         let before: i64 = conn
             .query_row("SELECT count(*) FROM accounting_transactions", [], |r| {

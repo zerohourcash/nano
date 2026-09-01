@@ -1,12 +1,12 @@
 import { useMemo, useState } from 'react'
 import { motion } from 'framer-motion'
-import { ArrowDownLeft, ArrowUpRight, Coins, Loader2, ReceiptText, ShieldCheck } from 'lucide-react'
+import { ArrowDownLeft, ArrowUpRight, Check, Coins, Loader2, ReceiptText, ShieldCheck, X } from 'lucide-react'
 import { toast } from 'sonner'
 import { trpc } from '@/providers/trpc'
 import { useStore } from '@/lib/store'
 import { cn } from '@/lib/utils'
 
-type Mode = 'transfer' | 'sale' | 'mint'
+type Mode = 'transfer' | 'sale' | 'sell' | 'mint'
 
 export default function BitWallet() {
   const { workspace, currentUser } = useStore()
@@ -28,8 +28,9 @@ export default function BitWallet() {
   const allQ = trpc.bit.transactions.useQuery({ workspaceId }, { enabled: !!workspaceId && canAudit })
   const itemsQ = trpc.items.list.useQuery(
     { workspaceId, page: 1, limit: 100, sort: 'title_asc' },
-    { enabled: !!workspaceId && mode === 'sale' }
+    { enabled: !!workspaceId && (mode === 'sale' || mode === 'sell') }
   )
+  const offersQ = trpc.bit.offers.useQuery({ workspaceId }, { enabled: !!workspaceId })
   const transactions = canAudit ? allQ.data ?? [] : mineQ.data ?? []
   const recipients = useMemo(() => recipientsQ.data ?? [], [recipientsQ.data])
   const recipientNames = useMemo(
@@ -38,14 +39,18 @@ export default function BitWallet() {
   )
 
   const refresh = async () => {
+    // Clear the submitted values before refetching. Otherwise the balance can
+    // render first and a fast next operation gets erased when refetch finishes.
+    setAmount('')
+    setMemo('')
     await Promise.all([
       utils.bit.balance.invalidate(),
       utils.bit.myTransactions.invalidate(),
       utils.bit.transactions.invalidate(),
+      utils.bit.offers.invalidate(),
+      utils.items.list.invalidate(),
       utils.sync.audit.invalidate(),
     ])
-    setAmount('')
-    setMemo('')
   }
   const mutationOptions = {
     onSuccess: async () => {
@@ -57,7 +62,19 @@ export default function BitWallet() {
   const transfer = trpc.bit.transfer.useMutation(mutationOptions)
   const mint = trpc.bit.mint.useMutation(mutationOptions)
   const sale = trpc.bit.sale.useMutation(mutationOptions)
-  const pending = transfer.isPending || mint.isPending || sale.isPending
+  const offer = trpc.bit.offer.useMutation({
+    ...mutationOptions,
+    onSuccess: async (createdOffer) => {
+      utils.bit.offers.setData({ workspaceId }, (current = []) => [
+        createdOffer,
+        ...current.filter((entry) => entry.id !== createdOffer.id),
+      ])
+      await mutationOptions.onSuccess()
+    },
+  })
+  const acceptSale = trpc.bit.acceptSale.useMutation(mutationOptions)
+  const rejectSale = trpc.bit.rejectSale.useMutation(mutationOptions)
+  const pending = transfer.isPending || mint.isPending || sale.isPending || offer.isPending || acceptSale.isPending || rejectSale.isPending
 
   const submit = (event: React.FormEvent) => {
     event.preventDefault()
@@ -70,13 +87,17 @@ export default function BitWallet() {
     }
     if (mode === 'mint') {
       mint.mutate({ workspaceId, recipientUserId: target, amount: units, memo: memo.trim() || undefined })
-    } else if (mode === 'sale') {
+    } else if (mode === 'sale' || mode === 'sell') {
       const item = Number(itemId)
       if (!item) {
         toast.error('Выберите товар или ТМЦ')
         return
       }
-      sale.mutate({ itemId: item, sellerUserId: target, amount: units, memo: memo.trim() || undefined })
+      if (mode === 'sell') {
+        offer.mutate({ itemId: item, toUserId: target, bitAmount: units, comment: memo.trim() || undefined })
+      } else {
+        sale.mutate({ itemId: item, sellerUserId: target, amount: units, memo: memo.trim() || undefined })
+      }
     } else {
       transfer.mutate({ workspaceId, recipientUserId: target, amount: units, memo: memo.trim() || undefined })
     }
@@ -100,24 +121,24 @@ export default function BitWallet() {
 
         <form onSubmit={submit} className="rounded-card border border-brand-100/60 bg-surface p-5 shadow-card">
           <div className="flex rounded-xl bg-brand-50 p-1 text-sm font-semibold">
-            {(['transfer', 'sale', ...(canMint ? ['mint' as const] : [])] as Mode[]).map((value) => (
+            {(['transfer', 'sale', 'sell', ...(canMint ? ['mint' as const] : [])] as Mode[]).map((value) => (
               <button key={value} type="button" onClick={() => setMode(value)} className={cn('flex-1 rounded-lg px-2 py-2 transition', mode === value ? 'bg-white text-brand-700 shadow-sm' : 'text-ink-500')}>
-                {value === 'transfer' ? 'Перевод' : value === 'sale' ? 'Покупка' : 'Эмиссия'}
+                {value === 'transfer' ? 'Перевод' : value === 'sale' ? 'Покупка' : value === 'sell' ? 'Продажа' : 'Эмиссия'}
               </button>
             ))}
           </div>
           <label className="mt-4 block text-sm font-semibold text-ink-900">
-            {mode === 'sale' ? 'Продавец' : 'Получатель'}
-            <select aria-label={mode === 'sale' ? 'Продавец' : 'Получатель Bit'} value={recipientId} onChange={(event) => { setRecipientId(event.target.value); if (mode === 'sale') setItemId('') }} className="mt-1.5 h-11 w-full rounded-xl border border-brand-100 bg-white px-3 font-normal">
+            {mode === 'sale' ? 'Продавец' : mode === 'sell' ? 'Покупатель' : 'Получатель'}
+            <select aria-label={mode === 'sale' ? 'Продавец' : mode === 'sell' ? 'Покупатель' : 'Получатель Bit'} value={recipientId} onChange={(event) => { setRecipientId(event.target.value); if (mode === 'sale' || mode === 'sell') setItemId('') }} className="mt-1.5 h-11 w-full rounded-xl border border-brand-100 bg-white px-3 font-normal">
               <option value="">Выберите участника</option>
               {recipients.filter((user) => mode === 'mint' || user.id !== currentUser?.id).map((user) => <option key={user.id} value={user.id}>{user.fullName}{user.position ? ` · ${user.position}` : ''}</option>)}
             </select>
           </label>
-          {mode === 'sale' && (
+          {(mode === 'sale' || mode === 'sell') && (
             <label className="mt-3 block text-sm font-semibold text-ink-900">Товар / ТМЦ
               <select aria-label="Товар или ТМЦ" value={itemId} onChange={(event) => setItemId(event.target.value)} className="mt-1.5 h-11 w-full rounded-xl border border-brand-100 bg-white px-3 font-normal">
                 <option value="">Выберите позицию</option>
-                {(itemsQ.data?.rows ?? []).filter((item) => item.responsibleUserId === Number(recipientId)).map((item) => <option key={item.id} value={item.id}>{item.internalId} · {item.title}</option>)}
+                {(itemsQ.data?.rows ?? []).filter((item) => item.responsibleUserId === (mode === 'sell' ? currentUser?.id : Number(recipientId))).map((item) => <option key={item.id} value={item.id}>{item.internalId} · {item.title}</option>)}
               </select>
             </label>
           )}
@@ -133,6 +154,24 @@ export default function BitWallet() {
           </button>
         </form>
       </div>
+
+      {(offersQ.data ?? []).length > 0 && <section className="rounded-card border border-brand-100/60 bg-surface shadow-card">
+        <div className="border-b border-brand-100/60 px-5 py-4"><h2 className="font-semibold text-ink-900">Предложения продажи</h2><p className="mt-1 text-xs text-ink-500">Оплата и передача ТМЦ выполняются атомарно после подписи покупателя</p></div>
+        <div className="divide-y divide-brand-100/60">
+          {(offersQ.data ?? []).map((saleOffer) => {
+            const incomingOffer = saleOffer.toUserId === currentUser?.id
+            return <article key={saleOffer.id} data-testid="bit-sale-offer" className="flex flex-wrap items-center gap-3 px-5 py-4">
+              <div className="min-w-0 flex-1"><div className="truncate font-semibold text-ink-900">{saleOffer.item.internalId} · {saleOffer.item.title}</div><div className="text-xs text-ink-500">{saleOffer.fromUser.fullName} → {saleOffer.toUser.fullName} · {saleOffer.code}</div></div>
+              <div className="font-mono font-semibold text-brand-700">{saleOffer.bitAmount} Bit</div>
+              <span className="rounded-full bg-brand-50 px-2 py-1 text-xs text-brand-700">{saleOffer.status === 'pending' ? 'ожидает' : saleOffer.status === 'accepted' ? 'принято' : 'отклонено'}</span>
+              {incomingOffer && saleOffer.status === 'pending' && <div className="flex gap-2">
+                <button aria-label="Принять предложение" disabled={pending} onClick={() => acceptSale.mutate({ id: saleOffer.id })} className="inline-flex h-9 items-center gap-1 rounded-lg bg-success px-3 text-sm font-semibold text-white"><Check size={16}/>Принять</button>
+                <button aria-label="Отклонить предложение" disabled={pending} onClick={() => rejectSale.mutate({ id: saleOffer.id })} className="inline-flex h-9 items-center gap-1 rounded-lg bg-danger px-3 text-sm font-semibold text-white"><X size={16}/>Отклонить</button>
+              </div>}
+            </article>
+          })}
+        </div>
+      </section>}
 
       <section className="rounded-card border border-brand-100/60 bg-surface shadow-card">
         <div className="flex items-center justify-between border-b border-brand-100/60 px-5 py-4">

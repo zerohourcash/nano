@@ -80,7 +80,7 @@ async function trpc<T>(
 test('browser signs a real custody transaction and ledger retains its proof', async ({
   page,
 }) => {
-  test.setTimeout(60_000);
+  test.setTimeout(90_000);
   await page.goto('/');
   await expect(
     page.getByRole('heading', { name: 'Новая организация' })
@@ -352,6 +352,12 @@ test('browser signs a real custody transaction and ledger retains its proof', as
     responsibleUserId: bitRecipient.id,
   });
   const currentUser = await trpc<{ id: number }>(page, 'auth.me', null, false);
+  const offeredItem = await trpc<{ id: number }>(page, 'items.create', {
+    workspaceId: workspaces[0].id,
+    internalId: 'BIT-OFFER-E2E',
+    title: 'ТМЦ для двухфазной продажи',
+    responsibleUserId: currentUser.id,
+  });
   await page.goto('/bit');
   await expect(page.getByRole('heading', { name: 'Кошелёк Bit' })).toBeVisible();
   await page.getByRole('button', { name: 'Эмиссия' }).click();
@@ -367,6 +373,29 @@ test('browser signs a real custody transaction and ledger retains its proof', as
   await page.getByLabel('Назначение платежа').fill('Оплата смены');
   await page.getByRole('button', { name: 'Подписать транзакцию' }).click();
   await expect(page.getByTestId('bit-balance')).toHaveText('75 Bit');
+
+  await page.getByRole('button', { name: 'Продажа' }).click();
+  await page.getByLabel('Покупатель').selectOption(String(bitRecipient.id));
+  await page.getByLabel('Товар или ТМЦ').selectOption(String(offeredItem.id));
+  await page.getByLabel('Сумма Bit').fill('12');
+  await page.getByLabel('Назначение платежа').fill('Подписанное предложение E2E');
+  await page.getByRole('button', { name: 'Подписать транзакцию' }).click();
+  await expect(page.getByTestId('bit-sale-offer')).toContainText('12 Bit');
+  await expect(page.getByTestId('bit-balance')).toHaveText('75 Bit');
+  await expect(page.getByTestId('bit-transaction')).toHaveCount(2);
+  const pendingOffers = await trpc<Array<{
+    id: number;
+    status: string;
+    bitAmount: number;
+    bitTransactionGuid: string | null;
+  }>>(page, 'bit.offers', { workspaceId: workspaces[0].id }, false);
+  expect(pendingOffers).toEqual([
+    expect.objectContaining({
+      status: 'pending',
+      bitAmount: 12,
+      bitTransactionGuid: null,
+    }),
+  ]);
 
   await page.getByRole('button', { name: 'Покупка' }).click();
   await page.getByLabel('Продавец').selectOption(String(bitRecipient.id));

@@ -18,6 +18,24 @@ export type BitTransaction = {
   createdAt: string;
 };
 
+export type BitSaleOffer = {
+  id: number;
+  code: string | null;
+  itemId: number;
+  fromUserId: number;
+  toUserId: number;
+  workspaceId: number;
+  status: 'draft' | 'pending' | 'accepted' | 'rejected';
+  comment: string | null;
+  bitAmount: number;
+  bitTransactionGuid: string | null;
+  createdAt: string;
+  completedAt: string | null;
+  item: { id: number; internalId: string; title: string };
+  fromUser: { id: number; fullName: string };
+  toUser: { id: number; fullName: string };
+};
+
 const workspaceInput = z.object({ workspaceId: z.number().int().positive().optional() }).optional();
 const unavailable = () => {
   throw new TRPCError({
@@ -44,4 +62,14 @@ export const bitRouter = createRouter({
   sale: publicQuery
     .input(z.object({ itemId: z.number().int().positive(), sellerUserId: z.number().int().positive(), amount: z.number().int().positive(), memo: z.string().max(500).optional() }))
     .mutation(async (): Promise<BitTransaction> => unavailable()),
+  offer: publicQuery
+    .input(z.object({ itemId: z.number().int().positive(), toUserId: z.number().int().positive(), bitAmount: z.number().int().positive(), comment: z.string().max(500).optional() }))
+    .mutation(async (): Promise<BitSaleOffer> => unavailable()),
+  offers: publicQuery.input(workspaceInput).query(async (): Promise<BitSaleOffer[]> => unavailable()),
+  acceptSale: publicQuery
+    .input(z.object({ id: z.number().int().positive(), comment: z.string().max(500).optional() }))
+    .mutation(async (): Promise<BitSaleOffer> => unavailable()),
+  rejectSale: publicQuery
+    .input(z.object({ id: z.number().int().positive(), comment: z.string().max(500).optional() }))
+    .mutation(async (): Promise<BitSaleOffer> => unavailable()),
 });

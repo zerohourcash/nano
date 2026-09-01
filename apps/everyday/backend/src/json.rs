@@ -402,7 +402,7 @@ pub fn item_history(conn: &Connection, item_id: i64) -> Vec<Value> {
 
 pub fn transfer_json(conn: &Connection, id: i64) -> Option<Value> {
     conn.query_row(
-        "SELECT id, code, item_id, from_user_id, to_user_id, to_storage_id, building_site_id, workspace_id, quantity, status, photo_url, comment, no_confirmation, created_at, completed_at
+        "SELECT id, code, item_id, from_user_id, to_user_id, to_storage_id, building_site_id, workspace_id, quantity, status, photo_url, comment, no_confirmation, created_at, completed_at, bit_amount, bit_transaction_guid
          FROM transfers WHERE id=?1",
         params![id],
         |r| {
@@ -425,6 +425,8 @@ pub fn transfer_json(conn: &Connection, id: i64) -> Option<Value> {
                 "noConfirmation": r.get::<_, i64>(12)? != 0,
                 "createdAt": r.get::<_, String>(13)?,
                 "completedAt": r.get::<_, Option<String>>(14)?,
+                "bitAmount": r.get::<_, Option<i64>>(15)?,
+                "bitTransactionGuid": r.get::<_, Option<String>>(16)?,
                 "item": item_json(conn, item_id, false).unwrap_or(Value::Null),
                 "fromUser": user_public(conn, from_id).unwrap_or(Value::Null),
                 "toUser": user_public(conn, to_id).unwrap_or(Value::Null),
