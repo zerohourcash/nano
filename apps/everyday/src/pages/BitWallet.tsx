@@ -19,6 +19,7 @@ export default function BitWallet() {
   const [recipientId, setRecipientId] = useState('')
   const [itemId, setItemId] = useState('')
   const [amount, setAmount] = useState('')
+  const [saleQuantity, setSaleQuantity] = useState('')
   const [memo, setMemo] = useState('')
   const utils = trpc.useUtils()
 
@@ -43,6 +44,7 @@ export default function BitWallet() {
     // render first and a fast next operation gets erased when refetch finishes.
     setAmount('')
     setMemo('')
+    setSaleQuantity('')
     await Promise.all([
       utils.bit.balance.invalidate(),
       utils.bit.myTransactions.invalidate(),
@@ -100,10 +102,16 @@ export default function BitWallet() {
           toast.error('Не удалось связать предложение с глобальными идентификаторами')
           return
         }
+        const quantity = selectedItem.quantitative ? Number(saleQuantity.replace(',', '.')) : undefined
+        if (selectedItem.quantitative && (!Number.isFinite(quantity) || quantity! <= 0)) {
+          toast.error('Укажите положительное количество материала')
+          return
+        }
         offer.mutate({
           itemId: item,
           toUserId: target,
           bitAmount: units,
+          quantity,
           offerGuid: crypto.randomUUID(),
           workspaceGuid: workspace.guid,
           itemGuid: selectedItem.guid,
@@ -153,8 +161,16 @@ export default function BitWallet() {
             <label className="mt-3 block text-sm font-semibold text-ink-900">Товар / ТМЦ
               <select aria-label="Товар или ТМЦ" value={itemId} onChange={(event) => setItemId(event.target.value)} className="mt-1.5 h-11 w-full rounded-xl border border-brand-100 bg-white px-3 font-normal">
                 <option value="">Выберите позицию</option>
-                {(itemsQ.data?.rows ?? []).filter((item) => item.responsibleUserId === (mode === 'sell' ? currentUser?.id : Number(recipientId))).map((item) => <option key={item.id} value={item.id}>{item.internalId} · {item.title}</option>)}
+                {(itemsQ.data?.rows ?? []).filter((item) => mode === 'sell'
+                  ? item.quantitative || item.responsibleUserId === currentUser?.id
+                  : item.responsibleUserId === Number(recipientId)
+                ).map((item) => <option key={item.id} value={item.id}>{item.internalId} · {item.title}</option>)}
               </select>
+            </label>
+          )}
+          {mode === 'sell' && itemsQ.data?.rows.find((item) => item.id === Number(itemId))?.quantitative && (
+            <label className="mt-3 block text-sm font-semibold text-ink-900">Количество партии
+              <input aria-label="Количество материала" value={saleQuantity} onChange={(event) => setSaleQuantity(event.target.value.replace(/[^0-9.,]/g, ''))} inputMode="decimal" className="mt-1.5 h-11 w-full rounded-xl border border-brand-100 px-3 font-mono" placeholder="1" />
             </label>
           )}
           <label className="mt-3 block text-sm font-semibold text-ink-900">Сумма
@@ -177,7 +193,7 @@ export default function BitWallet() {
             const incomingOffer = saleOffer.toUserId === currentUser?.id
             return <article key={saleOffer.id} data-testid="bit-sale-offer" className="flex flex-wrap items-center gap-3 px-5 py-4">
               <div className="min-w-0 flex-1"><div className="truncate font-semibold text-ink-900">{saleOffer.item.internalId} · {saleOffer.item.title}</div><div className="text-xs text-ink-500">{saleOffer.fromUser.fullName} → {saleOffer.toUser.fullName} · {saleOffer.code}</div></div>
-              <div className="font-mono font-semibold text-brand-700">{saleOffer.bitAmount} Bit</div>
+              <div className="text-right font-mono font-semibold text-brand-700">{saleOffer.bitAmount} Bit{saleOffer.quantity != null && <div className="text-[10px] font-normal text-ink-500">{saleOffer.quantity} ед.</div>}</div>
               <span className="rounded-full bg-brand-50 px-2 py-1 text-xs text-brand-700">{saleOffer.status === 'pending' ? 'ожидает' : saleOffer.status === 'accepted' ? 'принято' : 'отклонено'}</span>
               {incomingOffer && saleOffer.status === 'pending' && <div className="flex gap-2">
                 <button aria-label="Принять предложение" disabled={pending} onClick={() => acceptSale.mutate({ id: saleOffer.id })} className="inline-flex h-9 items-center gap-1 rounded-lg bg-success px-3 text-sm font-semibold text-white"><Check size={16}/>Принять</button>

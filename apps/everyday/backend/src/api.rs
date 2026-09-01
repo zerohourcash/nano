@@ -3107,14 +3107,9 @@ fn transfers_prepare_atomic(conn: &Connection, input: &Value, user_id: Option<i6
         if to == uid {
             return Err(ApiError::bad("Нельзя продать ТМЦ самому себе"));
         }
-        if item["quantitative"].as_bool().unwrap_or(false) {
-            return Err(ApiError::bad(
-                "Двухфазная продажа партий материалов пока не поддерживается",
-            ));
-        }
         if !source_custody {
             return Err(ApiError::conflict(
-                "Предложение продажи может создать только ответственный за ТМЦ",
+                "Предложение продажи может создать только ответственный за ТМЦ или держатель указанной партии",
             ));
         }
     }
@@ -3221,7 +3216,21 @@ fn transfers_accept_atomic(
                 .ok_or_else(|| ApiError::bad("В продаже нет продавца"))?;
             let item = jsn::item_json(conn, item_id, false)
                 .ok_or_else(|| ApiError::not_found("ТМЦ не найден"))?;
-            if item["responsibleUserId"].as_i64() != Some(seller) {
+            if item["quantitative"].as_bool().unwrap_or(false) {
+                let quantity = t["quantity"]
+                    .as_f64()
+                    .filter(|quantity| quantity.is_finite() && *quantity > 0.0)
+                    .ok_or_else(|| ApiError::bad("В продаже не указано количество партии"))?;
+                let held: f64 = conn.query_row(
+                    "SELECT COALESCE(SUM(quantity),0) FROM item_holdings WHERE item_id=?1 AND user_id=?2 AND returned_at IS NULL",
+                    params![item_id,seller], |row| row.get(0),
+                ).unwrap_or(0.0);
+                if held + 1e-9 < quantity {
+                    return Err(ApiError::conflict(
+                        "Продажа устарела: у продавца больше нет указанной партии",
+                    ));
+                }
+            } else if item["responsibleUserId"].as_i64() != Some(seller) {
                 return Err(ApiError::conflict(
                     "Продажа устарела: продавец больше не отвечает за этот ТМЦ",
                 ));
@@ -9274,6 +9283,38 @@ mod tests {
             2,
             "повтор принятия не должен создавать вторую оплату"
         );
+        let material = insert_item(&conn, ws, None, true, Some(10.0));
+        conn.execute(
+            "INSERT INTO item_holdings(item_id,user_id,quantity,created_at) VALUES(?1,?2,6,?3)",
+            params![material, users[0], now()],
+        )
+        .unwrap();
+        let material_guid = ledger::guid(&conn, "items", material).unwrap();
+        let material_offer = dispatch(
+            &mut conn,
+            "bit.offer",
+            &json!({"itemId":material,"toUserId":users[1],"quantity":4.0,"bitAmount":8,
+                "offerGuid":Uuid::new_v4().to_string(),"workspaceGuid":ws_guid,
+                "itemGuid":material_guid,"buyerGuid":buyer_guid,"comment":"Часть партии"}),
+            Some(users[0]),
+        )
+        .unwrap();
+        dispatch(
+            &mut conn,
+            "bit.acceptSale",
+            &json!({"id":material_offer["id"]}),
+            Some(users[1]),
+        )
+        .unwrap();
+        let active_holding = |user| {
+            conn.query_row(
+                "SELECT COALESCE(SUM(quantity),0) FROM item_holdings WHERE item_id=?1 AND user_id=?2 AND returned_at IS NULL",
+                params![material,user], |row| row.get::<_,f64>(0),
+            ).unwrap()
+        };
+        assert!((active_holding(users[0]) - 2.0).abs() < 1e-9);
+        assert!((active_holding(users[1]) - 4.0).abs() < 1e-9);
+        assert!(jsn::item_json(&conn, material, false).unwrap()["responsibleUserId"].is_null());
         let expensive_item = insert_item(&conn, ws, Some(users[0]), false, None);
         let expensive_item_guid = ledger::guid(&conn, "items", expensive_item).unwrap();
         let expensive_offer = dispatch(
@@ -9364,7 +9405,7 @@ mod tests {
             Some(users[1]),
         )
         .unwrap();
-        assert_eq!(personal.as_array().unwrap().len(), 3);
+        assert_eq!(personal.as_array().unwrap().len(), 4);
         assert!(personal.as_array().unwrap().iter().all(|transaction| {
             transaction["senderUserId"] == users[1] || transaction["recipientUserId"] == users[1]
         }));

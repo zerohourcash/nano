@@ -534,11 +534,22 @@ fn sale_offer_payload(record: &Value) -> anyhow::Result<Value> {
         .and_then(Value::as_i64)
         .filter(|amount| *amount > 0)
         .ok_or_else(|| anyhow::anyhow!("sale offer amount is invalid"))?;
+    let quantity = match record.get("quantity") {
+        None | Some(Value::Null) => Value::Null,
+        Some(value) => {
+            let quantity = value
+                .as_f64()
+                .filter(|quantity| quantity.is_finite() && *quantity > 0.0)
+                .ok_or_else(|| anyhow::anyhow!("sale offer quantity is invalid"))?;
+            json!(quantity)
+        }
+    };
     Ok(json!({
         "domain":"everyday/bit-sale-offer/v1",
         "offerGuid":required("offerGuid")?, "workspaceGuid":required("workspaceGuid")?,
         "itemGuid":required("itemGuid")?, "sellerGuid":required("sellerGuid")?,
         "buyerGuid":required("buyerGuid")?, "bitAmount":amount,
+        "quantity":quantity,
         "comment":record.get("comment").cloned().unwrap_or(Value::Null),
         "createdAt":required("createdAt")?, "ledgerHash":required("ledgerHash")?,
         "status":record.get("status").cloned().unwrap_or_else(||json!("pending")),
@@ -695,7 +706,7 @@ pub fn export_journal_since(conn: &Connection, recipient_frontier: Option<&Value
     }
     let mut sale_offers = Vec::new();
     if let Ok(mut statement) = conn.prepare(
-        "SELECT guid,workspace_id,item_id,from_user_id,to_user_id,bit_amount,comment,created_at,prepare_ledger_hash,status,accept_ledger_hash,bit_transaction_guid
+        "SELECT guid,workspace_id,item_id,from_user_id,to_user_id,bit_amount,comment,created_at,prepare_ledger_hash,status,accept_ledger_hash,bit_transaction_guid,quantity
          FROM transfers WHERE guid IS NOT NULL AND bit_amount IS NOT NULL AND status IN ('pending','accepted','rejected')
          ORDER BY created_at,guid",
     ) {
@@ -711,6 +722,7 @@ pub fn export_journal_since(conn: &Connection, recipient_frontier: Option<&Value
                 "status":row.get::<_,String>(9)?,
                 "decisionLedgerHash":row.get::<_,Option<String>>(10)?,
                 "bitTransactionGuid":row.get::<_,Option<String>>(11)?,
+                "quantity":row.get::<_,Option<f64>>(12)?,
             });
             record["recordHash"] = json!(sale_offer_hash(&record).unwrap_or_default());
             Ok(record)
@@ -2873,22 +2885,23 @@ pub fn import_journal(conn: &Connection, journal: &Value) -> Value {
             };
             let guid = offer.get("offerGuid").and_then(Value::as_str).unwrap_or("");
             let amount = offer.get("bitAmount").and_then(Value::as_i64).unwrap_or(0);
-            let immutable: Option<(i64,i64,i64,i64,i64)> = conn.query_row(
-                "SELECT workspace_id,item_id,from_user_id,to_user_id,bit_amount FROM transfers WHERE guid=?1",
-                [guid], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)),
+            let quantity = offer.get("quantity").and_then(Value::as_f64);
+            let immutable: Option<(i64,i64,i64,i64,i64,Option<f64>)> = conn.query_row(
+                "SELECT workspace_id,item_id,from_user_id,to_user_id,bit_amount,quantity FROM transfers WHERE guid=?1",
+                [guid], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?)),
             ).optional().ok().flatten();
-            if immutable
-                .is_some_and(|existing| existing != (workspace, item, seller, buyer, amount))
-            {
+            if immutable.is_some_and(|existing| {
+                existing != (workspace, item, seller, buyer, amount, quantity)
+            }) {
                 return json!({"ok":false,"error":"GUID предложения Bit уже связан с другими неизменяемыми полями"});
             }
             let code = format!("SALE-{}", guid.chars().take(8).collect::<String>());
             let inserted = conn.execute(
-                "INSERT OR IGNORE INTO transfers(code,item_id,from_user_id,to_user_id,workspace_id,status,comment,no_confirmation,source_custody,bit_amount,guid,prepare_ledger_hash,created_at)
-                 VALUES(?1,?2,?3,?4,?5,'pending',?6,0,1,?7,?8,?9,?10)",
+                "INSERT OR IGNORE INTO transfers(code,item_id,from_user_id,to_user_id,workspace_id,status,comment,no_confirmation,source_custody,bit_amount,guid,prepare_ledger_hash,created_at,quantity)
+                 VALUES(?1,?2,?3,?4,?5,'pending',?6,0,1,?7,?8,?9,?10,?11)",
                 params![code,item,seller,buyer,workspace,offer.get("comment").and_then(Value::as_str),
                     amount,guid,
-                    offer.get("ledgerHash").and_then(Value::as_str),offer.get("createdAt").and_then(Value::as_str)],
+                    offer.get("ledgerHash").and_then(Value::as_str),offer.get("createdAt").and_then(Value::as_str),quantity],
             ).unwrap_or(0);
             if inserted > 0 {
                 ops += 1
@@ -2904,11 +2917,20 @@ pub fn import_journal(conn: &Connection, journal: &Value) -> Value {
                     "UPDATE transfers SET status='accepted',completed_at=COALESCE(completed_at,?1),accept_ledger_hash=?2,bit_transaction_guid=?3 WHERE guid=?4 AND status!='accepted'",
                     params![chrono::Utc::now().to_rfc3339(),offer.get("decisionLedgerHash").and_then(Value::as_str),offer.get("bitTransactionGuid").and_then(Value::as_str),guid],
                 ).unwrap_or(0);
-                conn.execute(
-                    "UPDATE items SET responsible_user_id=?1 WHERE id=?2",
-                    params![buyer, item],
-                )
-                .unwrap_or(0);
+                let quantitative = conn
+                    .query_row(
+                        "SELECT quantitative!=0 FROM items WHERE id=?1",
+                        [item],
+                        |row| row.get::<_, bool>(0),
+                    )
+                    .unwrap_or(false);
+                if !quantitative {
+                    conn.execute(
+                        "UPDATE items SET responsible_user_id=?1 WHERE id=?2",
+                        params![buyer, item],
+                    )
+                    .unwrap_or(0);
+                }
             } else if status == "rejected" {
                 conn.execute(
                     "UPDATE transfers SET status='rejected',completed_at=COALESCE(completed_at,?1),accept_ledger_hash=?2 WHERE guid=?3 AND status='pending'",
@@ -4732,7 +4754,17 @@ fn verify_sale_offers(journal: &Value) -> anyhow::Result<()> {
                 anyhow::bail!("sale offer {field} differs from signed request");
             }
         }
+        let signed_quantity = input.get("quantity").and_then(Value::as_f64);
+        let portable_quantity = offer.get("quantity").and_then(Value::as_f64);
+        let quantity_matches = match (signed_quantity, portable_quantity) {
+            (None, None) => true,
+            (Some(signed), Some(portable)) => {
+                signed.is_finite() && signed > 0.0 && signed.to_bits() == portable.to_bits()
+            }
+            _ => false,
+        };
         if input.get("bitAmount") != offer.get("bitAmount")
+            || !quantity_matches
             || input.get("comment").unwrap_or(&Value::Null)
                 != offer.get("comment").unwrap_or(&Value::Null)
         {
@@ -7211,6 +7243,10 @@ mod tests {
             std::env::temp_dir().join(format!("sale-target-{}.db", uuid::Uuid::new_v4()));
         let rejected_path =
             std::env::temp_dir().join(format!("sale-rejected-{}.db", uuid::Uuid::new_v4()));
+        let quantity_rejected_path = std::env::temp_dir().join(format!(
+            "sale-quantity-rejected-{}.db",
+            uuid::Uuid::new_v4()
+        ));
         let mut source = db::open(&source_path).unwrap();
         let mut target = db::open(&target_path).unwrap();
         let workspace_guid = uuid::Uuid::new_v4().to_string();
@@ -7294,6 +7330,14 @@ mod tests {
                 .unwrap(),
             0
         );
+        let mut quantity_tampered = snapshot.clone();
+        quantity_tampered["saleOffers"][0]["quantity"] = json!(1.0);
+        quantity_tampered["saleOffers"][0]["recordHash"] =
+            json!(sale_offer_hash(&quantity_tampered["saleOffers"][0]).unwrap());
+        ledger::sign_journal(&source, &mut quantity_tampered).unwrap();
+        let quantity_rejected = db::open(&quantity_rejected_path).unwrap();
+        let quantity_rejection = apply_remote_journal(&quantity_rejected, &quantity_tampered, "");
+        assert_eq!(quantity_rejection["ok"], false, "{quantity_rejection}");
         let imported = apply_remote_journal(&target, &snapshot, "");
         assert_eq!(imported["ok"], true, "{imported}");
         let imported_offer: i64 = target
@@ -7352,6 +7396,7 @@ mod tests {
         let _ = std::fs::remove_file(source_path);
         let _ = std::fs::remove_file(target_path);
         let _ = std::fs::remove_file(rejected_path);
+        let _ = std::fs::remove_file(quantity_rejected_path);
     }
 
     #[test]

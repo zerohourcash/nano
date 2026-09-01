@@ -355,9 +355,12 @@ test('browser signs a real custody transaction and ledger retains its proof', as
   const offeredItem = await trpc<{ id: number }>(page, 'items.create', {
     workspaceId: workspaces[0].id,
     internalId: 'BIT-OFFER-E2E',
-    title: 'ТМЦ для двухфазной продажи',
-    responsibleUserId: currentUser.id,
+    title: 'Материал для двухфазной продажи',
+    quantitative: true,
+    quantity: 10,
+    unit: 'шт.',
   });
+  await trpc(page, 'transfers.take', { itemId: offeredItem.id, quantity: 6 });
   await page.goto('/bit');
   await expect(page.getByRole('heading', { name: 'Кошелёк Bit' })).toBeVisible();
   await page.getByRole('button', { name: 'Эмиссия' }).click();
@@ -377,6 +380,7 @@ test('browser signs a real custody transaction and ledger retains its proof', as
   await page.getByRole('button', { name: 'Продажа' }).click();
   await page.getByLabel('Покупатель').selectOption(String(bitRecipient.id));
   await page.getByLabel('Товар или ТМЦ').selectOption(String(offeredItem.id));
+  await page.getByLabel('Количество материала').fill('4');
   await page.getByLabel('Сумма Bit').fill('12');
   await page.getByLabel('Назначение платежа').fill('Подписанное предложение E2E');
   await page.getByRole('button', { name: 'Подписать транзакцию' }).click();
@@ -387,15 +391,21 @@ test('browser signs a real custody transaction and ledger retains its proof', as
     id: number;
     status: string;
     bitAmount: number;
+    quantity: number | null;
     bitTransactionGuid: string | null;
   }>>(page, 'bit.offers', { workspaceId: workspaces[0].id }, false);
   expect(pendingOffers).toEqual([
     expect.objectContaining({
       status: 'pending',
       bitAmount: 12,
+      quantity: 4,
       bitTransactionGuid: null,
     }),
   ]);
+  const materialBeforeAcceptance = await trpc<{
+    holders: Array<{ userId: number; quantity: number }>;
+  }>(page, 'items.byId', { id: offeredItem.id }, false);
+  expect(materialBeforeAcceptance.holders.find(holder => holder.userId === currentUser.id)?.quantity).toBe(6);
 
   await page.getByRole('button', { name: 'Покупка' }).click();
   await page.getByLabel('Продавец').selectOption(String(bitRecipient.id));

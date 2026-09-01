@@ -28,6 +28,7 @@ export type BitSaleOffer = {
   status: 'draft' | 'pending' | 'accepted' | 'rejected';
   comment: string | null;
   bitAmount: number;
+  quantity: number | null;
   bitTransactionGuid: string | null;
   guid: string;
   createdAt: string;
@@ -64,7 +65,7 @@ export const bitRouter = createRouter({
     .input(z.object({ itemId: z.number().int().positive(), sellerUserId: z.number().int().positive(), amount: z.number().int().positive(), memo: z.string().max(500).optional() }))
     .mutation(async (): Promise<BitTransaction> => unavailable()),
   offer: publicQuery
-    .input(z.object({ itemId: z.number().int().positive(), toUserId: z.number().int().positive(), bitAmount: z.number().int().positive(), offerGuid: z.string().uuid(), workspaceGuid: z.string().uuid(), itemGuid: z.string().uuid(), buyerGuid: z.string().uuid(), comment: z.string().max(500).optional() }))
+    .input(z.object({ itemId: z.number().int().positive(), toUserId: z.number().int().positive(), bitAmount: z.number().int().positive(), quantity: z.number().positive().optional(), offerGuid: z.string().uuid(), workspaceGuid: z.string().uuid(), itemGuid: z.string().uuid(), buyerGuid: z.string().uuid(), comment: z.string().max(500).optional() }))
     .mutation(async (): Promise<BitSaleOffer> => unavailable()),
   offers: publicQuery.input(workspaceInput).query(async (): Promise<BitSaleOffer[]> => unavailable()),
   acceptSale: publicQuery
