@@ -1111,6 +1111,8 @@ fn dispatch_inner(
         "profile.get" => profile_get(conn, user_id),
         "profile.update" => profile_update(conn, input, user_id),
         "profile.changePassword" => profile_password(conn, input, user_id),
+        "profile.leaveWorkspace" => profile_leave_workspace(conn, input, user_id),
+        "profile.deleteAccount" => profile_delete_account(conn, input, user_id),
         "admin.users.list" => admin_users(conn, input),
         "admin.users.create" => admin_user_create(conn, input, user_id),
         "admin.users.update" => admin_user_update(conn, input, user_id),
@@ -4346,6 +4348,148 @@ fn profile_password(conn: &Connection, input: &Value, user_id: Option<i64>) -> A
     Ok(json!({"ok": true, "message": "Пароль изменён"}))
 }
 
+fn membership_can_admin(rights: &Value) -> bool {
+    rights
+        .get("manageUsers")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn profile_leave_workspace(
+    conn: &mut Connection,
+    input: &Value,
+    user_id: Option<i64>,
+) -> ApiResult {
+    atomic(conn, |conn| {
+        profile_leave_workspace_atomic(conn, input, user_id)
+    })
+}
+
+fn profile_leave_workspace_atomic(
+    conn: &Connection,
+    input: &Value,
+    user_id: Option<i64>,
+) -> ApiResult {
+    let uid = require_user(conn, user_id)?;
+    let ws = i64v(input, "workspaceId").ok_or_else(|| ApiError::bad("workspaceId"))?;
+    conn.query_row(
+        "SELECT 1 FROM user_workspaces WHERE user_id=?1 AND workspace_id=?2",
+        params![uid, ws],
+        |_| Ok(()),
+    )
+    .optional()?
+    .ok_or_else(|| ApiError::not_found("Вы не состоите в этой организации"))?;
+    if membership_can_admin(&merged_rights(conn, uid, ws)) {
+        let mut statement = conn
+            .prepare("SELECT user_id FROM user_workspaces WHERE workspace_id=?1 AND user_id<>?2")?;
+        let other_users: Vec<i64> = statement
+            .query_map(params![ws, uid], |row| row.get(0))?
+            .flatten()
+            .collect();
+        let other_admins = other_users
+            .into_iter()
+            .any(|other| membership_can_admin(&merged_rights(conn, other, ws)));
+        if !other_admins {
+            return Err(ApiError::conflict(
+                "Сначала назначьте другого администратора организации",
+            ));
+        }
+    }
+    let active_custody: i64 = conn.query_row(
+        "SELECT (SELECT COUNT(*) FROM items WHERE workspace_id=?1 AND responsible_user_id=?2 AND archived=0)
+              + (SELECT COUNT(*) FROM item_holdings h JOIN items i ON i.id=h.item_id
+                 WHERE i.workspace_id=?1 AND h.user_id=?2 AND h.returned_at IS NULL)",
+        params![ws, uid],
+        |row| row.get(0),
+    )?;
+    if active_custody > 0 {
+        return Err(ApiError::conflict(
+            "Сначала верните или передайте всё числящееся за вами оборудование",
+        ));
+    }
+    let user_guid = ledger::guid(conn, "users", uid)
+        .map_err(|error| ApiError::internal(format!("Ошибка GUID: {error}")))?;
+    let event = ledger::append(
+        conn,
+        ws,
+        uid,
+        None,
+        "membership_remove",
+        Some(&user_guid),
+        None,
+        None,
+        Some("Участник самостоятельно покинул организацию; история сохранена"),
+    )
+    .map_err(|error| ApiError::internal(format!("Ошибка журнала: {error}")))?;
+    crate::sync::record_membership_version(conn, ws, uid, false, event["opId"].as_str(), false)
+        .map_err(|error| ApiError::internal(format!("Ошибка tombstone членства: {error}")))?;
+    conn.execute(
+        "DELETE FROM user_workspaces WHERE user_id=?1 AND workspace_id=?2",
+        params![uid, ws],
+    )?;
+    let mut statement = conn.prepare(
+        "SELECT workspace_id FROM user_workspaces WHERE user_id=?1 ORDER BY workspace_id",
+    )?;
+    let remaining: Vec<i64> = statement
+        .query_map([uid], |row| row.get(0))?
+        .flatten()
+        .collect();
+    if remaining.is_empty() {
+        conn.execute("UPDATE users SET status='disabled' WHERE id=?1", [uid])?;
+        conn.execute(
+            "UPDATE sessions SET revoked_at=?1 WHERE user_id=?2 AND revoked_at IS NULL",
+            params![now(), uid],
+        )?;
+    }
+    Ok(json!({"ok":true,"ledgerHash":event["opId"],"remainingWorkspaceIds":remaining}))
+}
+
+fn profile_delete_account(conn: &mut Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
+    atomic(conn, |conn| {
+        let uid = require_user(conn, user_id)?;
+        let password = s(input, "currentPassword").unwrap_or_default();
+        let hash: Option<String> = conn.query_row(
+            "SELECT password_hash FROM users WHERE id=?1",
+            [uid],
+            |row| row.get(0),
+        )?;
+        if hash
+            .as_deref()
+            .is_none_or(|value| !verify_password(&password, value))
+        {
+            return Err(ApiError::unauth("Неверный текущий пароль"));
+        }
+        let workspaces: Vec<i64> = {
+            let mut statement = conn.prepare(
+                "SELECT workspace_id FROM user_workspaces WHERE user_id=?1 ORDER BY workspace_id",
+            )?;
+            let values = statement
+                .query_map([uid], |row| row.get(0))?
+                .flatten()
+                .collect();
+            values
+        };
+        for workspace_id in workspaces {
+            profile_leave_workspace_atomic(conn, &json!({"workspaceId":workspace_id}), Some(uid))?;
+        }
+        let guid = ledger::guid(conn, "users", uid)
+            .map_err(|error| ApiError::internal(format!("Ошибка GUID: {error}")))?;
+        conn.execute(
+            "UPDATE users SET full_name='Удалённый участник',phone=?1,position=NULL,avatar_url=NULL,password_hash=NULL,status='disabled' WHERE id=?2",
+            params![format!("deleted-{guid}"), uid],
+        )?;
+        conn.execute(
+            "UPDATE user_devices SET revoked_at=COALESCE(revoked_at,?1) WHERE user_id=?2",
+            params![now(), uid],
+        )?;
+        conn.execute(
+            "UPDATE sessions SET revoked_at=COALESCE(revoked_at,?1) WHERE user_id=?2",
+            params![now(), uid],
+        )?;
+        Ok(json!({"ok":true,"historyPreserved":true}))
+    })
+}
+
 fn admin_users(conn: &Connection, input: &Value) -> ApiResult {
     let ws = i64v(input, "workspaceId").unwrap_or_else(|| ws_fallback(conn));
     let mut stmt = conn.prepare("SELECT user_id,position,role_name,personnel_number,rights_json FROM user_workspaces WHERE workspace_id=?1")?;
@@ -4833,8 +4977,9 @@ fn validate_config_responsible(
         return Ok(());
     };
     let member: i64 = conn.query_row(
-        "SELECT count(*) FROM user_workspaces WHERE workspace_id=?1 AND user_id=?2 AND removed_at IS NULL",
-        params![workspace_id,user_id], |row| row.get(0),
+        "SELECT count(*) FROM user_workspaces WHERE workspace_id=?1 AND user_id=?2",
+        params![workspace_id, user_id],
+        |row| row.get(0),
     )?;
     if member == 0 {
         return Err(ApiError::bad("Ответственный не состоит в этой организации"));
@@ -6633,6 +6778,107 @@ mod tests {
             .unwrap();
         }
         (conn, path, users, ws)
+    }
+
+    #[test]
+    fn self_leave_is_ledger_bound_and_custody_and_last_admin_are_guarded() {
+        let (mut conn, path, users, ws) = test_db();
+        let item = insert_item(&conn, ws, Some(users[1]), false, None);
+        let custody_error = dispatch(
+            &mut conn,
+            "profile.leaveWorkspace",
+            &json!({"workspaceId":ws}),
+            Some(users[1]),
+        )
+        .unwrap_err();
+        assert_eq!(custody_error.http, 409, "{}", custody_error.message);
+        conn.execute(
+            "UPDATE items SET responsible_user_id=NULL WHERE id=?1",
+            [item],
+        )
+        .unwrap();
+        let left = dispatch(
+            &mut conn,
+            "profile.leaveWorkspace",
+            &json!({"workspaceId":ws}),
+            Some(users[1]),
+        )
+        .unwrap();
+        assert_eq!(left["remainingWorkspaceIds"], json!([]));
+        assert_eq!(left["ledgerHash"].as_str().unwrap().len(), 64);
+        let membership: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM user_workspaces WHERE user_id=?1 AND workspace_id=?2",
+                params![users[1], ws],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(membership, 0);
+        let tombstone: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM membership_versions WHERE user_guid=(SELECT guid FROM users WHERE id=?1) AND active=0",
+                [users[1]],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(tombstone, 1);
+
+        let last_admin = dispatch(
+            &mut conn,
+            "profile.leaveWorkspace",
+            &json!({"workspaceId":ws}),
+            Some(users[0]),
+        )
+        .unwrap_err();
+        assert_eq!(last_admin.http, 409);
+        cleanup(conn, path);
+    }
+
+    #[test]
+    fn account_deletion_verifies_password_anonymizes_and_preserves_history() {
+        let (mut conn, path, users, ws) = test_db();
+        conn.execute(
+            "UPDATE users SET password_hash=?1 WHERE id=?2",
+            params![hash_password("CorrectPassword123"), users[2]],
+        )
+        .unwrap();
+        let wrong = dispatch(
+            &mut conn,
+            "profile.deleteAccount",
+            &json!({"currentPassword":"wrong"}),
+            Some(users[2]),
+        )
+        .unwrap_err();
+        assert_eq!(wrong.http, 401);
+        assert!(dispatch(
+            &mut conn,
+            "profile.deleteAccount",
+            &json!({"currentPassword":"CorrectPassword123"}),
+            Some(users[2]),
+        )
+        .unwrap()["historyPreserved"]
+            .as_bool()
+            .unwrap());
+        let (name, phone, status, password): (String, String, String, Option<String>) = conn
+            .query_row(
+                "SELECT full_name,phone,status,password_hash FROM users WHERE id=?1",
+                [users[2]],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(name, "Удалённый участник");
+        assert!(phone.starts_with("deleted-"));
+        assert_eq!(status, "disabled");
+        assert!(password.is_none());
+        let preserved: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM history_entries WHERE workspace_id=?1 AND actor_user_id=?2 AND type='membership_remove'",
+                params![ws, users[2]],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(preserved, 1);
+        cleanup(conn, path);
     }
 
     #[test]

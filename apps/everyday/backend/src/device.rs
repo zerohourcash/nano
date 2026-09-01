@@ -141,6 +141,8 @@ pub fn requires_signature(procedure: &str) -> bool {
             | "backup.import"
             | "profile.update"
             | "profile.changePassword"
+            | "profile.leaveWorkspace"
+            | "profile.deleteAccount"
             | "auth.revokeDevice"
             | "admin.users.create"
             | "admin.users.update"
@@ -393,6 +395,8 @@ mod tests {
             "backup.import",
             "profile.update",
             "profile.changePassword",
+            "profile.leaveWorkspace",
+            "profile.deleteAccount",
             "auth.revokeDevice",
             "sync.reportTransportStatus",
         ] {

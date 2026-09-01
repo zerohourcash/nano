@@ -3,6 +3,7 @@ import { createRouter, publicQuery } from "./middleware";
 import { updateUser, workspacesOfUser } from "./queries/users";
 import { requireMe } from "./auth";
 import { publicUser } from "./lib/password";
+import { TRPCError } from "@trpc/server";
 
 export const profileRouter = createRouter({
   get: publicQuery.query(async ({ ctx }) => {
@@ -25,7 +26,6 @@ export const profileRouter = createRouter({
       return updateUser(me.id, input);
     }),
 
-  /** Заглушка: смена пароля (демо-режим, реальной авторизации нет). */
   changePassword: publicQuery
     .input(
       z.object({
@@ -33,5 +33,21 @@ export const profileRouter = createRouter({
         newPassword: z.string().min(12).max(128),
       }),
     )
-    .mutation(async () => ({ ok: true, message: "Пароль изменён (демо-режим)" })),
+    .mutation(async () => {
+      throw new TRPCError({ code: "PRECONDITION_FAILED", message: "Смена пароля доступна на автономном Rust-узле" });
+    }),
+
+  // Production uses the Rust node. The legacy adapter fails closed instead of
+  // pretending that destructive local-only actions succeeded.
+  leaveWorkspace: publicQuery
+    .input(z.object({ workspaceId: z.number().int().positive() }))
+    .mutation(async () => {
+      throw new TRPCError({ code: "PRECONDITION_FAILED", message: "Требуется автономный Rust-узел" });
+    }),
+
+  deleteAccount: publicQuery
+    .input(z.object({ currentPassword: z.string().min(1) }))
+    .mutation(async () => {
+      throw new TRPCError({ code: "PRECONDITION_FAILED", message: "Требуется автономный Rust-узел" });
+    }),
 });

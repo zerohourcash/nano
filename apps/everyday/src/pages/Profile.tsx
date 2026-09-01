@@ -263,17 +263,7 @@ export default function Profile() {
     [profileQ.data],
   )
 
-  // Локальные дополнения (создание пространства без бэкенда, скрытые пространства)
-  const [extraWs, setExtraWs] = useState<VWorkspace[]>([])
-  const [leftWsIds, setLeftWsIds] = useState<Set<string>>(new Set())
-  const [avatarOverride, setAvatarOverride] = useState<string | null>(null)
-
-  const allWorkspaces: VWorkspace[] = useMemo(() => {
-    const base = profile?.workspaces ?? []
-    const merged = [...base]
-    for (const e of extraWs) if (!merged.some((w) => w.name === e.name)) merged.push(e)
-    return merged.filter((w) => !leftWsIds.has(w.id))
-  }, [profile, extraWs, leftWsIds])
+  const allWorkspaces: VWorkspace[] = profile?.workspaces ?? []
 
   // ─── Мутации ───────────────────────────────────────────────────────────────
 
@@ -296,6 +286,8 @@ export default function Profile() {
   })
 
   const pwdM = trpc.profile.changePassword.useMutation()
+  const leaveM = trpc.profile.leaveWorkspace.useMutation()
+  const deleteM = trpc.profile.deleteAccount.useMutation()
 
   const createWsM = trpc.admin.workspaces.create.useMutation({
     onSuccess: () => {
@@ -351,12 +343,11 @@ export default function Profile() {
   const onAvatarFile = async (file: File) => {
     try {
       const dataUrl = await fileToAvatarDataUrl(file)
-      setAvatarOverride(dataUrl)
       updateM.mutate(
         { avatarUrl: dataUrl },
         {
           onSuccess: () => showToast('Фото обновлено'),
-          onError: () => showToast('Фото сохранено локально (демо)'),
+          onError: (error) => showToast(error.message || 'Не удалось сохранить фото', true),
         }
       )
     } catch {
@@ -373,7 +364,7 @@ export default function Profile() {
       { fullName: fullName.trim(), position: position.trim() || null },
       {
         onSuccess: () => showToast('Данные обновлены'),
-        onError: () => showToast('Данные обновлены локально (демо)'),
+        onError: (error) => showToast(error.message || 'Не удалось обновить данные', true),
       }
     )
     setFlash(true)
@@ -433,10 +424,7 @@ export default function Profile() {
         onSuccess: () => {
           showToast('Рабочее пространство создано')
         },
-        onError: () => {
-          setExtraWs((prev) => [...prev, { id: `local-${Date.now()}`, name, prefix: wsPrefix.trim() || 'ВН-', timezone: wsTz }])
-          showToast('Пространство создано локально (демо)')
-        },
+        onError: (error) => showToast(error.message || 'Не удалось создать пространство', true),
       }
     )
     setCreateWsOpen(false)
@@ -446,19 +434,36 @@ export default function Profile() {
 
   const onLeaveWorkspace = () => {
     if (!leaveWs || leaveConfirm.trim() !== leaveWs.name) return
-    setLeftWsIds((prev) => new Set(prev).add(leaveWs.id))
-    showToast(`Вы покинули ${leaveWs.name}`)
-    setLeaveWs(null)
-    setLeaveConfirm('')
+    const leaving = leaveWs
+    leaveM.mutate(
+      { workspaceId: Number(leaving.id) },
+      {
+        onSuccess: () => {
+          void utils.profile.get.invalidate()
+          void utils.meta.workspaces.invalidate()
+          showToast(`Вы покинули ${leaving.name}; tombstone записан в летопись`)
+          setLeaveWs(null)
+          setLeaveConfirm('')
+        },
+        onError: (error) => showToast(error.message || 'Не удалось покинуть пространство', true),
+      },
+    )
   }
 
   const onDeleteAccount = () => {
     if (!deleteAgree || !deletePwd) return
-    setDeleteOpen(false)
-    setDeleteAgree(false)
-    setDeletePwd('')
-    showToast('Аккаунт удалён (демо)', true)
-    setTimeout(() => navigate('/login'), 600)
+    deleteM.mutate(
+      { currentPassword: deletePwd },
+      {
+        onSuccess: () => {
+          setDeleteOpen(false)
+          setDeleteAgree(false)
+          setDeletePwd('')
+          navigate('/login')
+        },
+        onError: (error) => showToast(error.message || 'Не удалось удалить аккаунт', true),
+      },
+    )
   }
 
   // ─── Render ────────────────────────────────────────────────────────────────
@@ -491,7 +496,7 @@ export default function Profile() {
     )
   }
 
-  const avatarSrc = avatarOverride ?? profile.avatar
+  const avatarSrc = profile.avatar
 
   return (
     <div className="space-y-5">
@@ -978,7 +983,7 @@ export default function Profile() {
           </button>
           <button
             onClick={onLeaveWorkspace}
-            disabled={!leaveWs || leaveConfirm.trim() !== leaveWs.name}
+            disabled={!leaveWs || leaveConfirm.trim() !== leaveWs.name || leaveM.isPending}
             className="h-10 px-5 rounded-xl bg-danger text-white text-sm font-semibold hover:brightness-95 active:scale-[0.97] transition disabled:opacity-50"
           >
             Покинуть пространство
@@ -1024,7 +1029,7 @@ export default function Profile() {
           </button>
           <button
             onClick={onDeleteAccount}
-            disabled={!deleteAgree || !deletePwd}
+            disabled={!deleteAgree || !deletePwd || deleteM.isPending}
             className="h-10 px-5 rounded-xl bg-danger text-white text-sm font-semibold hover:brightness-95 active:scale-[0.97] transition disabled:opacity-50"
           >
             Удалить навсегда

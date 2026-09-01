@@ -97,6 +97,8 @@ check(
 )
 for procedure, payload in [
     ("profile.update", {"fullName": "Подмена профиля"}),
+    ("profile.leaveWorkspace", {"workspaceId": ws_id}),
+    ("profile.deleteAccount", {"currentPassword": "SuperSecret123"}),
     ("sync.pullNow", {}),
     ("content.pin", {"hash": "0" * 64}),
     ("auth.revokeDevice", {"deviceId": owner.signer.device_id}),

@@ -19,7 +19,7 @@ CRITICAL = {
     "interorg.ensureIdentity", "interorg.trustContact", "interorg.revokeContact", "interorg.send", "interorg.accept",
     "sync.approveNodeKey", "sync.revokeNodeKey", "sync.addPeer", "sync.removePeer", "sync.pullNow", "sync.resolveConflict",
     "sync.clearDiagnostics", "sync.reportTransportStatus", "content.setMode", "content.ingest", "content.pin", "content.unpin",
-    "backup.export", "backup.import", "profile.update", "profile.changePassword", "auth.revokeDevice",
+    "backup.export", "backup.import", "profile.update", "profile.changePassword", "profile.leaveWorkspace", "profile.deleteAccount", "auth.revokeDevice",
     "admin.users.create", "admin.users.update", "admin.users.remove", "admin.users.invite",
     "admin.workspaces.create", "admin.workspaces.update", "admin.workspaces.remove",
     "admin.workspaces.createInvite", "admin.organizationNodes.create",
