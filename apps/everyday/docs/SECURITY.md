@@ -136,6 +136,13 @@ capability, затем применяют только её scope. Неверн�
   Все три типа связаны с отдельным Ed25519 device-proof; delta может ссылаться
   на уже сохранённый корень. Импорт проверяет hash, Ledger evidence и пределы
   размеров до доверия к ключу ноды, затем заново материализует session/results.
+  Inventory Ledger V3 дополнительно переносит исходное безопасное JSON-тело
+  HTTP-запроса. Оно является частью node-chain, его SHA-256 уже входит в
+  Ed25519 device signature. Remote verifier пересчитывает hash, проверяет
+  endpoint и сравнивает фактическое количество/checked с подписанным input.
+  Тест отдельно создаёт новый валидно node-signed event с повторно приложенным
+  device-proof, но `actualQty=99` вместо подписанного `7`; импорт его отклоняет
+  как semantic substitution.
 - «Удаление» ТМЦ реализовано как delete-wins `itemTombstoneMode=monotonic/v1`.
   Tombstone коммитит GUID организации, карточки и автора, Ledger hash и время;
   связанное `item_archive` обязано иметь полный device-proof. Проверка проходит

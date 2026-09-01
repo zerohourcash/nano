@@ -117,6 +117,14 @@ fn migrate(conn: &Connection) -> Result<()> {
         [],
     );
     let _ = conn.execute(
+        "ALTER TABLE history_entries ADD COLUMN request_body TEXT",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE pending_device_proofs ADD COLUMN request_body TEXT",
+        [],
+    );
+    let _ = conn.execute(
         "ALTER TABLE transfers ADD COLUMN needs_admin INTEGER NOT NULL DEFAULT 0",
         [],
     );
@@ -448,7 +456,8 @@ fn migrate(conn: &Connection) -> Result<()> {
           signature TEXT NOT NULL,
           request_hash TEXT NOT NULL,
           request_timestamp TEXT NOT NULL,
-          request_path TEXT NOT NULL
+          request_path TEXT NOT NULL,
+          request_body TEXT
         );
         CREATE UNIQUE INDEX IF NOT EXISTS user_workspaces_pair_uq
           ON user_workspaces(user_id, workspace_id);
@@ -888,6 +897,7 @@ fn init_schema(conn: &Connection) -> Result<()> {
           request_hash TEXT,
           request_timestamp TEXT,
           request_path TEXT,
+          request_body TEXT,
           created_at TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS inventory_sessions (

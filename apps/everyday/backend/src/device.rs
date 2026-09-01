@@ -18,6 +18,7 @@ pub struct Proof {
     pub request_hash: String,
     pub timestamp: String,
     pub path: String,
+    pub request_body: Option<String>,
 }
 
 pub fn requires_signature(procedure: &str) -> bool {
@@ -223,15 +224,19 @@ pub fn verify_request(
         request_hash: body_hash,
         timestamp: timestamp.to_owned(),
         path: path.to_owned(),
+        request_body: path
+            .starts_with("/api/trpc/inventory.")
+            .then(|| String::from_utf8(body.to_vec()))
+            .transpose()?,
     })
 }
 
 pub fn set_pending(conn: &Connection, user_id: i64, proof: &Proof) -> anyhow::Result<()> {
     conn.execute(
-        "INSERT INTO pending_device_proofs(user_id,device_id,public_key,nonce,signature,request_hash,request_timestamp,request_path)
-         VALUES(?1,?2,?3,?4,?5,?6,?7,?8)
-         ON CONFLICT(user_id) DO UPDATE SET device_id=excluded.device_id,public_key=excluded.public_key,nonce=excluded.nonce,signature=excluded.signature,request_hash=excluded.request_hash,request_timestamp=excluded.request_timestamp,request_path=excluded.request_path",
-        params![user_id,proof.device_id,proof.public_key,proof.nonce,proof.signature,proof.request_hash,proof.timestamp,proof.path],
+        "INSERT INTO pending_device_proofs(user_id,device_id,public_key,nonce,signature,request_hash,request_timestamp,request_path,request_body)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)
+         ON CONFLICT(user_id) DO UPDATE SET device_id=excluded.device_id,public_key=excluded.public_key,nonce=excluded.nonce,signature=excluded.signature,request_hash=excluded.request_hash,request_timestamp=excluded.request_timestamp,request_path=excluded.request_path,request_body=excluded.request_body",
+        params![user_id,proof.device_id,proof.public_key,proof.nonce,proof.signature,proof.request_hash,proof.timestamp,proof.path,proof.request_body],
     )?;
     Ok(())
 }
@@ -301,12 +306,32 @@ mod tests {
         let path = "/api/trpc/transfers.take";
         let body = br#"{"itemId":42}"#;
         let headers = signed_headers(&key, "phone-device-0001", path, body, "unique-nonce-0001");
-        verify_request(&db, 7, path, body, &headers).unwrap();
+        let proof = verify_request(&db, 7, path, body, &headers).unwrap();
+        assert!(
+            proof.request_body.is_none(),
+            "обычные и потенциально секретные запросы не должны попадать в переносимый Ledger body"
+        );
         assert!(verify_request(&db, 7, path, body, &headers).is_err());
 
         let tampered_headers =
             signed_headers(&key, "phone-device-0001", path, body, "unique-nonce-0002");
         assert!(verify_request(&db, 7, path, br#"{"itemId":43}"#, &tampered_headers).is_err());
+
+        let inventory_path = "/api/trpc/inventory.checkItem";
+        let inventory_body = br#"{"0":{"json":{"sessionId":1,"itemId":42,"actualQty":7}}}"#;
+        let inventory_headers = signed_headers(
+            &key,
+            "phone-device-0001",
+            inventory_path,
+            inventory_body,
+            "unique-nonce-0003",
+        );
+        let inventory_proof =
+            verify_request(&db, 7, inventory_path, inventory_body, &inventory_headers).unwrap();
+        assert_eq!(
+            inventory_proof.request_body.as_deref(),
+            std::str::from_utf8(inventory_body).ok()
+        );
     }
 
     #[test]

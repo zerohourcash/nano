@@ -18,6 +18,7 @@ const KEY_NAME: &str = "ledger.node-signing-key.v1";
 const EXTERNAL_KEY_ENV: &str = "MESHKEEPER_NODE_SIGNING_KEY";
 const DOMAIN_V1: &str = "everyday/ledger-event/v1";
 const DOMAIN_V2: &str = "everyday/ledger-event/v2";
+const DOMAIN_V3: &str = "everyday/ledger-event/v3";
 const JOURNAL_DOMAIN: &str = "everyday/sync-journal/v1";
 
 #[derive(Debug, Serialize)]
@@ -59,6 +60,30 @@ struct EventV2<'a> {
     request_path: Option<&'a str>,
 }
 
+#[derive(Debug, Serialize)]
+struct EventV3<'a> {
+    domain: &'static str,
+    workspace_guid: &'a str,
+    actor_guid: &'a str,
+    item_guid: Option<&'a str>,
+    op_type: &'a str,
+    from_label: Option<&'a str>,
+    to_label: Option<&'a str>,
+    quantity_delta: Option<f64>,
+    comment: Option<&'a str>,
+    created_at: &'a str,
+    nonce: &'a str,
+    prev_hash: Option<&'a str>,
+    request_device_id: Option<&'a str>,
+    request_public_key: Option<&'a str>,
+    request_nonce: Option<&'a str>,
+    request_signature: Option<&'a str>,
+    request_hash: Option<&'a str>,
+    request_timestamp: Option<&'a str>,
+    request_path: Option<&'a str>,
+    request_body: Option<&'a str>,
+}
+
 #[derive(Default)]
 struct RequestProof {
     device_id: Option<String>,
@@ -68,6 +93,7 @@ struct RequestProof {
     hash: Option<String>,
     timestamp: Option<String>,
     path: Option<String>,
+    body: Option<String>,
 }
 
 fn decode_signing_key(encoded: &str) -> anyhow::Result<SigningKey> {
@@ -144,7 +170,7 @@ pub(crate) fn guid(conn: &Connection, table: &str, id: i64) -> anyhow::Result<St
 
 fn pending_proof(conn: &Connection, actor_id: i64) -> RequestProof {
     conn.query_row(
-        "SELECT device_id,public_key,nonce,signature,request_hash,request_timestamp,request_path
+        "SELECT device_id,public_key,nonce,signature,request_hash,request_timestamp,request_path,request_body
          FROM pending_device_proofs WHERE user_id=?1",
         [actor_id],
         |r| {
@@ -156,6 +182,7 @@ fn pending_proof(conn: &Connection, actor_id: i64) -> RequestProof {
                 hash: r.get(4)?,
                 timestamp: r.get(5)?,
                 path: r.get(6)?,
+                body: r.get(7)?,
             })
         },
     )
@@ -248,46 +275,71 @@ pub fn append(
     let actor_guid = guid(conn, "users", actor_id)?;
     let item_guid = item_id.map(|id| guid(conn, "items", id)).transpose()?;
     let proof = pending_proof(conn, actor_id);
-    let event = EventV2 {
-        domain: DOMAIN_V2,
-        workspace_guid: &workspace_guid,
-        actor_guid: &actor_guid,
-        item_guid: item_guid.as_deref(),
-        op_type,
-        from_label,
-        to_label,
-        quantity_delta,
-        comment,
-        created_at: &ts,
-        nonce: &nonce,
-        prev_hash: prev_hash.as_deref(),
-        request_device_id: proof.device_id.as_deref(),
-        request_public_key: proof.public_key.as_deref(),
-        request_nonce: proof.nonce.as_deref(),
-        request_signature: proof.signature.as_deref(),
-        request_hash: proof.hash.as_deref(),
-        request_timestamp: proof.timestamp.as_deref(),
-        request_path: proof.path.as_deref(),
+    let event_version = if proof.body.is_some() { 3 } else { 2 };
+    let bytes = if event_version == 3 {
+        serde_json::to_vec(&EventV3 {
+            domain: DOMAIN_V3,
+            workspace_guid: &workspace_guid,
+            actor_guid: &actor_guid,
+            item_guid: item_guid.as_deref(),
+            op_type,
+            from_label,
+            to_label,
+            quantity_delta,
+            comment,
+            created_at: &ts,
+            nonce: &nonce,
+            prev_hash: prev_hash.as_deref(),
+            request_device_id: proof.device_id.as_deref(),
+            request_public_key: proof.public_key.as_deref(),
+            request_nonce: proof.nonce.as_deref(),
+            request_signature: proof.signature.as_deref(),
+            request_hash: proof.hash.as_deref(),
+            request_timestamp: proof.timestamp.as_deref(),
+            request_path: proof.path.as_deref(),
+            request_body: proof.body.as_deref(),
+        })?
+    } else {
+        serde_json::to_vec(&EventV2 {
+            domain: DOMAIN_V2,
+            workspace_guid: &workspace_guid,
+            actor_guid: &actor_guid,
+            item_guid: item_guid.as_deref(),
+            op_type,
+            from_label,
+            to_label,
+            quantity_delta,
+            comment,
+            created_at: &ts,
+            nonce: &nonce,
+            prev_hash: prev_hash.as_deref(),
+            request_device_id: proof.device_id.as_deref(),
+            request_public_key: proof.public_key.as_deref(),
+            request_nonce: proof.nonce.as_deref(),
+            request_signature: proof.signature.as_deref(),
+            request_hash: proof.hash.as_deref(),
+            request_timestamp: proof.timestamp.as_deref(),
+            request_path: proof.path.as_deref(),
+        })?
     };
-    let bytes = serde_json::to_vec(&event)?;
     let hash = digest(&bytes);
     let signature = STANDARD_NO_PAD.encode(key.sign(&bytes).to_bytes());
     conn.execute(
-        "INSERT INTO history_entries(workspace_id,item_id,type,actor_user_id,from_label,to_label,quantity_delta,comment,prev_hash,hash,signature,pubkey,event_version,request_device_id,request_public_key,request_nonce,request_signature,request_hash,request_timestamp,request_path,created_at,guid)
-         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,2,?13,?14,?15,?16,?17,?18,?19,?20,?21)",
+        "INSERT INTO history_entries(workspace_id,item_id,type,actor_user_id,from_label,to_label,quantity_delta,comment,prev_hash,hash,signature,pubkey,event_version,request_device_id,request_public_key,request_nonce,request_signature,request_hash,request_timestamp,request_path,request_body,created_at,guid)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23)",
         params![workspace_id,item_id,op_type,actor_id,from_label,to_label,quantity_delta,comment,
-            prev_hash,hash,signature,pubkey,proof.device_id,proof.public_key,proof.nonce,proof.signature,
-            proof.hash,proof.timestamp,proof.path,ts,nonce],
+            prev_hash,hash,signature,pubkey,event_version,proof.device_id,proof.public_key,proof.nonce,proof.signature,
+            proof.hash,proof.timestamp,proof.path,proof.body,ts,nonce],
     )?;
     Ok(json!({
         "id":conn.last_insert_rowid(),"opId":hash,"workspaceId":workspace_id,
         "itemId":item_id,"type":op_type,"actorUserId":actor_id,"fromLabel":from_label,
         "toLabel":to_label,"quantityDelta":quantity_delta,"comment":comment,
-        "prevHash":prev_hash,"signature":signature,"pubkey":pubkey,"eventVersion":2,
+        "prevHash":prev_hash,"signature":signature,"pubkey":pubkey,"eventVersion":event_version,
         "requestDeviceId":proof.device_id,"requestNonce":proof.nonce,
         "requestPublicKey":proof.public_key,
         "requestSignature":proof.signature,"requestHash":proof.hash,
-        "requestTimestamp":proof.timestamp,"requestPath":proof.path,
+        "requestTimestamp":proof.timestamp,"requestPath":proof.path,"requestBody":proof.body,
         "createdAt":ts,"guid":nonce
     }))
 }
@@ -344,14 +396,20 @@ fn verify_device_proof(row: &Row<'_>) -> anyhow::Result<()> {
     )?;
     let signature = Signature::from_slice(&URL_SAFE_NO_PAD.decode(signature)?)?;
     key.verify(message.as_bytes(), &signature)
-        .context("invalid device proof")
+        .context("invalid device proof")?;
+    if let Some(body) = optional_string(row, 22)? {
+        if digest(body.as_bytes()) != hash {
+            bail!("device request body hash mismatch")
+        }
+    }
+    Ok(())
 }
 
 pub fn verify_all(conn: &Connection) -> anyhow::Result<usize> {
     let mut stmt = conn.prepare(
         "SELECT workspace_id,item_id,type,actor_user_id,from_label,to_label,quantity_delta,comment,
                 prev_hash,hash,signature,pubkey,created_at,guid,event_version,
-                request_device_id,request_public_key,request_nonce,request_signature,request_hash,request_timestamp,request_path
+                request_device_id,request_public_key,request_nonce,request_signature,request_hash,request_timestamp,request_path,request_body
          FROM history_entries ORDER BY workspace_id,id",
     )?;
     let mut rows = stmt.query([])?;
@@ -391,7 +449,7 @@ pub fn verify_all(conn: &Connection) -> anyhow::Result<usize> {
                 nonce: &nonce,
                 prev_hash: stored_prev.as_deref(),
             })?
-        } else if version == 2 {
+        } else if version == 2 || version == 3 {
             let workspace_guid = guid(conn, "workspaces", ws)?;
             let actor: i64 = row.get(3)?;
             let actor_guid = guid(conn, "users", actor)?;
@@ -404,27 +462,53 @@ pub fn verify_all(conn: &Connection) -> anyhow::Result<usize> {
             let request_hash = optional_string(row, 19)?;
             let request_timestamp = optional_string(row, 20)?;
             let request_path = optional_string(row, 21)?;
-            serde_json::to_vec(&EventV2 {
-                domain: DOMAIN_V2,
-                workspace_guid: &workspace_guid,
-                actor_guid: &actor_guid,
-                item_guid: item_guid.as_deref(),
-                op_type: &op_type,
-                from_label: from_label.as_deref(),
-                to_label: to_label.as_deref(),
-                quantity_delta: row.get(6)?,
-                comment: comment.as_deref(),
-                created_at: &created_at,
-                nonce: &nonce,
-                prev_hash: stored_prev.as_deref(),
-                request_device_id: device_id.as_deref(),
-                request_public_key: request_public_key.as_deref(),
-                request_nonce: request_nonce.as_deref(),
-                request_signature: request_signature.as_deref(),
-                request_hash: request_hash.as_deref(),
-                request_timestamp: request_timestamp.as_deref(),
-                request_path: request_path.as_deref(),
-            })?
+            let request_body = optional_string(row, 22)?;
+            if version == 3 {
+                serde_json::to_vec(&EventV3 {
+                    domain: DOMAIN_V3,
+                    workspace_guid: &workspace_guid,
+                    actor_guid: &actor_guid,
+                    item_guid: item_guid.as_deref(),
+                    op_type: &op_type,
+                    from_label: from_label.as_deref(),
+                    to_label: to_label.as_deref(),
+                    quantity_delta: row.get(6)?,
+                    comment: comment.as_deref(),
+                    created_at: &created_at,
+                    nonce: &nonce,
+                    prev_hash: stored_prev.as_deref(),
+                    request_device_id: device_id.as_deref(),
+                    request_public_key: request_public_key.as_deref(),
+                    request_nonce: request_nonce.as_deref(),
+                    request_signature: request_signature.as_deref(),
+                    request_hash: request_hash.as_deref(),
+                    request_timestamp: request_timestamp.as_deref(),
+                    request_path: request_path.as_deref(),
+                    request_body: request_body.as_deref(),
+                })?
+            } else {
+                serde_json::to_vec(&EventV2 {
+                    domain: DOMAIN_V2,
+                    workspace_guid: &workspace_guid,
+                    actor_guid: &actor_guid,
+                    item_guid: item_guid.as_deref(),
+                    op_type: &op_type,
+                    from_label: from_label.as_deref(),
+                    to_label: to_label.as_deref(),
+                    quantity_delta: row.get(6)?,
+                    comment: comment.as_deref(),
+                    created_at: &created_at,
+                    nonce: &nonce,
+                    prev_hash: stored_prev.as_deref(),
+                    request_device_id: device_id.as_deref(),
+                    request_public_key: request_public_key.as_deref(),
+                    request_nonce: request_nonce.as_deref(),
+                    request_signature: request_signature.as_deref(),
+                    request_hash: request_hash.as_deref(),
+                    request_timestamp: request_timestamp.as_deref(),
+                    request_path: request_path.as_deref(),
+                })?
+            }
         } else {
             bail!("unsupported ledger event version {version}");
         };
@@ -433,7 +517,7 @@ pub fn verify_all(conn: &Connection) -> anyhow::Result<usize> {
             bail!("ledger hash mismatch in workspace {ws}");
         }
         verify_node_signature(&pubkey, &signature, &bytes)?;
-        if version == 2 {
+        if version >= 2 {
             verify_device_proof(row)?;
         }
         previous.insert(chain, stored_hash);
@@ -487,8 +571,8 @@ mod tests {
              CREATE TABLE workspaces(id INTEGER PRIMARY KEY,guid TEXT); INSERT INTO workspaces VALUES(1,'ws-guid');
              CREATE TABLE users(id INTEGER PRIMARY KEY,guid TEXT); INSERT INTO users VALUES(7,'user-guid');
              CREATE TABLE items(id INTEGER PRIMARY KEY,guid TEXT); INSERT INTO items VALUES(4,'item-guid');
-             CREATE TABLE pending_device_proofs(user_id INTEGER PRIMARY KEY,device_id TEXT,public_key TEXT,nonce TEXT,signature TEXT,request_hash TEXT,request_timestamp TEXT,request_path TEXT);
-             CREATE TABLE history_entries(id INTEGER PRIMARY KEY,workspace_id INTEGER NOT NULL,item_id INTEGER,type TEXT NOT NULL,actor_user_id INTEGER NOT NULL,from_label TEXT,to_label TEXT,quantity_delta REAL,comment TEXT,prev_hash TEXT,hash TEXT NOT NULL UNIQUE,signature TEXT,pubkey TEXT,event_version INTEGER NOT NULL DEFAULT 1,request_device_id TEXT,request_public_key TEXT,request_nonce TEXT,request_signature TEXT,request_hash TEXT,request_timestamp TEXT,request_path TEXT,created_at TEXT NOT NULL,guid TEXT);"
+             CREATE TABLE pending_device_proofs(user_id INTEGER PRIMARY KEY,device_id TEXT,public_key TEXT,nonce TEXT,signature TEXT,request_hash TEXT,request_timestamp TEXT,request_path TEXT,request_body TEXT);
+             CREATE TABLE history_entries(id INTEGER PRIMARY KEY,workspace_id INTEGER NOT NULL,item_id INTEGER,type TEXT NOT NULL,actor_user_id INTEGER NOT NULL,from_label TEXT,to_label TEXT,quantity_delta REAL,comment TEXT,prev_hash TEXT,hash TEXT NOT NULL UNIQUE,signature TEXT,pubkey TEXT,event_version INTEGER NOT NULL DEFAULT 1,request_device_id TEXT,request_public_key TEXT,request_nonce TEXT,request_signature TEXT,request_hash TEXT,request_timestamp TEXT,request_path TEXT,request_body TEXT,created_at TEXT NOT NULL,guid TEXT);"
         ).unwrap();
         db
     }
@@ -548,7 +632,7 @@ mod tests {
         let device_signature =
             URL_SAFE_NO_PAD.encode(device_key.sign(message.as_bytes()).to_bytes());
         db.execute(
-            "INSERT INTO pending_device_proofs VALUES(7,'phone',?1,?2,?3,?4,?5,?6)",
+            "INSERT INTO pending_device_proofs VALUES(7,'phone',?1,?2,?3,?4,?5,?6,NULL)",
             params![
                 URL_SAFE_NO_PAD.encode(device_key.verifying_key().to_bytes()),
                 request_nonce,

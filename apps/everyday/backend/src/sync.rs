@@ -745,7 +745,7 @@ pub fn export_journal_since(conn: &Connection, recipient_frontier: Option<&Value
     }
     let mut history = Vec::new();
     if let Ok(mut stmt) = conn.prepare(
-        "SELECT id, workspace_id, item_id, type, actor_user_id, from_label, to_label, quantity_delta, comment, hash, created_at, guid, prev_hash, signature, pubkey,event_version,request_device_id,request_public_key,request_nonce,request_signature,request_hash,request_timestamp,request_path FROM history_entries ORDER BY id",
+        "SELECT id, workspace_id, item_id, type, actor_user_id, from_label, to_label, quantity_delta, comment, hash, created_at, guid, prev_hash, signature, pubkey,event_version,request_device_id,request_public_key,request_nonce,request_signature,request_hash,request_timestamp,request_path,request_body FROM history_entries ORDER BY id",
     ) {
         for row in stmt.query_map([], |r| {
             let ws: i64 = r.get(1)?;
@@ -774,6 +774,7 @@ pub fn export_journal_since(conn: &Connection, recipient_frontier: Option<&Value
                 "requestHash": r.get::<_, Option<String>>(20)?,
                 "requestTimestamp": r.get::<_, Option<String>>(21)?,
                 "requestPath": r.get::<_, Option<String>>(22)?,
+                "requestBody": r.get::<_, Option<String>>(23)?,
             }))
         }).into_iter().flatten().flatten() {
             history.push(row);
@@ -2694,8 +2695,8 @@ pub fn import_journal(conn: &Connection, journal: &Value) -> Value {
                 .and_then(|g| id_by_guid(conn, "users", g))
                 .unwrap_or(1);
             let _ = conn.execute(
-                "INSERT OR IGNORE INTO history_entries (workspace_id,item_id,type,actor_user_id,from_label,to_label,quantity_delta,comment,hash,created_at,guid,prev_hash,signature,pubkey,event_version,request_device_id,request_public_key,request_nonce,request_signature,request_hash,request_timestamp,request_path)
-                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22)",
+                "INSERT OR IGNORE INTO history_entries (workspace_id,item_id,type,actor_user_id,from_label,to_label,quantity_delta,comment,hash,created_at,guid,prev_hash,signature,pubkey,event_version,request_device_id,request_public_key,request_nonce,request_signature,request_hash,request_timestamp,request_path,request_body)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23)",
                 params![
                     ws, item,
                     h.get("type").and_then(|v| v.as_str()).unwrap_or("update"),
@@ -2717,7 +2718,8 @@ pub fn import_journal(conn: &Connection, journal: &Value) -> Value {
                     h.get("requestSignature").and_then(Value::as_str),
                     h.get("requestHash").and_then(Value::as_str),
                     h.get("requestTimestamp").and_then(Value::as_str),
-                    h.get("requestPath").and_then(Value::as_str)
+                    h.get("requestPath").and_then(Value::as_str),
+                    h.get("requestBody").and_then(Value::as_str)
                 ],
             );
             ops += 1;
@@ -4445,6 +4447,56 @@ fn inventory_record_hash(payload_hash: &str, ledger_hash: &str) -> String {
     )
 }
 
+fn verify_inventory_intent(record: &Value, event: &Value) -> anyhow::Result<()> {
+    if event.get("eventVersion").and_then(Value::as_i64) != Some(3) {
+        anyhow::bail!("inventory event has no signed request body")
+    }
+    let body = event
+        .get("requestBody")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("inventory request body unavailable"))?;
+    let hash = event
+        .get("requestHash")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("inventory request hash unavailable"))?;
+    if hex::encode(Sha256::digest(body.as_bytes())) != hash {
+        anyhow::bail!("inventory request body hash mismatch")
+    }
+    let kind = record
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let procedure = kind.strip_prefix("adopt_").unwrap_or(kind);
+    let expected_path = match procedure {
+        "create" => "/api/trpc/inventory.create",
+        "check" => "/api/trpc/inventory.checkItem",
+        "complete" => "/api/trpc/inventory.complete",
+        _ => anyhow::bail!("unsupported inventory intent"),
+    };
+    if event.get("requestPath").and_then(Value::as_str) != Some(expected_path) {
+        anyhow::bail!("inventory request path mismatch")
+    }
+    let envelope: Value = serde_json::from_str(body)?;
+    let input = envelope
+        .get("0")
+        .and_then(|v| v.get("json"))
+        .ok_or_else(|| anyhow::anyhow!("inventory request input unavailable"))?;
+    if procedure == "check" {
+        let fields = &record["fields"];
+        let requested_checked = input
+            .get("checked")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        if fields.get("checked").and_then(Value::as_bool) != Some(requested_checked)
+            || fields.get("actualQty").and_then(Value::as_f64)
+                != input.get("actualQty").and_then(Value::as_f64)
+        {
+            anyhow::bail!("inventory result differs from signed user intent")
+        }
+    }
+    Ok(())
+}
+
 fn verify_inventory_records(conn: &Connection, journal: &Value) -> anyhow::Result<()> {
     if journal.get("inventoryMode").and_then(Value::as_str) != Some("append-only-records/v1") {
         anyhow::bail!("journal does not provide portable inventory")
@@ -4614,11 +4666,12 @@ fn verify_inventory_records(conn: &Connection, journal: &Value) -> anyhow::Resul
             if !validate(event) {
                 anyhow::bail!("inventory ledger evidence mismatch")
             }
+            verify_inventory_intent(record, event)?;
         } else {
-            let exists:i64=conn.query_row("SELECT count(*) FROM history_entries h JOIN workspaces w ON w.id=h.workspace_id JOIN users u ON u.id=h.actor_user_id WHERE h.hash=?1 AND w.guid=?2 AND u.guid=?3 AND h.type=?4 AND h.from_label=?5 AND h.to_label=?6 AND h.request_device_id IS NOT NULL AND h.request_signature IS NOT NULL",params![ledger_hash,ws,actor,expected_type,session,payload],|r|r.get(0))?;
-            if exists == 0 {
-                anyhow::bail!("inventory ledger event unavailable")
-            }
+            let stored:Option<Value>=conn.query_row("SELECT h.event_version,h.request_body,h.request_hash,h.request_path FROM history_entries h JOIN workspaces w ON w.id=h.workspace_id JOIN users u ON u.id=h.actor_user_id WHERE h.hash=?1 AND w.guid=?2 AND u.guid=?3 AND h.type=?4 AND h.from_label=?5 AND h.to_label=?6 AND h.request_device_id IS NOT NULL AND h.request_signature IS NOT NULL",params![ledger_hash,ws,actor,expected_type,session,payload],|r|Ok(json!({"eventVersion":r.get::<_,i64>(0)?,"requestBody":r.get::<_,Option<String>>(1)?,"requestHash":r.get::<_,Option<String>>(2)?,"requestPath":r.get::<_,Option<String>>(3)?}))).optional()?;
+            let stored =
+                stored.ok_or_else(|| anyhow::anyhow!("inventory ledger event unavailable"))?;
+            verify_inventory_intent(record, &stored)?;
         }
     }
     Ok(())
@@ -6167,6 +6220,31 @@ mod tests {
             request_hash,
             timestamp,
             path: path.to_owned(),
+            request_body: None,
+        }
+    }
+    fn signed_device_proof_body(
+        key: &SigningKey,
+        device_id: &str,
+        path: &str,
+        body: &Value,
+    ) -> crate::device::Proof {
+        let request_body = body.to_string();
+        let timestamp = chrono::Utc::now().timestamp().to_string();
+        let nonce = uuid::Uuid::new_v4().to_string();
+        let request_hash = hex::encode(Sha256::digest(request_body.as_bytes()));
+        let message = format!(
+            "everyday/device-request/v1\nPOST\n{path}\n{timestamp}\n{nonce}\n{request_hash}"
+        );
+        crate::device::Proof {
+            device_id: device_id.to_owned(),
+            public_key: URL_SAFE_NO_PAD.encode(key.verifying_key().to_bytes()),
+            nonce,
+            signature: URL_SAFE_NO_PAD.encode(key.sign(message.as_bytes()).to_bytes()),
+            request_hash,
+            timestamp,
+            path: path.to_owned(),
+            request_body: Some(request_body),
         }
     }
 
@@ -6377,7 +6455,7 @@ mod tests {
 
         // Даже нода, владеющая своим snapshot-ключом, не может переписать
         // время/смысл удаления без несовпадения с device-signed Ledger event.
-        let mut forged = valid;
+        let mut forged = valid.clone();
         forged["itemTombstones"][0]["deletedAt"] = json!("2099-01-01T00:00:00Z");
         let hash = item_tombstone_hash(
             "tombstone-workspace",
@@ -7816,42 +7894,57 @@ mod tests {
         )
         .unwrap();
         let item=crate::api::dispatch(&mut source,"items.create",&json!({"workspaceId":workspace,"title":"Cable","internalId":"I-0001","quantitative":true,"quantity":10,"unit":"pcs"}),Some(owner)).unwrap();
+        let create_input = json!({"workspaceId":workspace});
         crate::device::set_pending(
             &source,
             owner,
-            &signed_device_proof(&key, device, "/api/trpc/inventory.create"),
+            &signed_device_proof_body(
+                &key,
+                device,
+                "/api/trpc/inventory.create",
+                &json!({"0":{"json":create_input}}),
+            ),
         )
         .unwrap();
-        let session = crate::api::dispatch(
-            &mut source,
-            "inventory.create",
-            &json!({"workspaceId":workspace}),
-            Some(owner),
-        )
-        .unwrap();
+        let session =
+            crate::api::dispatch(&mut source, "inventory.create", &create_input, Some(owner))
+                .unwrap();
+        let check_input =
+            json!({"sessionId":session["id"],"itemId":item["id"],"checked":true,"actualQty":7});
         crate::device::set_pending(
             &source,
             owner,
-            &signed_device_proof(&key, device, "/api/trpc/inventory.checkItem"),
+            &signed_device_proof_body(
+                &key,
+                device,
+                "/api/trpc/inventory.checkItem",
+                &json!({"0":{"json":check_input}}),
+            ),
         )
         .unwrap();
         crate::api::dispatch(
             &mut source,
             "inventory.checkItem",
-            &json!({"sessionId":session["id"],"itemId":item["id"],"checked":true,"actualQty":7}),
+            &check_input,
             Some(owner),
         )
         .unwrap();
+        let complete_input = json!({"sessionId":session["id"]});
         crate::device::set_pending(
             &source,
             owner,
-            &signed_device_proof(&key, device, "/api/trpc/inventory.complete"),
+            &signed_device_proof_body(
+                &key,
+                device,
+                "/api/trpc/inventory.complete",
+                &json!({"0":{"json":complete_input}}),
+            ),
         )
         .unwrap();
         crate::api::dispatch(
             &mut source,
             "inventory.complete",
-            &json!({"sessionId":session["id"]}),
+            &complete_input,
             Some(owner),
         )
         .unwrap();
@@ -7862,7 +7955,7 @@ mod tests {
         let restored:(String,f64,bool)=target.query_row("SELECT s.status,r.actual_qty,r.checked!=0 FROM inventory_sessions s JOIN inventory_results r ON r.session_id=s.id",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
         assert_eq!(restored, ("completed".into(), 7.0, true));
         assert_eq!(verify_stored_inventory_records(&target).unwrap(), 3);
-        let mut forged = valid;
+        let mut forged = valid.clone();
         forged["inventoryRecords"][1]["fields"]["actualQty"] = json!(99);
         ledger::sign_journal(&source, &mut forged).unwrap();
         let result = apply_remote_journal(&rejected, &forged, "");
@@ -7873,6 +7966,53 @@ mod tests {
                 .unwrap_or_default()
                 .contains("инвентаризации"),
             "{result}"
+        );
+        let session_guid = valid["inventoryRecords"][0]["sessionGuid"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let workspace_guid = "inventory-workspace";
+        let actor_guid = "inventory-owner";
+        let item_guid = item["guid"].as_str().unwrap();
+        let malicious_fields = json!({"expectedQty":10.0,"actualQty":99.0,"checked":true});
+        let malicious_created = chrono::Utc::now().to_rfc3339();
+        let malicious_record = json!({"sessionGuid":session_guid,"workspaceGuid":workspace_guid,"actorGuid":actor_guid,"kind":"check","itemGuid":item_guid,"fields":malicious_fields,"createdAt":malicious_created});
+        let malicious_payload = inventory_payload_hash(&malicious_record).unwrap();
+        let signed_intent = json!({"0":{"json":{"sessionId":session["id"],"itemId":item["id"],"checked":true,"actualQty":7}}});
+        crate::device::set_pending(
+            &source,
+            owner,
+            &signed_device_proof_body(
+                &key,
+                device,
+                "/api/trpc/inventory.checkItem",
+                &signed_intent,
+            ),
+        )
+        .unwrap();
+        let malicious_event = ledger::append(
+            &source,
+            workspace,
+            owner,
+            Some(item["id"].as_i64().unwrap()),
+            "inventory_check",
+            Some(&session_guid),
+            Some(&malicious_payload),
+            None,
+            Some("semantic substitution attempt"),
+        )
+        .unwrap();
+        let malicious_ledger = malicious_event["opId"].as_str().unwrap();
+        let malicious_hash = inventory_record_hash(&malicious_payload, malicious_ledger);
+        source.execute("INSERT INTO inventory_records(record_hash,session_guid,workspace_guid,actor_guid,kind,item_guid,fields_json,payload_hash,ledger_hash,created_at) VALUES(?1,?2,?3,?4,'check',?5,?6,?7,?8,?9)",params![malicious_hash,session_guid,workspace_guid,actor_guid,item_guid,malicious_fields.to_string(),malicious_payload,malicious_ledger,malicious_created]).unwrap();
+        let semantic_result = apply_remote_journal(&rejected, &export_journal(&source), "");
+        assert_eq!(semantic_result["ok"], false, "{semantic_result}");
+        assert!(
+            semantic_result["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("signed user intent"),
+            "{semantic_result}"
         );
         drop((source, target, rejected));
         for path in [source_path, target_path, rejected_path] {
