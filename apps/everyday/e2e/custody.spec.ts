@@ -258,6 +258,18 @@ test('browser signs a real custody transaction and ledger retains its proof', as
     /^data:text\/plain;base64,/
   );
 
+  await page.goto('/chat');
+  await page.getByRole('button', { name: 'Прикрепить файлы' }).click();
+  await page.locator('input[type="file"]').setInputFiles({
+    name: 'mesh-note.txt',
+    mimeType: 'text/plain',
+    buffer: Buffer.from('offline mesh attachment'),
+  });
+  await page.getByPlaceholder('Сообщение группе…').fill('Файл из локального чата');
+  await page.getByRole('button', { name: 'Отправить' }).click();
+  await expect(page.getByText('Файл из локального чата')).toBeVisible();
+  await expect(page.getByRole('link', { name: 'mesh-note.txt' })).toBeVisible();
+
   const transportBundle = await trpc<{
     format: string;
     version: number;
@@ -280,6 +292,7 @@ test('browser signs a real custody transaction and ledger retains its proof', as
     photoError?: string | null;
     documentIntentVerified?: boolean;
     knowledgeIntentVerified?: boolean;
+    chatIntentVerified?: boolean;
   }>(
     page,
     'sync.audit',
@@ -289,6 +302,7 @@ test('browser signs a real custody transaction and ledger retains its proof', as
   expect(integrity.healthy, JSON.stringify(integrity)).toBe(true);
   expect(integrity.documentIntentVerified).toBe(true);
   expect(integrity.knowledgeIntentVerified).toBe(true);
+  expect(integrity.chatIntentVerified).toBe(true);
 
   await page.goto('/admin');
   await page.getByRole('button', { name: 'Пространства', exact: true }).click();

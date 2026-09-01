@@ -526,11 +526,30 @@ pub fn verify_all(conn: &Connection) -> anyhow::Result<usize> {
     Ok(verified)
 }
 
+pub fn chat_commitment(
+    guid: &str,
+    workspace_guid: &str,
+    user_guid: &str,
+    text: &str,
+    attachments: &Value,
+) -> String {
+    let payload = json!({
+        "domain":"everyday/chat-message/v1","guid":guid,
+        "workspaceGuid":workspace_guid,"userGuid":user_guid,
+        "text":text,"attachments":attachments,
+    });
+    hex::encode(Sha256::digest(
+        serde_json::to_vec(&payload).expect("JSON serialization"),
+    ))
+}
+
 pub fn verify_chat_links(conn: &Connection) -> anyhow::Result<usize> {
     let mut stmt = conn.prepare(
-        "SELECT m.guid,m.workspace_id,m.user_id,m.text,m.ledger_hash,
-                h.workspace_id,h.actor_user_id,h.type,h.from_label,h.comment
-         FROM chat_messages m
+        "SELECT m.guid,m.workspace_id,m.user_id,m.text,m.attachments_json,m.ledger_hash,
+                w.guid,u.guid,h.workspace_id,h.actor_user_id,h.type,h.from_label,h.to_label,
+                h.comment,h.event_version
+         FROM chat_messages m JOIN workspaces w ON w.id=m.workspace_id
+         JOIN users u ON u.id=m.user_id
          LEFT JOIN history_entries h ON h.hash=m.ledger_hash
          WHERE m.ledger_hash IS NOT NULL",
     )?;
@@ -541,12 +560,18 @@ pub fn verify_chat_links(conn: &Connection) -> anyhow::Result<usize> {
         let message_workspace: i64 = row.get(1)?;
         let message_user: i64 = row.get(2)?;
         let text: String = row.get(3)?;
-        let ledger_hash: String = row.get(4)?;
-        let event_workspace: Option<i64> = row.get(5)?;
-        let event_user: Option<i64> = row.get(6)?;
-        let event_type: Option<String> = row.get(7)?;
-        let event_guid: Option<String> = row.get(8)?;
-        let event_text: Option<String> = row.get(9)?;
+        let attachments_raw: String = row.get(4)?;
+        let attachments: Value = serde_json::from_str(&attachments_raw)?;
+        let ledger_hash: String = row.get(5)?;
+        let workspace_guid: String = row.get(6)?;
+        let user_guid: String = row.get(7)?;
+        let event_workspace: Option<i64> = row.get(8)?;
+        let event_user: Option<i64> = row.get(9)?;
+        let event_type: Option<String> = row.get(10)?;
+        let event_guid: Option<String> = row.get(11)?;
+        let event_commitment: Option<String> = row.get(12)?;
+        let event_text: Option<String> = row.get(13)?;
+        let event_version: Option<i64> = row.get(14)?;
         if event_workspace != Some(message_workspace)
             || event_user != Some(message_user)
             || event_type.as_deref() != Some("chat_message")
@@ -554,6 +579,13 @@ pub fn verify_chat_links(conn: &Connection) -> anyhow::Result<usize> {
             || event_text.as_deref() != Some(text.as_str())
         {
             bail!("chat message {guid} is not bound to ledger event {ledger_hash}");
+        }
+        let expected_commitment =
+            chat_commitment(&guid, &workspace_guid, &user_guid, &text, &attachments);
+        if event_version == Some(3)
+            && event_commitment.as_deref() != Some(expected_commitment.as_str())
+        {
+            bail!("chat message {guid} commitment does not match ledger");
         }
         verified += 1;
     }

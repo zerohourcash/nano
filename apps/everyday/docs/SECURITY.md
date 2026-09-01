@@ -236,6 +236,11 @@ capability, затем применяют только её scope. Неверн�
   до доверия к ноде сравнивает с ним slug, заголовок, текст, ACL, parent и все
   CAS-вложения. Старые ревизии остаются явно legacy и не получают ложной
   атрибуции пользовательского intent.
+- Новые сообщения чата используют клиентский `messageGuid` и V3 commitment для
+  workspace/author GUID, текста и полного списка CAS-вложений. Import сверяет
+  commitment с точным Ed25519-signed request body до node trust; подмена текста,
+  MIME, имени или CAS-хэша доверенной нодой отклоняется. Файлы сообщения
+  загружаются отдельно и восстанавливаются только content/full-нодами.
 - Файловый transport bundle v2 не раскрывает journal посреднику: используется
   XChaCha20-Poly1305 с новым 192-битным nonce, фиксированным AAD и ключом
   HKDF-SHA256, доменно отделённым от bearer/CAS. Wrong-key и tampering

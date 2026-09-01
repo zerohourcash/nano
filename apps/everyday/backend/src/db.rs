@@ -348,6 +348,7 @@ fn migrate(conn: &Connection) -> Result<()> {
           workspace_id INTEGER NOT NULL,
           user_id INTEGER NOT NULL,
           text TEXT NOT NULL,
+          attachments_json TEXT NOT NULL DEFAULT '[]',
           ledger_hash TEXT UNIQUE,
           created_at TEXT NOT NULL
         );
@@ -608,6 +609,10 @@ fn migrate(conn: &Connection) -> Result<()> {
     )?;
     let _ = conn.execute("ALTER TABLE chat_messages ADD COLUMN guid TEXT", []);
     let _ = conn.execute("ALTER TABLE chat_messages ADD COLUMN ledger_hash TEXT", []);
+    let _ = conn.execute(
+        "ALTER TABLE chat_messages ADD COLUMN attachments_json TEXT NOT NULL DEFAULT '[]'",
+        [],
+    );
     conn.execute_batch(
         "CREATE UNIQUE INDEX IF NOT EXISTS chat_messages_guid_idx ON chat_messages(guid) WHERE guid IS NOT NULL;
          CREATE UNIQUE INDEX IF NOT EXISTS chat_messages_ledger_idx ON chat_messages(ledger_hash) WHERE ledger_hash IS NOT NULL;",

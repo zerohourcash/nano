@@ -995,7 +995,7 @@ pub fn export_journal_since(conn: &Connection, recipient_frontier: Option<&Value
     }
     let mut messages = Vec::new();
     if let Ok(mut stmt) = conn.prepare(
-        "SELECT guid,workspace_id,user_id,text,ledger_hash,created_at
+        "SELECT guid,workspace_id,user_id,text,attachments_json,ledger_hash,created_at
          FROM chat_messages WHERE ledger_hash IS NOT NULL ORDER BY created_at,guid",
     ) {
         for row in stmt
@@ -1007,8 +1007,10 @@ pub fn export_journal_since(conn: &Connection, recipient_frontier: Option<&Value
                     "workspaceGuid": guid_of(conn, "workspaces", workspace),
                     "userGuid": guid_of(conn, "users", user),
                     "text": row.get::<_, String>(3)?,
-                    "ledgerHash": row.get::<_, String>(4)?,
-                    "createdAt": row.get::<_, String>(5)?,
+                    "attachments":serde_json::from_str::<Value>(&row.get::<_,String>(4)?)
+                        .unwrap_or_else(|_|json!([])),
+                    "ledgerHash": row.get::<_, String>(5)?,
+                    "createdAt": row.get::<_, String>(6)?,
                 }))
             })
             .into_iter()
@@ -1113,6 +1115,10 @@ pub fn export_journal_since(conn: &Connection, recipient_frontier: Option<&Value
         "knowledge": crate::knowledge::export(conn),
     });
     if let Some(object) = journal.as_object_mut() {
+        object.insert(
+            "chatMode".into(),
+            json!("device-signed-with-explicit-legacy/v1"),
+        );
         object.insert(
             "documentMode".into(),
             json!("intent-bound-with-explicit-legacy/v1"),
@@ -2869,9 +2875,13 @@ pub fn import_journal(conn: &Connection, journal: &Value) -> Value {
                 .and_then(Value::as_str)
                 .unwrap_or("");
             let text = message.get("text").and_then(Value::as_str).unwrap_or("");
+            let attachments = message
+                .get("attachments")
+                .cloned()
+                .unwrap_or_else(|| json!([]));
             if guid.is_empty()
                 || ledger_hash.is_empty()
-                || text.is_empty()
+                || (text.is_empty() && attachments.as_array().is_none_or(|items| items.is_empty()))
                 || text.chars().count() > 4000
             {
                 skipped += 1;
@@ -2895,13 +2905,14 @@ pub fn import_journal(conn: &Connection, journal: &Value) -> Value {
             };
             let inserted = conn
                 .execute(
-                    "INSERT OR IGNORE INTO chat_messages(guid,workspace_id,user_id,text,ledger_hash,created_at)
-                     VALUES(?1,?2,?3,?4,?5,?6)",
+                    "INSERT OR IGNORE INTO chat_messages(guid,workspace_id,user_id,text,attachments_json,ledger_hash,created_at)
+                     VALUES(?1,?2,?3,?4,?5,?6,?7)",
                     params![
                         guid,
                         workspace,
                         user,
                         text,
+                        attachments.to_string(),
                         ledger_hash,
                         message.get("createdAt").and_then(Value::as_str).unwrap_or("")
                     ],
@@ -3306,6 +3317,9 @@ pub fn apply_remote_journal(conn: &Connection, journal: &Value, peer_url: &str) 
     if let Err(error) = verify_knowledge_records(conn, journal) {
         return json!({"ok":false,"error":format!("Проверка intent базы знаний: {error}")});
     }
+    if let Err(error) = verify_chat_records(conn, journal) {
+        return json!({"ok":false,"error":format!("Проверка intent чата: {error}")});
+    }
     if let Err(error) = crate::accounting::verify_journal_links(conn, journal) {
         return json!({"ok":false,"error":format!("Проверка Bit-летописи: {error}")});
     }
@@ -3400,6 +3414,10 @@ pub fn apply_remote_journal(conn: &Connection, journal: &Value, peer_url: &str) 
     if let Err(error) = verify_knowledge_records(conn, &export_journal(conn)) {
         let _ = conn.execute_batch("ROLLBACK TO verified_sync; RELEASE verified_sync");
         return json!({"ok":false,"error":format!("Проверка сохранённого intent базы знаний: {error}")});
+    }
+    if let Err(error) = verify_chat_records(conn, &export_journal(conn)) {
+        let _ = conn.execute_batch("ROLLBACK TO verified_sync; RELEASE verified_sync");
+        return json!({"ok":false,"error":format!("Проверка сохранённого intent чата: {error}")});
     }
     if let Err(error) = ledger::verify_chat_links(conn) {
         let _ = conn.execute_batch("ROLLBACK TO verified_sync; RELEASE verified_sync");
@@ -4935,6 +4953,131 @@ fn verify_knowledge_records(conn: &Connection, journal: &Value) -> anyhow::Resul
     Ok(())
 }
 
+fn verify_chat_intent(message: &Value, event: &Value) -> anyhow::Result<()> {
+    let required = |field: &str| {
+        message
+            .get(field)
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("chat message has no {field}"))
+    };
+    let guid = required("guid")?;
+    let workspace_guid = required("workspaceGuid")?;
+    let user_guid = required("userGuid")?;
+    let text_value = message.get("text").and_then(Value::as_str).unwrap_or("");
+    let attachments = message
+        .get("attachments")
+        .cloned()
+        .unwrap_or_else(|| json!([]));
+    let commitment =
+        ledger::chat_commitment(guid, workspace_guid, user_guid, text_value, &attachments);
+    if event.get("eventVersion").and_then(Value::as_i64) != Some(3)
+        || event.get("type").and_then(Value::as_str) != Some("chat_message")
+        || event.get("actorGuid").and_then(Value::as_str) != Some(user_guid)
+        || event.get("fromLabel").and_then(Value::as_str) != Some(guid)
+        || event.get("toLabel").and_then(Value::as_str) != Some(commitment.as_str())
+        || event.get("requestPath").and_then(Value::as_str) != Some("/api/trpc/chat.send")
+    {
+        anyhow::bail!("chat ledger evidence mismatch")
+    }
+    let body = event
+        .get("requestBody")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("chat event has no signed intent"))?;
+    let request_hash = hex::encode(Sha256::digest(body.as_bytes()));
+    if event.get("requestHash").and_then(Value::as_str) != Some(request_hash.as_str()) {
+        anyhow::bail!("chat request body hash mismatch")
+    }
+    let envelope: Value = serde_json::from_str(body)?;
+    let input = trpc_request_input(&envelope)?;
+    let mut input_attachments = input
+        .get("attachments")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    for attachment in &mut input_attachments {
+        let url = attachment
+            .get("url")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("chat attachment has no CAS URL"))?;
+        let checksum = url
+            .strip_prefix("cas:")
+            .filter(|hash| hash.len() == 64 && hash.chars().all(|value| value.is_ascii_hexdigit()))
+            .ok_or_else(|| anyhow::anyhow!("chat attachment is not CAS-backed"))?;
+        attachment["sha256"] = json!(checksum);
+    }
+    for (field, expected) in [
+        ("workspaceGuid", Value::String(workspace_guid.into())),
+        ("messageGuid", Value::String(guid.into())),
+        ("text", Value::String(text_value.into())),
+    ] {
+        let actual = input.get(field).cloned().unwrap_or(Value::Null);
+        if actual != expected {
+            anyhow::bail!("chat message differs from signed user intent")
+        }
+    }
+    if Value::Array(input_attachments) != attachments {
+        anyhow::bail!("chat attachments differ from signed user intent")
+    }
+    Ok(())
+}
+
+fn verify_chat_records(conn: &Connection, journal: &Value) -> anyhow::Result<()> {
+    if journal.get("chatMode").and_then(Value::as_str)
+        != Some("device-signed-with-explicit-legacy/v1")
+    {
+        anyhow::bail!("journal does not declare chat verification mode")
+    }
+    let history: HashMap<&str, &Value> = journal
+        .get("history")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|event| {
+            event
+                .get("opId")
+                .and_then(Value::as_str)
+                .map(|hash| (hash, event))
+        })
+        .collect();
+    for message in journal
+        .get("messages")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let ledger_hash = message
+            .get("ledgerHash")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("chat message has no ledgerHash"))?;
+        let stored;
+        let event = if let Some(event) = history.get(ledger_hash) {
+            *event
+        } else {
+            stored = conn
+                .query_row(
+                    "SELECT h.event_version,u.guid,h.type,h.from_label,h.to_label,
+                            h.request_hash,h.request_path,h.request_body
+                     FROM history_entries h JOIN users u ON u.id=h.actor_user_id WHERE h.hash=?1",
+                    [ledger_hash],
+                    |row| Ok(json!({
+                        "eventVersion":row.get::<_,i64>(0)?,"actorGuid":row.get::<_,String>(1)?,
+                        "type":row.get::<_,String>(2)?,"fromLabel":row.get::<_,Option<String>>(3)?,
+                        "toLabel":row.get::<_,Option<String>>(4)?,"requestHash":row.get::<_,Option<String>>(5)?,
+                        "requestPath":row.get::<_,Option<String>>(6)?,"requestBody":row.get::<_,Option<String>>(7)?,
+                    })),
+                )
+                .optional()?
+                .ok_or_else(|| anyhow::anyhow!("chat ledger event unavailable"))?;
+            &stored
+        };
+        if event.get("eventVersion").and_then(Value::as_i64) == Some(3) {
+            verify_chat_intent(message, event)?;
+        }
+    }
+    Ok(())
+}
+
 fn verify_inventory_records(conn: &Connection, journal: &Value) -> anyhow::Result<()> {
     if journal.get("inventoryMode").and_then(Value::as_str) != Some("append-only-records/v1") {
         anyhow::bail!("journal does not provide portable inventory")
@@ -6413,6 +6556,7 @@ pub fn integrity_audit(conn: &Connection) -> Value {
     let photo_result = verify_photo_records(conn, &snapshot);
     let document_result = verify_document_records(conn, &snapshot);
     let knowledge_intent_result = verify_knowledge_records(conn, &snapshot);
+    let chat_intent_result = verify_chat_records(conn, &snapshot);
     let membership_result = verify_membership_records(conn, &snapshot);
 
     let count = |table: &str| -> i64 {
@@ -6514,6 +6658,7 @@ pub fn integrity_audit(conn: &Connection) -> Value {
         .as_ref()
         .err()
         .map(ToString::to_string);
+    let chat_intent_error = chat_intent_result.as_ref().err().map(ToString::to_string);
     let membership_error = membership_result.as_ref().err().map(ToString::to_string);
     let healthy = database_check == "ok"
         && ledger_result.is_ok()
@@ -6534,6 +6679,7 @@ pub fn integrity_audit(conn: &Connection) -> Value {
         && photo_result.is_ok()
         && document_result.is_ok()
         && knowledge_intent_result.is_ok()
+        && chat_intent_result.is_ok()
         && membership_result.is_ok()
         && orphan_history == 0
         && missing_guids == 0
@@ -6633,6 +6779,14 @@ pub fn integrity_audit(conn: &Connection) -> Value {
         object.insert(
             "knowledgeIntentVerified".into(),
             json!(knowledge_intent_result.is_ok()),
+        );
+        object.insert(
+            "chatIntentError".into(),
+            chat_intent_error.map(Value::String).unwrap_or(Value::Null),
+        );
+        object.insert(
+            "chatIntentVerified".into(),
+            json!(chat_intent_result.is_ok()),
         );
         object.insert(
             "organizationNodeError".into(),
@@ -8444,6 +8598,74 @@ mod tests {
         assert!(error
             .to_string()
             .contains("differs from signed user intent"));
+
+        drop(conn);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn chat_intent_rejects_trusted_node_snapshot_rewrite() {
+        let path = std::env::temp_dir().join(format!("chat-intent-{}.db", uuid::Uuid::new_v4()));
+        let conn = crate::db::open(&path).unwrap();
+        let created = chrono::Utc::now().to_rfc3339();
+        let workspace_guid = uuid::Uuid::new_v4().to_string();
+        let owner_guid = uuid::Uuid::new_v4().to_string();
+        conn.execute("INSERT INTO workspaces(name,internal_id_prefix,created_at,guid) VALUES('Chat org','C-',?1,?2)",params![created,workspace_guid]).unwrap();
+        let workspace = conn.last_insert_rowid();
+        conn.execute("INSERT INTO users(full_name,phone,status,role_rights,created_at,guid) VALUES('Owner','+70000000994','active',?1,?2,?3)",params![crate::db::owner_rights().to_string(),created,owner_guid]).unwrap();
+        let owner = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO user_workspaces(user_id,workspace_id,rights_json) VALUES(?1,?2,?3)",
+            params![owner, workspace, crate::db::owner_rights().to_string()],
+        )
+        .unwrap();
+        let key = SigningKey::generate(&mut OsRng);
+        let device = "chat-device-0001";
+        crate::device::register(&conn,owner,&json!({"deviceId":device,"name":"Chat phone","publicKey":URL_SAFE_NO_PAD.encode(key.verifying_key().to_bytes())})).unwrap();
+        let cas = crate::content::ingest_data_url(&conn, "data:text/plain;base64,QUJD")
+            .unwrap()
+            .unwrap();
+        let message_guid = uuid::Uuid::new_v4().to_string();
+        let attachments = json!([{"name":"note.txt","url":cas,"mime":"text/plain",
+            "sha256":cas.trim_start_matches("cas:")}]);
+        let commitment = ledger::chat_commitment(
+            &message_guid,
+            &workspace_guid,
+            &owner_guid,
+            "Original message",
+            &attachments,
+        );
+        let body = json!({"json":{"workspaceId":workspace,"workspaceGuid":workspace_guid,
+            "messageGuid":message_guid,"text":"Original message",
+            "attachments":[{"name":"note.txt","url":cas,"mime":"text/plain"}]}});
+        let proof = signed_device_proof_body(&key, device, "/api/trpc/chat.send", &body);
+        crate::device::set_pending(&conn, owner, &proof).unwrap();
+        let event = ledger::append(
+            &conn,
+            workspace,
+            owner,
+            None,
+            "chat_message",
+            Some(&message_guid),
+            Some(&commitment),
+            None,
+            Some("Original message"),
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO chat_messages(guid,workspace_id,user_id,text,attachments_json,ledger_hash,created_at)
+             VALUES(?1,?2,?3,'Original message',?4,?5,?6)",
+            params![message_guid,workspace,owner,attachments.to_string(),event["opId"].as_str(),created],
+        ).unwrap();
+
+        let valid = export_journal(&conn);
+        verify_chat_records(&conn, &valid).unwrap();
+        let mut forged = valid;
+        forged["messages"][0]["text"] = json!("Forged message");
+        ledger::sign_journal(&conn, &mut forged).unwrap();
+        ledger::verify_journal(&forged).unwrap();
+        let error = verify_chat_records(&conn, &forged).unwrap_err();
+        assert!(error.to_string().contains("ledger evidence mismatch"));
 
         drop(conn);
         let _ = std::fs::remove_file(path);

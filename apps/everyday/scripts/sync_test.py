@@ -42,6 +42,7 @@ PHOTO_DATA_URL = "data:image/png;base64," + base64.b64encode(PHOTO_BYTES).decode
 DOCUMENT_BYTES = b"%PDF-1.7\n" + bytes((index * 17) % 256 for index in range(90_000))
 DOCUMENT_DATA_URL = "data:application/pdf;base64," + base64.b64encode(DOCUMENT_BYTES).decode()
 KNOWLEDGE_DATA_URL = "data:text/plain;base64,0J/RgNC+0LLQtdGA0LrQsA=="
+CHAT_DATA_URL = "data:text/plain;base64," + base64.b64encode(b"offline chat file").decode()
 
 # Консоль Windows по умолчанию не в UTF-8: без этого падает первый же вывод.
 for stream in (sys.stdout, sys.stderr):
@@ -720,6 +721,38 @@ def main() -> int:
             and KNOWLEDGE_DATA_URL not in json.dumps(knowledge_snapshot),
             str(exported_attachment),
         )
+        chat_blob = node.call(
+            "content.ingest",
+            {"workspaceId": node_ws_id, "dataUrl": CHAT_DATA_URL},
+        )
+        chat_guid = str(uuid.uuid4())
+        offline_chat = node.call(
+            "chat.send",
+            {
+                "workspaceId": node_ws_id,
+                "workspaceGuid": node_ws[0]["guid"],
+                "messageGuid": chat_guid,
+                "text": "Офлайн-файл для смены",
+                "attachments": [{
+                    "name": "shift.txt",
+                    "url": chat_blob["url"],
+                    "mime": "text/plain",
+                }],
+            },
+        )
+        chat_snapshot = journal_from(node)
+        exported_chat = next(
+            (row for row in chat_snapshot.get("messages", []) if row.get("guid") == chat_guid),
+            None,
+        )
+        check(
+            "чат хранит файл как compact V3 CAS intent",
+            offline_chat.get("guid") == chat_guid
+            and isinstance(exported_chat, dict)
+            and exported_chat.get("attachments", [{}])[0].get("url", "").startswith("cas:")
+            and CHAT_DATA_URL not in json.dumps(chat_snapshot),
+            str(exported_chat),
+        )
         fault = node.call(
             "items.reportFault",
             {"itemId": created["id"], "severity": "high", "description": "Офлайн: искрит выключатель"},
@@ -810,6 +843,15 @@ def main() -> int:
             wait_for(knowledge_arrived, timeout=30),
             str(synced_knowledge)[:220],
         )
+        synced_chat = wait_for(
+            lambda: any(
+                message.get("guid") == chat_guid
+                and message.get("attachments", [{}])[0].get("url") == CHAT_DATA_URL
+                for message in server.call("chat.list", {"workspaceId": ws_id}, mutation=False)
+            ),
+            timeout=30,
+        )
+        check("full-node восстановил CAS-вложение offline-чата", synced_chat)
         synced_faults = server.call("items.faults", {"workspaceId": ws_id}, mutation=False)
         check(
             "полная нода восстановила описание и решение офлайн-неисправности",

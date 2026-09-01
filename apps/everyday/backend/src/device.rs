@@ -49,6 +49,34 @@ fn is_compact_knowledge_intent(body: &[u8]) -> bool {
         })
 }
 
+fn is_compact_chat_intent(body: &[u8]) -> bool {
+    let Ok(envelope) = serde_json::from_slice::<Value>(body) else {
+        return false;
+    };
+    let input = envelope
+        .get("0")
+        .and_then(|value| value.get("json"))
+        .or_else(|| envelope.get("json"));
+    let Some(input) = input else { return false };
+    if !["workspaceGuid", "messageGuid"]
+        .iter()
+        .all(|field| input.get(field).and_then(Value::as_str).is_some())
+    {
+        return false;
+    }
+    input
+        .get("attachments")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .all(|attachment| {
+            attachment
+                .get("url")
+                .and_then(Value::as_str)
+                .is_some_and(|url| !url.starts_with("data:"))
+        })
+}
+
 pub fn requires_signature(procedure: &str) -> bool {
     matches!(
         procedure,
@@ -273,7 +301,8 @@ pub fn verify_request(
                 path,
                 "/api/trpc/items.addPhoto" | "/api/trpc/items.addDocument"
             )
-            || (path == "/api/trpc/knowledge.save" && is_compact_knowledge_intent(body)))
+            || (path == "/api/trpc/knowledge.save" && is_compact_knowledge_intent(body))
+            || (path == "/api/trpc/chat.send" && is_compact_chat_intent(body)))
         .then(|| String::from_utf8(body.to_vec()))
         .transpose()?,
     })
@@ -474,6 +503,18 @@ mod tests {
                 .to_string()
                 .as_bytes()
         ));
+        let chat = json!({"0":{"json":{
+            "workspaceGuid":uuid::Uuid::new_v4().to_string(),
+            "messageGuid":uuid::Uuid::new_v4().to_string(),
+            "attachments":[{"name":"Note","url":format!("cas:{}", "b".repeat(64))}]
+        }}});
+        assert!(is_compact_chat_intent(chat.to_string().as_bytes()));
+        let inline_chat = json!({"0":{"json":{
+            "workspaceGuid":uuid::Uuid::new_v4().to_string(),
+            "messageGuid":uuid::Uuid::new_v4().to_string(),
+            "attachments":[{"name":"Note","url":"data:text/plain;base64,QUJD"}]
+        }}});
+        assert!(!is_compact_chat_intent(inline_chat.to_string().as_bytes()));
     }
 
     #[test]

@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import type { FormEvent } from 'react'
-import { Loader2, MessageCircle, Send, ShieldCheck } from 'lucide-react'
+import { FileText, Loader2, MessageCircle, Paperclip, Send, ShieldCheck, X } from 'lucide-react'
 import { format } from 'date-fns'
 import { ru } from 'date-fns/locale'
 import { trpc } from '@/providers/trpc'
@@ -11,7 +11,9 @@ export default function Chat() {
   const { currentUser, workspace } = useStore()
   const utils = trpc.useUtils()
   const [text, setText] = useState('')
+  const [files, setFiles] = useState<File[]>([])
   const listRef = useRef<HTMLDivElement>(null)
+  const fileRef = useRef<HTMLInputElement>(null)
   const listQ = trpc.chat.list.useQuery(
     { workspaceId: workspace?.id },
     { refetchInterval: 4000 },
@@ -19,9 +21,11 @@ export default function Chat() {
   const send = trpc.chat.send.useMutation({
     onSuccess: () => {
       setText('')
+      setFiles([])
       utils.chat.list.invalidate()
     },
   })
+  const ingestContent = trpc.content.ingest.useMutation()
 
   const messages = listQ.data ?? []
 
@@ -29,11 +33,31 @@ export default function Chat() {
     listRef.current?.scrollTo({ top: listRef.current.scrollHeight, behavior: 'smooth' })
   }, [messages.length])
 
-  const onSubmit = (e: FormEvent) => {
+  const onSubmit = async (e: FormEvent) => {
     e.preventDefault()
     const value = text.trim()
-    if (!value || send.isPending) return
-    send.mutate({ text: value, workspaceId: workspace?.id })
+    if (!value || !workspace?.guid || send.isPending || ingestContent.isPending) return
+    try {
+      const attachments = await Promise.all(files.map(async (file) => {
+        const dataUrl = await new Promise<string>((resolve, reject) => {
+          const reader = new FileReader()
+          reader.onload = () => resolve(String(reader.result))
+          reader.onerror = () => reject(reader.error ?? new Error('Не удалось прочитать файл'))
+          reader.readAsDataURL(file)
+        })
+        const uploaded = await ingestContent.mutateAsync({ workspaceId: workspace.id, dataUrl })
+        return { name: file.name, url: uploaded.url, mime: uploaded.mime }
+      }))
+      send.mutate({
+        text: value,
+        workspaceId: workspace.id,
+        workspaceGuid: workspace.guid,
+        messageGuid: crypto.randomUUID(),
+        attachments,
+      })
+    } catch {
+      // Ошибка ingest уже отображается стандартным состоянием mutation.
+    }
   }
 
   return (
@@ -93,12 +117,39 @@ export default function Chat() {
                   >
                     {m.text}
                   </div>
+                  {!!m.attachments?.length && (
+                    <div className="mt-1.5 flex flex-wrap gap-1.5">
+                      {m.attachments.map((attachment) => (
+                        <a key={`${m.guid}-${attachment.sha256}`} href={attachment.url} download={attachment.name} className="inline-flex max-w-full items-center gap-1.5 rounded-lg bg-brand-100/70 px-2.5 py-1.5 text-xs font-semibold text-brand-700 hover:bg-brand-100">
+                          <FileText size={13} />
+                          <span className="truncate">{attachment.name}</span>
+                        </a>
+                      ))}
+                    </div>
+                  )}
                 </div>
               </div>
             )
           })}
         </div>
-        <form onSubmit={onSubmit} className="border-t border-brand-100/60 p-3 flex items-end gap-2">
+        <form onSubmit={onSubmit} className="border-t border-brand-100/60 p-3">
+          {!!files.length && (
+            <div className="mb-2 flex flex-wrap gap-2">
+              {files.map((file, index) => (
+                <span key={`${file.name}-${index}`} className="inline-flex max-w-[240px] items-center gap-1.5 rounded-lg bg-brand-50 px-2.5 py-1.5 text-xs font-semibold text-ink-700">
+                  <Paperclip size={12} /><span className="truncate">{file.name}</span>
+                  <button type="button" aria-label={`Убрать ${file.name}`} onClick={() => setFiles(current => current.filter((_, item) => item !== index))}><X size={12} /></button>
+                </span>
+              ))}
+            </div>
+          )}
+          <div className="flex items-end gap-2">
+          <input ref={fileRef} type="file" multiple className="hidden" onChange={(event) => {
+            const selected = Array.from(event.target.files ?? []).filter(file => file.size <= 32 * 1024 * 1024)
+            setFiles(current => [...current, ...selected].slice(0, 10))
+            event.target.value = ''
+          }} />
+          <button type="button" aria-label="Прикрепить файлы" onClick={() => fileRef.current?.click()} className="h-11 w-11 shrink-0 rounded-xl border border-brand-100 text-brand-700 inline-flex items-center justify-center hover:bg-brand-50"><Paperclip size={17} /></button>
           <textarea
             value={text}
             onChange={(e) => setText(e.target.value)}
@@ -114,18 +165,20 @@ export default function Chat() {
           />
           <button
             type="submit"
-            disabled={!text.trim() || send.isPending}
+            disabled={!text.trim() || send.isPending || ingestContent.isPending}
             className="h-11 px-4 rounded-xl bg-accent text-white text-sm font-semibold inline-flex items-center gap-2 hover:bg-accent-hover disabled:opacity-50"
           >
-            {send.isPending ? <Loader2 size={16} className="animate-spin" /> : <Send size={16} />}
+            {send.isPending || ingestContent.isPending ? <Loader2 size={16} className="animate-spin" /> : <Send size={16} />}
             Отправить
           </button>
+          </div>
         </form>
         {send.error && (
           <p className="px-3 pb-3 text-xs text-danger" role="alert">
             {send.error.message}
           </p>
         )}
+        {ingestContent.error && <p className="px-3 pb-3 text-xs text-danger" role="alert">{ingestContent.error.message}</p>}
       </section>
     </div>
   )

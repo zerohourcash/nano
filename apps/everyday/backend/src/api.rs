@@ -6173,16 +6173,26 @@ fn chat_list(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiResul
     let uid = require_user(conn, user_id)?;
     let ws = i64v(input, "workspaceId").unwrap_or_else(|| ws_fallback(conn));
     require_member(conn, uid, ws)?;
-    let mut stmt = conn.prepare("SELECT id,guid,workspace_id,user_id,text,created_at,ledger_hash FROM chat_messages WHERE workspace_id=?1 ORDER BY created_at DESC,guid DESC LIMIT 200")?;
+    let mut stmt = conn.prepare("SELECT id,guid,workspace_id,user_id,text,attachments_json,created_at,ledger_hash FROM chat_messages WHERE workspace_id=?1 ORDER BY created_at DESC,guid DESC LIMIT 200")?;
     let mut rows: Vec<Value> = stmt
         .query_map(params![ws], |r| {
             let author: i64 = r.get(3)?;
+            let raw: String = r.get(5)?;
+            let mut attachments: Value = serde_json::from_str(&raw).unwrap_or_else(|_| json!([]));
+            if let Some(entries) = attachments.as_array_mut() {
+                for entry in entries {
+                    if let Some(url) = entry.get("url").and_then(Value::as_str) {
+                        entry["url"] = json!(crate::content::resolve_url(conn, url));
+                    }
+                }
+            }
             Ok(json!({
                 "id": r.get::<_, i64>(0)?, "guid": r.get::<_, String>(1)?,
                 "workspaceId": r.get::<_, i64>(2)?, "userId": author,
-                "text": r.get::<_, String>(4)?, "createdAt": r.get::<_, String>(5)?,
-                "ledgerHash": r.get::<_, Option<String>>(6)?,
-                "ledgerVerified": r.get::<_, Option<String>>(6)?.is_some(),
+                "text": r.get::<_, String>(4)?, "attachments":attachments,
+                "createdAt": r.get::<_, String>(6)?,
+                "ledgerHash": r.get::<_, Option<String>>(7)?,
+                "ledgerVerified": r.get::<_, Option<String>>(7)?.is_some(),
                 "user": jsn::user_public(conn, author)
             }))
         })?
@@ -6196,8 +6206,7 @@ fn chat_send(conn: &mut Connection, input: &Value, user_id: Option<i64>) -> ApiR
     let uid = require_user(conn, user_id)?;
     let text = s(input, "text")
         .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| ApiError::bad("Пустое сообщение"))?;
+        .unwrap_or_default();
     if text.chars().count() > 4000 {
         return Err(ApiError::bad("Сообщение длиннее 4000 символов"));
     }
@@ -6206,6 +6215,47 @@ fn chat_send(conn: &mut Connection, input: &Value, user_id: Option<i64>) -> ApiR
     }
     let ws = i64v(input, "workspaceId").unwrap_or_else(|| ws_fallback(conn));
     require_member(conn, uid, ws)?;
+    let workspace_guid = ledger::guid(conn, "workspaces", ws)
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    if s(input, "workspaceGuid").is_some_and(|guid| guid != workspace_guid) {
+        return Err(ApiError::bad("workspaceGuid не соответствует организации"));
+    }
+    let guid = s(input, "messageGuid").unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    uuid::Uuid::parse_str(&guid).map_err(|_| ApiError::bad("Некорректный messageGuid"))?;
+    let attachment_inputs = input
+        .get("attachments")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if attachment_inputs.len() > 10 {
+        return Err(ApiError::bad("Не более 10 вложений в сообщении"));
+    }
+    let mut attachments = Vec::new();
+    for attachment in attachment_inputs {
+        let name = attachment
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|name| !name.is_empty() && name.chars().count() <= 200)
+            .ok_or_else(|| ApiError::bad("Некорректное имя вложения"))?;
+        let url = attachment
+            .get("url")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ApiError::bad("Нет CAS-ссылки вложения"))?;
+        let sha256 = validate_known_cas(conn, url)?;
+        let mime = attachment
+            .get("mime")
+            .and_then(Value::as_str)
+            .unwrap_or("application/octet-stream");
+        attachments.push(json!({"name":name,"url":url,"mime":mime,"sha256":sha256}));
+    }
+    if text.is_empty() && attachments.is_empty() {
+        return Err(ApiError::bad("Пустое сообщение"));
+    }
+    let attachments = Value::Array(attachments);
+    let author_guid =
+        ledger::guid(conn, "users", uid).map_err(|error| ApiError::internal(error.to_string()))?;
+    let commitment =
+        ledger::chat_commitment(&guid, &workspace_guid, &author_guid, &text, &attachments);
     let result = atomic(conn, |conn| {
         let minute_ago = (chrono::Utc::now() - chrono::Duration::minutes(1)).to_rfc3339();
         let recent: i64 = conn.query_row(
@@ -6236,7 +6286,6 @@ fn chat_send(conn: &mut Connection, input: &Value, user_id: Option<i64>) -> ApiR
                 "Такое сообщение уже отправлено",
             ));
         }
-        let guid = uuid::Uuid::new_v4().to_string();
         let event = ledger::append(
             conn,
             ws,
@@ -6244,7 +6293,7 @@ fn chat_send(conn: &mut Connection, input: &Value, user_id: Option<i64>) -> ApiR
             None,
             "chat_message",
             Some(&guid),
-            None,
+            Some(&commitment),
             None,
             Some(&text),
         )
@@ -6252,12 +6301,13 @@ fn chat_send(conn: &mut Connection, input: &Value, user_id: Option<i64>) -> ApiR
         let hash = event.get("opId").and_then(Value::as_str).unwrap_or("");
         let created_at = event.get("createdAt").and_then(Value::as_str).unwrap_or("");
         conn.execute(
-            "INSERT INTO chat_messages (guid,workspace_id,user_id,text,ledger_hash,created_at) VALUES (?1,?2,?3,?4,?5,?6)",
-            params![guid, ws, uid, text, hash, created_at],
+            "INSERT INTO chat_messages (guid,workspace_id,user_id,text,attachments_json,ledger_hash,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7)",
+            params![guid, ws, uid, text, attachments.to_string(), hash, created_at],
         )?;
         Ok(json!({
             "id": conn.last_insert_rowid(), "guid": guid,
             "workspaceId": ws, "userId": uid, "text": text,
+            "attachments":attachments,
             "createdAt": created_at, "ledgerHash": hash, "ledgerVerified": true,
             "user": jsn::user_public(conn, uid)
         }))
