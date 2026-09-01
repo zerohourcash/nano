@@ -1221,7 +1221,10 @@ mod capability_tests {
             .iter()
             .all(|capability| capability.workspace_scope.is_some()));
         let matched = find_bearer_capability(parsed, &format!("Bearer {token_b}")).unwrap();
-        assert_eq!(matched.workspace_scope.unwrap(), HashSet::from(["org-b".to_string(), "org-c".to_string()]));
+        assert_eq!(
+            matched.workspace_scope.unwrap(),
+            HashSet::from(["org-b".to_string(), "org-c".to_string()])
+        );
 
         assert!(parse_sync_capabilities("[]").is_err());
         assert!(parse_sync_capabilities(
@@ -1273,6 +1276,7 @@ mod android_jni {
         upstream: JString<'_>,
         sync_token: JString<'_>,
         workspace_scope: JString<'_>,
+        sync_capabilities: JString<'_>,
         node_signing_key: JString<'_>,
         advertise_url: JString<'_>,
     ) -> jint {
@@ -1282,6 +1286,7 @@ mod android_jni {
             let upstream = string(&mut env, upstream)?;
             let sync_token = string(&mut env, sync_token)?;
             let workspace_scope = string(&mut env, workspace_scope)?;
+            let sync_capabilities = string(&mut env, sync_capabilities)?;
             let node_signing_key = string(&mut env, node_signing_key)?;
             let advertise_url = string(&mut env, advertise_url)?;
             std::env::set_var("MESHKEEPER_DB", db_path);
@@ -1302,10 +1307,19 @@ mod android_jni {
             } else {
                 std::env::set_var("MESHKEEPER_SYNC_TOKEN", sync_token);
             }
-            if workspace_scope.is_empty() {
-                std::env::remove_var("MESHKEEPER_SYNC_WORKSPACES");
+            if sync_capabilities.is_empty() {
+                std::env::remove_var("MESHKEEPER_SYNC_CAPABILITIES");
+                if workspace_scope.is_empty() {
+                    std::env::remove_var("MESHKEEPER_SYNC_WORKSPACES");
+                } else {
+                    std::env::set_var("MESHKEEPER_SYNC_WORKSPACES", workspace_scope);
+                }
             } else {
-                std::env::set_var("MESHKEEPER_SYNC_WORKSPACES", workspace_scope);
+                crate::parse_sync_capabilities(&sync_capabilities)?;
+                std::env::set_var("MESHKEEPER_SYNC_CAPABILITIES", sync_capabilities);
+                std::env::remove_var("MESHKEEPER_SYNC_WORKSPACES");
+                std::env::remove_var("MESHKEEPER_UPSTREAM");
+                std::env::remove_var("MESHKEEPER_SYNC_TOKEN");
             }
             if node_signing_key.is_empty() {
                 return Err("Android node signing key is empty".into());

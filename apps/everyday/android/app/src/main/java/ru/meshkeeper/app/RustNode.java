@@ -27,6 +27,7 @@ public final class RustNode {
             String upstream,
             String syncToken,
             String workspaceScope,
+            String syncCapabilities,
             String nodeSigningKey,
             String advertiseUrl
     );

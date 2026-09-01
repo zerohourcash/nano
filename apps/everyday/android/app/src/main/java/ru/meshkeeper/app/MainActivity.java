@@ -31,6 +31,7 @@ import java.net.HttpURLConnection;
 import java.net.URL;
 import java.security.SecureRandom;
 import java.nio.charset.StandardCharsets;
+import java.util.HashSet;
 
 import androidx.activity.result.ActivityResultLauncher;
 import androidx.activity.result.contract.ActivityResultContracts;
@@ -53,8 +54,10 @@ public class MainActivity extends AppCompatActivity {
     private EditText serverUrl;
     private EditText syncToken;
     private EditText workspaceScope;
+    private EditText syncCapabilities;
     private TextView lanHint;
     private boolean hasStoredToken;
+    private boolean hasStoredCapabilities;
     private String pendingMode = "join";
     /** Адрес сервера, с которого открыт интерфейс. Пустой — интерфейс не загружен. */
     private String serverOrigin = "";
@@ -95,18 +98,24 @@ public class MainActivity extends AppCompatActivity {
         serverUrl = findViewById(R.id.serverUrl);
         syncToken = findViewById(R.id.syncToken);
         workspaceScope = findViewById(R.id.workspaceScope);
+        syncCapabilities = findViewById(R.id.syncCapabilities);
         lanHint = findViewById(R.id.lanHint);
         Button btnJoin = findViewById(R.id.btnJoin);
         Button btnCreate = findViewById(R.id.btnCreate);
+        Button btnClearCapabilities = findViewById(R.id.btnClearCapabilities);
 
         SharedPreferences prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
         serverUrl.setText(prefs.getString(KEY_RELAY, ""));
         workspaceScope.setText(prefs.getString(KEY_WORKSPACE_SCOPE, ""));
         try {
             hasStoredToken = !SecretStore.loadSyncToken(this).isEmpty();
+            hasStoredCapabilities = !SecretStore.loadSyncCapabilities(this).isEmpty();
             syncToken.setHint(hasStoredToken
                     ? "mesh-токен защищён на устройстве"
                     : "общий mesh-токен (пусто = создать)");
+            syncCapabilities.setHint(hasStoredCapabilities
+                    ? "набор организаций защищён на устройстве"
+                    : "GUID | токен | peer (по строке)");
         } catch (Exception error) {
             hasStoredToken = false;
             Toast.makeText(this, "Не удалось открыть защищённый mesh-токен", Toast.LENGTH_LONG).show();
@@ -179,6 +188,17 @@ public class MainActivity extends AppCompatActivity {
 
         btnJoin.setOnClickListener(v -> openApp("join"));
         btnCreate.setOnClickListener(v -> openApp("register"));
+        btnClearCapabilities.setOnClickListener(v -> {
+            try {
+                SecretStore.saveSyncCapabilities(this, "");
+                hasStoredCapabilities = false;
+                syncCapabilities.setText("");
+                syncCapabilities.setHint("GUID | токен | peer (по строке)");
+                Toast.makeText(this, "Набор capability удалён", Toast.LENGTH_SHORT).show();
+            } catch (Exception error) {
+                Toast.makeText(this, "Не удалось удалить capability", Toast.LENGTH_LONG).show();
+            }
+        });
 
         showSetupHint();
         askNotify();
@@ -327,26 +347,51 @@ public class MainActivity extends AppCompatActivity {
             Toast.makeText(this, "Mesh-токен должен содержать не менее 32 символов", Toast.LENGTH_LONG).show();
             return;
         }
-        final String scope;
+        String scope;
+        String capabilitiesJson = "";
         try {
             scope = normalizeWorkspaceScope(workspaceScope.getText().toString());
+            String enteredCapabilities = syncCapabilities.getText().toString().trim();
+            if (!enteredCapabilities.isEmpty()) {
+                capabilitiesJson = normalizeCapabilities(enteredCapabilities);
+            } else if (hasStoredCapabilities) {
+                capabilitiesJson = SecretStore.loadSyncCapabilities(this);
+            }
         } catch (IllegalArgumentException error) {
             Toast.makeText(this, error.getMessage(), Toast.LENGTH_LONG).show();
             return;
+        } catch (Exception error) {
+            Toast.makeText(this, "Не удалось открыть защищённые capability", Toast.LENGTH_LONG).show();
+            return;
+        }
+        // Multi-capability mode owns its peers and scopes. Do not retain an
+        // unused legacy secret or silently mix the legacy relay with it.
+        if (!capabilitiesJson.isEmpty()) {
+            relay = "";
+            scope = "";
+            token = "";
         }
         try {
             SecretStore.saveSyncToken(this, token);
+            SecretStore.saveSyncCapabilities(this, capabilitiesJson);
         } catch (Exception error) {
             Toast.makeText(this, "Не удалось защитить mesh-токен в Android Keystore", Toast.LENGTH_LONG).show();
             return;
         }
-        hasStoredToken = true;
+        hasStoredToken = !token.isEmpty();
+        hasStoredCapabilities = !capabilitiesJson.isEmpty();
         getSharedPreferences(PREFS, MODE_PRIVATE).edit()
                 .putString(KEY_RELAY, relay)
                 .putString(KEY_WORKSPACE_SCOPE, scope)
                 .apply();
         syncToken.setText("");
-        syncToken.setHint("mesh-токен защищён на устройстве");
+        syncToken.setHint(hasStoredToken
+                ? "mesh-токен защищён на устройстве"
+                : "общий mesh-токен (для одной организации)");
+        syncCapabilities.setText("");
+        syncCapabilities.setHint(hasStoredCapabilities
+                ? "набор организаций защищён на устройстве"
+                : "GUID | токен | peer (по строке)");
         Intent service = new Intent(this, NodeService.class)
                 .putExtra(NodeService.EXTRA_RELAY, relay);
         ContextCompat.startForegroundService(this, service);
@@ -405,6 +450,52 @@ public class MainActivity extends AppCompatActivity {
             if (unique.size() > 100) throw new IllegalArgumentException("Разрешено не более 100 организаций");
         }
         return String.join(",", unique);
+    }
+
+    /** Human-editable input is converted to the exact fail-closed Rust capability JSON. */
+    private static String normalizeCapabilities(String raw) {
+        org.json.JSONArray result = new org.json.JSONArray();
+        HashSet<String> tokens = new HashSet<>();
+        HashSet<String> workspaces = new HashSet<>();
+        String[] lines = raw.replace("\r", "").split("\n");
+        if (lines.length > 100) throw new IllegalArgumentException("Разрешено не более 100 capability");
+        for (String source : lines) {
+            String line = source.trim();
+            if (line.isEmpty()) continue;
+            String[] fields = line.split("\\|", -1);
+            if (fields.length < 2 || fields.length > 3) {
+                throw new IllegalArgumentException("Формат строки: GUID | токен | peer");
+            }
+            String guid = normalizeWorkspaceScope(fields[0]);
+            if (guid.isEmpty() || guid.contains(",")) {
+                throw new IllegalArgumentException("В capability укажите один GUID организации");
+            }
+            String token = fields[1].trim();
+            if (token.length() < 32 || token.length() > 256) {
+                throw new IllegalArgumentException("Capability-токен должен содержать 32–256 символов");
+            }
+            if (!tokens.add(token)) throw new IllegalArgumentException("Capability-токен повторяется");
+            if (!workspaces.add(guid)) throw new IllegalArgumentException("GUID организации повторяется");
+            org.json.JSONArray peers = new org.json.JSONArray();
+            if (fields.length == 3 && !fields[2].trim().isEmpty()) {
+                for (String peerValue : fields[2].split(",")) {
+                    String peer = normalizeRelay(peerValue);
+                    if (peer.isEmpty()) continue;
+                    peers.put(peer);
+                    if (peers.length() > 32) throw new IllegalArgumentException("Не более 32 peers на capability");
+                }
+            }
+            try {
+                result.put(new org.json.JSONObject()
+                        .put("token", token)
+                        .put("workspaces", new org.json.JSONArray().put(guid))
+                        .put("peers", peers));
+            } catch (org.json.JSONException error) {
+                throw new IllegalArgumentException("Не удалось собрать capability", error);
+            }
+        }
+        if (result.length() == 0) throw new IllegalArgumentException("Capability-набор пуст");
+        return result.toString();
     }
 
     @Override

@@ -23,10 +23,13 @@ final class SecretStore {
     private static final String TOKEN_IV = "sync_token_iv_v1";
     private static final String NODE_KEY_CIPHERTEXT = "node_signing_key_ciphertext_v1";
     private static final String NODE_KEY_IV = "node_signing_key_iv_v1";
+    private static final String CAPABILITIES_CIPHERTEXT = "sync_capabilities_ciphertext_v1";
+    private static final String CAPABILITIES_IV = "sync_capabilities_iv_v1";
     private static final String KEY_ALIAS = "meshkeeper.sync-token.v1";
     private static final String KEYSTORE = "AndroidKeyStore";
     private static final byte[] TOKEN_AAD = aad("sync-token/v1");
     private static final byte[] NODE_KEY_AAD = aad("node-signing-key/v1");
+    private static final byte[] CAPABILITIES_AAD = aad("sync-capabilities/v1");
 
     private SecretStore() {}
 
@@ -52,6 +55,16 @@ final class SecretStore {
 
     static String loadNodeSigningKey(Context context) throws GeneralSecurityException {
         return load(context, NODE_KEY_CIPHERTEXT, NODE_KEY_IV, NODE_KEY_AAD);
+    }
+
+    static void saveSyncCapabilities(Context context, String capabilitiesJson)
+            throws GeneralSecurityException {
+        save(context, CAPABILITIES_CIPHERTEXT, CAPABILITIES_IV, null,
+                CAPABILITIES_AAD, capabilitiesJson);
+    }
+
+    static String loadSyncCapabilities(Context context) throws GeneralSecurityException {
+        return load(context, CAPABILITIES_CIPHERTEXT, CAPABILITIES_IV, CAPABILITIES_AAD);
     }
 
     private static void save(Context context, String ciphertextName, String ivName,
