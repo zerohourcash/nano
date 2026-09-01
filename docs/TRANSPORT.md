@@ -196,6 +196,7 @@ Android APK экспортирует это ядро через JNI-методы
   discovery вычисляет адрес заново перед каждым подписанным анонсом.
 - Обмен телефонов без IP: уже возможен вручную через системный файловый Share.
 - Android BLE GATT radio adapter реализован и проходит compile/APK contract,
-  но межтелефонный RF-тест требует двух физических BLE-устройств и пока не
+  а bounded spool исполняется instrumentation-тестами на API 34 emulator в CI.
+  Межтелефонный RF-тест требует двух физических BLE-устройств и пока не
   зафиксирован. iOS-оболочка и Bluetooth Mesh managed-flooding profile ещё не
-  реализованы. Android ABI/APK проверяются отдельным CI job.
+  реализованы. Android ABI/APK и emulator regression проверяются отдельным CI job.

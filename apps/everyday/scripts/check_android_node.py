@@ -14,6 +14,7 @@ layout = (android / "src/main/res/layout/activity_main.xml").read_text(encoding=
 stream_inbox = (android / "src/main/java/ru/meshkeeper/app/StreamTransportInbox.java").read_text(encoding="utf-8")
 ble_transport = (android / "src/main/java/ru/meshkeeper/app/BleMeshTransport.java").read_text(encoding="utf-8")
 ble_spool = (android / "src/main/java/ru/meshkeeper/app/BleBundleSpool.java").read_text(encoding="utf-8")
+quality_workflow = (ROOT.parent.parent / ".github/workflows/quality.yml").read_text(encoding="utf-8")
 
 required = {
     "Rust JNI symbol": "Java_ru_meshkeeper_app_RustNode_startNode" in lib,
@@ -60,7 +61,9 @@ required = {
     "connected-device foreground declaration": "FOREGROUND_SERVICE_CONNECTED_DEVICE" in manifest
         and 'foregroundServiceType="dataSync|connectedDevice"' in manifest,
     "BLE spool instrumentation regression": (android / "src/androidTest/java/ru/meshkeeper/app/BleBundleSpoolTest.java").is_file()
-        and "testInstrumentationRunner" in gradle,
+        and "testInstrumentationRunner" in gradle
+        and "connectedDebugAndroidTest" in quality_workflow
+        and "reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d" in quality_workflow,
     "Android backup and device transfer disabled": "dataExtractionRules" in manifest
         and (android / "src/main/res/xml/data_extraction_rules.xml").is_file(),
     "private UI bind": 'MESHKEEPER_BIND", "127.0.0.1:8765' in lib,

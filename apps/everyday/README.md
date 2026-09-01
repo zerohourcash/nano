@@ -286,6 +286,12 @@ cargo clippy --manifest-path backend/Cargo.toml --all-targets -- -D warnings
 cargo test --manifest-path backend/Cargo.toml
 ```
 
+Android CI дополнительно запускает `gradle connectedDebugAndroidTest` на API 34
+x86_64 emulator. Этот gate исполняет durable BLE spool: восстановление после
+незавершённой замены, bounded-очередь, quarantine повреждения и цикл
+`claim → reject/retry → accept`. Реальный BLE RF всё равно проверяется по
+[docs/BLE_TEST.md](docs/BLE_TEST.md) на двух телефонах.
+
 `npm run smoke` поднимает узел на временной базе и прогоняет 41 проверку:
 регистрация, каталог, выдача и возврат, приглашения и роли, неисправности,
 инвентаризация, отчёты, защита от cross-site, SPA-маршруты.
