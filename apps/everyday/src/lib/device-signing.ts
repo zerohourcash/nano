@@ -91,6 +91,7 @@ const CRITICAL = [
   'knowledge.save',
   'sync.importBundle',
   'sync.clearDiagnostics',
+  'content.setMode',
 ]
 
 export function requiresDeviceSignature(url: string): boolean {

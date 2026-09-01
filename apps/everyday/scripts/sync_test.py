@@ -221,6 +221,7 @@ def main() -> int:
             "MESHKEEPER_SYNC_TOKEN": TOKEN,
             "MESHKEEPER_UPSTREAM": f"http://127.0.0.1:{server_port}",
             "MESHKEEPER_SYNC_INTERVAL": "5",
+            "MESHKEEPER_CONTENT_MODE": "metadata",
         },
     )
     try:
@@ -375,6 +376,21 @@ def main() -> int:
             and synced_card.get("organizationNode", {}).get("name") == "Кабинет 204",
             str(synced_card.get("organizationNode") if isinstance(synced_card, dict) else synced_card),
         )
+        metadata_status = node.call("content.status", None, mutation=False)
+        check(
+            "metadata-нода получила летопись и CAS-каталог без тяжёлого файла",
+            metadata_status.get("mode") == "metadata"
+            and metadata_status.get("missing") == 1
+            and metadata_status.get("blobs") == 0,
+            str(metadata_status),
+        )
+        full_status = node.call("content.setMode", {"mode": "full"})
+        check(
+            "любой авторизованный узел переключается в полную ноду подписанной командой",
+            full_status.get("mode") == "full",
+            str(full_status),
+        )
+        node.call("sync.pullNow", {})
         photo_arrived = wait_for(
             lambda: (item_named(node, node_ws_id or 1, "Перфоратор с сервера") or {})
             .get("photos", [{}])[0]
@@ -383,6 +399,13 @@ def main() -> int:
             timeout=30,
         )
         check("многочастное CAS-фото докачалось и прошло SHA-256", photo_arrived)
+        replicated_status = node.call("content.status", None, mutation=False)
+        check(
+            "полная нода восстановила все известные CAS-файлы",
+            replicated_status.get("missing") == 0
+            and replicated_status.get("blobs") == replicated_status.get("catalogEntries") == 1,
+            str(replicated_status),
+        )
         compact_snapshot = journal_from(node)
         check(
             "snapshot содержит только CAS-ссылку и manifest, не base64 файла",

@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { GitBranch, Network, Radio, RefreshCw, ShieldAlert, ShieldCheck, Download, Upload, Trash2 } from 'lucide-react'
+import { Database, GitBranch, Network, Radio, RefreshCw, ShieldAlert, ShieldCheck, Download, Upload, Trash2 } from 'lucide-react'
 import { trpc } from '@/providers/trpc'
 import { cn } from '@/lib/utils'
 import { SectionHeader, btnPrimaryCls, btnSecondaryCls, cardCls, inputCls, useToast } from './ui'
@@ -11,6 +11,13 @@ function fmtMoment(iso: string): string {
     : date.toLocaleString('ru-RU', { dateStyle: 'short', timeStyle: 'medium' })
 }
 
+function fmtBytes(value: number): string {
+  if (value < 1024) return `${value} Б`
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} КБ`
+  if (value < 1024 * 1024 * 1024) return `${(value / 1024 / 1024).toFixed(1)} МБ`
+  return `${(value / 1024 / 1024 / 1024).toFixed(1)} ГБ`
+}
+
 export default function OfflineNodesSection() {
   const toast = useToast()
   const utils = trpc.useUtils()
@@ -19,6 +26,7 @@ export default function OfflineNodesSection() {
   const conflictsQ = trpc.sync.conflicts.useQuery(undefined, { refetchInterval: 8000 })
   const keysQ = trpc.sync.nodeKeys.useQuery(undefined, { refetchInterval: 8000 })
   const diagnosticsQ = trpc.sync.diagnostics.useQuery(undefined, { refetchInterval: 8000 })
+  const contentQ = trpc.content.status.useQuery(undefined, { refetchInterval: 8000 })
   const bundleQ = trpc.sync.exportBundle.useQuery(undefined, { enabled: false })
   const [peerUrl, setPeerUrl] = useState('')
   const [password, setPassword] = useState('')
@@ -68,6 +76,14 @@ export default function OfflineNodesSection() {
     onSuccess: (result) => {
       utils.invalidate()
       toast(`Пакет проверен: импортировано ${result.imported ?? 0}, конфликтов ${result.conflicts ?? 0}`)
+    },
+    onError: (e) => toast(e.message, 'error'),
+  })
+  const setContentMode = trpc.content.setMode.useMutation({
+    onSuccess: (state) => {
+      utils.content.status.setData(undefined, state)
+      pull.mutate({})
+      toast(state.mode === 'full' ? 'Полная нода включена: начата докачка CAS-файлов' : 'Режим хранения изменён')
     },
     onError: (e) => toast(e.message, 'error'),
   })
@@ -221,6 +237,48 @@ export default function OfflineNodesSection() {
               </p>
             )}
           </div>
+        )}
+      </section>
+
+      <section className={cardCls + ' p-5 space-y-3'} data-testid="content-node-mode">
+        <div className="flex items-center gap-2">
+          <Database size={18} className="text-brand-600" />
+          <h3 className="text-[17px] font-semibold text-ink-900">Хранение файлов на этой ноде</h3>
+        </div>
+        <p className="text-sm text-ink-500">
+          Подписанная летопись, транзакции и текст синхронизируются всегда. Режим определяет только хранение фотографий и документов по их CAS-хэшам.
+        </p>
+        <div className="grid gap-2 sm:grid-cols-3">
+          {([
+            ['metadata', 'Только летопись', 'Не хранить чужие тяжёлые файлы'],
+            ['smart', 'Умный режим', 'Хранить свои файлы и нужные превью'],
+            ['full', 'Полная нода', 'Докачать и проверять все известные файлы'],
+          ] as const).map(([mode, title, description]) => (
+            <button
+              key={mode}
+              type="button"
+              className={cn('rounded-xl border p-3 text-left', contentQ.data?.mode === mode ? 'border-brand-600 bg-brand-50' : 'border-brand-100')}
+              disabled={setContentMode.isPending}
+              onClick={() => setContentMode.mutate({ mode })}
+            >
+              <span className="block text-sm font-semibold">{title}</span>
+              <span className="block text-[12px] text-ink-500">{description}</span>
+            </button>
+          ))}
+        </div>
+        <div className="grid gap-2 text-sm sm:grid-cols-3">
+          <div>Локально: <b>{contentQ.data?.blobs ?? 0}</b> · {fmtBytes(contentQ.data?.bytes ?? 0)}</div>
+          <div>В каталоге: <b>{contentQ.data?.catalogEntries ?? 0}</b> · {fmtBytes(contentQ.data?.catalogBytes ?? 0)}</div>
+          <div>Отсутствует: <b>{contentQ.data?.missing ?? 0}</b> · {fmtBytes(contentQ.data?.missingBytes ?? 0)}</div>
+          <div>Докачивается: <b>{contentQ.data?.pending ?? 0}</b></div>
+          <div>Закреплено: <b>{contentQ.data?.pinned ?? 0}</b></div>
+          <div>Известных провайдеров: <b>{contentQ.data?.providers ?? 0}</b></div>
+        </div>
+        {contentQ.data?.mode === 'full' && (contentQ.data?.missing ?? 0) === 0 && (
+          <p className="rounded-xl bg-teal/10 p-3 text-sm text-teal-dark">Полная копия всех известных CAS-файлов сохранена на этой ноде.</p>
+        )}
+        {contentQ.data?.mode === 'full' && (contentQ.data?.missing ?? 0) > 0 && (
+          <p className="rounded-xl bg-[#FFFDF2] p-3 text-sm text-[#80600C]">Нода продолжит докачку с доступных peers после восстановления связи. Каждый файл принимается только после проверки SHA-256.</p>
         )}
       </section>
 

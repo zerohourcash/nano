@@ -426,9 +426,21 @@ pub fn status(conn: &Connection) -> Value {
             |row| row.get::<_, i64>(0),
         )
         .unwrap_or(0);
-    json!({"mode":mode(conn),"blobs":count("content_blobs"),"catalogEntries":count("content_catalog"),
+    let (catalog_entries, catalog_bytes, missing, missing_bytes) = conn
+        .query_row(
+            "SELECT count(*),coalesce(sum(c.size),0),
+                    coalesce(sum(CASE WHEN b.hash IS NULL THEN 1 ELSE 0 END),0),
+                    coalesce(sum(CASE WHEN b.hash IS NULL THEN c.size ELSE 0 END),0)
+             FROM content_catalog c LEFT JOIN content_blobs b ON b.hash=c.hash",
+            [],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?, row.get::<_, i64>(3)?)),
+        )
+        .unwrap_or((0, 0, 0, 0));
+    json!({"mode":mode(conn),"blobs":count("content_blobs"),
         "providers":count("content_providers"),"pinned":count("content_pins"),
-        "pending":count("blob_downloads"),"bytes":bytes})
+        "pending":count("blob_downloads"),"bytes":bytes,
+        "catalogEntries":catalog_entries,"catalogBytes":catalog_bytes,
+        "missing":missing,"missingBytes":missing_bytes})
 }
 
 pub fn pin(conn: &Connection, hash: &str, reason: &str) -> anyhow::Result<()> {
@@ -636,5 +648,10 @@ mod tests {
         }
         assert_eq!(providers(&db, &hash, "http://127.0.0.1:8000").len(), 8);
         assert_eq!(manifests(&db), json!([]));
+        let state = status(&db);
+        assert_eq!(state["catalogEntries"], 1);
+        assert_eq!(state["catalogBytes"], 42);
+        assert_eq!(state["missing"], 1);
+        assert_eq!(state["missingBytes"], 42);
     }
 }

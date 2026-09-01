@@ -95,6 +95,7 @@ pub fn is_mutation(procedure: &str) -> bool {
             | "sync.nodeKeys"
             | "sync.diagnostics"
             | "sync.exportBundle"
+            | "content.status"
             | "bit.balance"
             | "bit.transactions"
             | "knowledge.list"

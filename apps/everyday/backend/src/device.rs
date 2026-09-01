@@ -42,6 +42,7 @@ pub fn requires_signature(procedure: &str) -> bool {
             | "knowledge.save"
             | "sync.importBundle"
             | "sync.clearDiagnostics"
+            | "content.setMode"
     )
 }
 
