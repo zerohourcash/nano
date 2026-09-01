@@ -3420,12 +3420,71 @@ pub fn resolve_conflict(
     id: i64,
     responsible: Option<i64>,
     uid: i64,
+    input: &Value,
 ) -> anyhow::Result<Value> {
-    let (item_id, ws): (i64, i64) = conn.query_row(
-        "SELECT item_id, workspace_id FROM conflicts WHERE id=?1",
+    let (item_id, ws, status): (i64, i64, String) = conn.query_row(
+        "SELECT item_id, workspace_id,status FROM conflicts WHERE id=?1",
         params![id],
-        |r| Ok((r.get(0)?, r.get(1)?)),
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
     )?;
+    let resolution_guid = input
+        .get("resolutionGuid")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("resolutionGuid обязателен"))?;
+    uuid::Uuid::parse_str(resolution_guid)?;
+    let workspace_guid = ledger::guid(conn, "workspaces", ws)?;
+    let item_guid = ledger::guid(conn, "items", item_id)?;
+    if input.get("workspaceGuid").and_then(Value::as_str) != Some(workspace_guid.as_str())
+        || input.get("itemGuid").and_then(Value::as_str) != Some(item_guid.as_str())
+    {
+        anyhow::bail!("GUID разрешения не соответствуют конфликту");
+    }
+    let responsible_guid = responsible
+        .map(|user| {
+            let active: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM user_workspaces WHERE user_id=?1 AND workspace_id=?2",
+                params![user, ws],
+                |row| row.get(0),
+            )?;
+            if active == 0 {
+                anyhow::bail!("ответственный не состоит в организации");
+            }
+            ledger::guid(conn, "users", user)
+        })
+        .transpose()?;
+    if input
+        .get("responsibleUserGuid")
+        .filter(|value| !value.is_null())
+        .and_then(Value::as_str)
+        != responsible_guid.as_deref()
+    {
+        anyhow::bail!("responsibleUserGuid не соответствует сотруднику");
+    }
+    let actor_guid = ledger::guid(conn, "users", uid)?;
+    let commitment = conflict_resolution_commitment(
+        resolution_guid,
+        &workspace_guid,
+        &item_guid,
+        &actor_guid,
+        responsible_guid.as_deref(),
+    );
+    let existing_resolution: Option<(String, Option<String>)> = conn
+        .query_row(
+            "SELECT hash,to_label FROM history_entries WHERE workspace_id=?1 AND type='conflict_resolve' AND from_label=?2",
+            params![ws,resolution_guid], |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    if let Some((hash, stored_commitment)) = existing_resolution {
+        if stored_commitment.as_deref() != Some(commitment.as_str()) {
+            anyhow::bail!("resolutionGuid уже использован для другого решения");
+        }
+        return Ok(
+            json!({"ok":true,"duplicate":true,"resolutionGuid":resolution_guid,"ledgerHash":hash}),
+        );
+    }
+    if status != "open" {
+        anyhow::bail!("конфликт уже разрешён");
+    }
     conn.execute(
         "UPDATE conflicts SET status='resolved', resolved_at=?1, resolver_id=?2 WHERE id=?3",
         params![chrono::Utc::now().to_rfc3339(), uid, id],
@@ -3441,18 +3500,18 @@ pub fn resolve_conflict(
             params![responsible, st, item_id],
         )?;
     }
-    let _ = ledger::append(
+    let event = ledger::append(
         conn,
         ws,
         uid,
         Some(item_id),
-        "update",
-        None,
-        None,
+        "conflict_resolve",
+        Some(resolution_guid),
+        Some(&commitment),
         None,
         Some("Конфликт выдачи разрешён администратором"),
-    );
-    Ok(json!({"ok": true}))
+    )?;
+    Ok(json!({"ok": true,"resolutionGuid":resolution_guid,"ledgerHash":event["opId"]}))
 }
 
 pub fn local_http_base() -> String {
@@ -5041,7 +5100,84 @@ fn stock_operation_commitment(
     Ok(hex::encode(Sha256::digest(serde_json::to_vec(&payload)?)))
 }
 
+fn conflict_resolution_commitment(
+    resolution_guid: &str,
+    workspace_guid: &str,
+    item_guid: &str,
+    actor_guid: &str,
+    responsible_guid: Option<&str>,
+) -> String {
+    let payload = json!({
+        "domain":"everyday/conflict-resolution/v1",
+        "resolutionGuid":resolution_guid,
+        "workspaceGuid":workspace_guid,
+        "itemGuid":item_guid,
+        "actorGuid":actor_guid,
+        "responsibleUserGuid":responsible_guid,
+    });
+    hex::encode(Sha256::digest(
+        serde_json::to_vec(&payload).expect("JSON serialization"),
+    ))
+}
+
+fn verify_conflict_resolution_records(journal: &Value) -> anyhow::Result<usize> {
+    let mut verified = 0;
+    for event in journal
+        .get("history")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|event| event.get("type").and_then(Value::as_str) == Some("conflict_resolve"))
+    {
+        if event.get("eventVersion").and_then(Value::as_i64) != Some(3)
+            || event.get("requestPath").and_then(Value::as_str)
+                != Some("/api/trpc/sync.resolveConflict")
+        {
+            anyhow::bail!("conflict resolution has no exact V3 user intent")
+        }
+        let body = event
+            .get("requestBody")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("conflict resolution has no request body"))?;
+        if event.get("requestHash").and_then(Value::as_str)
+            != Some(hex::encode(Sha256::digest(body.as_bytes())).as_str())
+        {
+            anyhow::bail!("conflict resolution request hash mismatch")
+        }
+        let envelope: Value = serde_json::from_str(body)?;
+        let input = trpc_request_input(&envelope)?;
+        for (input_field, event_field) in [
+            ("resolutionGuid", "fromLabel"),
+            ("workspaceGuid", "workspaceGuid"),
+            ("itemGuid", "itemGuid"),
+        ] {
+            if input.get(input_field).and_then(Value::as_str)
+                != event.get(event_field).and_then(Value::as_str)
+            {
+                anyhow::bail!("conflict resolution differs from signed user intent")
+            }
+        }
+        let responsible = input
+            .get("responsibleUserGuid")
+            .filter(|value| !value.is_null())
+            .and_then(Value::as_str);
+        let commitment = conflict_resolution_commitment(
+            event["fromLabel"].as_str().unwrap_or_default(),
+            event["workspaceGuid"].as_str().unwrap_or_default(),
+            event["itemGuid"].as_str().unwrap_or_default(),
+            event["actorGuid"].as_str().unwrap_or_default(),
+            responsible,
+        );
+        if event.get("toLabel").and_then(Value::as_str) != Some(commitment.as_str()) {
+            anyhow::bail!("conflict resolution commitment mismatch")
+        }
+        verified += 1;
+    }
+    Ok(verified)
+}
+
 fn verify_stock_operation_records(journal: &Value) -> anyhow::Result<(usize, usize)> {
+    verify_conflict_resolution_records(journal)?;
     let mut verified = 0;
     let mut legacy = 0;
     for event in journal
@@ -5392,10 +5528,43 @@ fn expected_custody_states(journal: &Value) -> anyhow::Result<ExpectedCustodySta
             .unwrap_or("");
         let mut balances: HashMap<String, f64> = HashMap::new();
         let mut due_dates: HashMap<String, Option<String>> = HashMap::new();
-        if let Some(owner) = fields.get("responsibleGuid").and_then(Value::as_str) {
+        let latest_resolution = journal
+            .get("history")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|event| {
+                event.get("type").and_then(Value::as_str) == Some("conflict_resolve")
+                    && event.get("itemGuid").and_then(Value::as_str) == Some(item)
+                    && event
+                        .get("createdAt")
+                        .and_then(Value::as_str)
+                        .is_some_and(|created| created >= baseline)
+            })
+            .max_by_key(|event| {
+                (
+                    event.get("createdAt").and_then(Value::as_str).unwrap_or(""),
+                    event.get("opId").and_then(Value::as_str).unwrap_or(""),
+                )
+            });
+        let resolution_at = latest_resolution
+            .and_then(|event| event.get("createdAt"))
+            .and_then(Value::as_str);
+        if let Some(event) = latest_resolution {
+            let body = event["requestBody"].as_str().unwrap_or_default();
+            let envelope: Value = serde_json::from_str(body)?;
+            let input = trpc_request_input(&envelope)?;
+            if let Some(owner) = input
+                .get("responsibleUserGuid")
+                .filter(|value| !value.is_null())
+                .and_then(Value::as_str)
+            {
+                balances.insert(owner.to_owned(), 1.0);
+            }
+        } else if let Some(owner) = fields.get("responsibleGuid").and_then(Value::as_str) {
             balances.insert(owner.to_owned(), 1.0);
         }
-        let mut observed = false;
+        let mut observed = latest_resolution.is_some();
         for entry in journal
             .get("custody")
             .and_then(Value::as_array)
@@ -5406,7 +5575,9 @@ fn expected_custody_states(journal: &Value) -> anyhow::Result<ExpectedCustodySta
                     && entry
                         .get("createdAt")
                         .and_then(Value::as_str)
-                        .is_some_and(|created| created >= baseline)
+                        .is_some_and(|created| {
+                            resolution_at.map_or(created >= baseline, |resolved| created > resolved)
+                        })
             })
         {
             observed = true;
@@ -5469,6 +5640,36 @@ fn rebuild_nonquantitative_custody_state(conn: &Connection) -> anyhow::Result<()
             "UPDATE items SET responsible_user_id=?1,status_id=COALESCE(?2,status_id),due_at=?3 WHERE guid=?4 AND quantitative=0",
             params![responsible_id, status_id, due_at, item],
         )?;
+        let has_resolution = snapshot
+            .get("history")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .any(|event| {
+                event.get("type").and_then(Value::as_str) == Some("conflict_resolve")
+                    && event.get("itemGuid").and_then(Value::as_str) == Some(item.as_str())
+            });
+        if has_resolution {
+            let item_id: i64 =
+                conn.query_row("SELECT id FROM items WHERE guid=?1", [&item], |row| {
+                    row.get(0)
+                })?;
+            let existing: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM conflicts WHERE item_guid=?1 OR item_id=?2",
+                params![item, item_id],
+                |row| row.get(0),
+            )?;
+            if existing == 0 {
+                conn.execute(
+                    "INSERT INTO conflicts(workspace_id,item_id,item_guid,status,description,created_at,resolved_at) VALUES(?1,?2,?3,'resolved','Конфликт разрешён подписанным решением',?4,?4)",
+                    params![workspace,item_id,item,chrono::Utc::now().to_rfc3339()],
+                )?;
+            }
+            conn.execute(
+                "UPDATE conflicts SET status='resolved',resolved_at=COALESCE(resolved_at,?1) WHERE item_guid=?2 OR item_id=(SELECT id FROM items WHERE guid=?2)",
+                params![chrono::Utc::now().to_rfc3339(), item],
+            )?;
+        }
     }
     Ok(())
 }
@@ -9786,6 +9987,41 @@ mod tests {
             expected_custody_states(&double_checkout).unwrap()["tool-2"],
             (None, "needs-check".to_owned(), None)
         );
+
+        let resolution_body = json!({"0":{"json":{
+            "id":1,"resolutionGuid":"resolution-1","workspaceGuid":"ws-1",
+            "itemGuid":"tool-2","responsibleUserGuid":null
+        }}})
+        .to_string();
+        let mut resolution_event = json!({
+            "type":"conflict_resolve","eventVersion":3,
+            "requestPath":"/api/trpc/sync.resolveConflict","requestBody":resolution_body,
+            "requestHash":hex::encode(Sha256::digest(resolution_body.as_bytes())),
+            "fromLabel":"resolution-1","workspaceGuid":"ws-1","itemGuid":"tool-2",
+            "actorGuid":"auditor-1","createdAt":"2026-09-01T12:02:00Z","opId":"resolution-hash"
+        });
+        resolution_event["toLabel"] = json!(conflict_resolution_commitment(
+            "resolution-1",
+            "ws-1",
+            "tool-2",
+            "auditor-1",
+            None,
+        ));
+        let resolved = json!({
+            "history":[resolution_event.clone()],
+            "itemStateVersions":double_checkout["itemStateVersions"].clone(),
+            "custody":double_checkout["custody"].clone(),
+            "items":[{"guid":"tool-2","responsibleGuid":null,"statusSlug":"in-stock","dueAt":null}]
+        });
+        assert_eq!(verify_stock_operation_records(&resolved).unwrap(), (0, 0));
+        resolution_event["toLabel"] = json!("forged-resolution");
+        assert!(verify_stock_operation_records(&json!({
+            "history":[resolution_event],
+            "itemStateVersions":double_checkout["itemStateVersions"].clone(),
+            "custody":double_checkout["custody"].clone(),
+            "items":[{"guid":"tool-2","responsibleGuid":null,"statusSlug":"in-stock","dueAt":null}]
+        }))
+        .is_err());
     }
 
     #[test]

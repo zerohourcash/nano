@@ -595,7 +595,17 @@ export default function OfflineNodesSection() {
             <p className="text-sm font-semibold">{c.item?.internalId} {c.item?.title}</p>
             <p className="text-sm text-ink-500">{c.description}</p>
             <div className="flex gap-2">
-              <button className={btnPrimaryCls} onClick={() => resolve.mutate({ id: c.id, responsibleUserId: null })}>
+              <button className={btnPrimaryCls} disabled={!workspace?.guid || !c.itemGuid} onClick={() => {
+                if (!workspace?.guid || !c.itemGuid) return
+                resolve.mutate({
+                  id: c.id,
+                  resolutionGuid: crypto.randomUUID(),
+                  workspaceGuid: workspace.guid,
+                  itemGuid: c.itemGuid,
+                  responsibleUserId: null,
+                  responsibleUserGuid: null,
+                })
+              }}>
                 Вернуть на склад
               </button>
             </div>

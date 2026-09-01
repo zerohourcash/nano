@@ -1325,8 +1325,16 @@ fn dispatch_inner(
             let workspace = target_workspace(conn, procedure, input)?
                 .ok_or_else(|| ApiError::not_found("Конфликт не найден"))?;
             require_can_in_workspace(conn, uid, workspace, "editItems")?;
-            crate::sync::resolve_conflict(conn, id, i64v(input, "responsibleUserId"), uid)
+            atomic(conn, |conn| {
+                crate::sync::resolve_conflict(
+                    conn,
+                    id,
+                    i64v(input, "responsibleUserId"),
+                    uid,
+                    input,
+                )
                 .map_err(|e| ApiError::bad(e.to_string()))
+            })
         }
         "sync.pullNow" => {
             let no_upstream = std::env::var("MESHKEEPER_UPSTREAM")

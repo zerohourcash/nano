@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import copy
 import json
+import sqlite3
 import urllib.request
+import uuid
 from http.cookiejar import CookieJar
 
 from device_test_signing import DeviceSigner
@@ -242,6 +244,46 @@ def main() -> int:
             and converged_tool.get("responsibleUserId") is None
             and any(row.get("type") == "conflict_detected" for row in converged_history),
             str(converged_tool)[:240],
+        )
+        source_workspace = source.call("meta.workspaces", None, mutation=False)[0]
+        open_conflict = next(row for row in conflicts if row.get("status") == "open")
+        resolution_payload = {
+            "id": open_conflict["id"],
+            "resolutionGuid": str(uuid.uuid4()),
+            "workspaceGuid": source_workspace["guid"],
+            "itemGuid": conflict_tool["guid"],
+            "responsibleUserId": None,
+            "responsibleUserGuid": None,
+        }
+        resolution = source.call("sync.resolveConflict", resolution_payload)
+        resolution_retry = source.call("sync.resolveConflict", resolution_payload)
+        resolved_snapshot = journal(source)
+        resolution_events = [
+            event for event in resolved_snapshot.get("history", [])
+            if event.get("type") == "conflict_resolve"
+        ]
+        resolved_import = submit(target, resolved_snapshot)
+        resolved_source = item_named(source, ws, "Конфликтная пила") or {}
+        resolved_target = item_named(target, target_ws, "Конфликтная пила") or {}
+        with sqlite3.connect(target.db) as target_db:
+            target_resolved_conflicts = target_db.execute(
+                "SELECT COUNT(*) FROM conflicts WHERE status='resolved'"
+            ).fetchone()[0]
+        check(
+            "аудиторское решение подписано и после reconnect вернуло инструмент на склад",
+            resolution.get("ledgerHash")
+            and resolution_retry.get("duplicate") is True
+            and resolution_retry.get("ledgerHash") == resolution.get("ledgerHash")
+            and resolved_import.get("ok") is True
+            and len(resolution_events) == 1
+            and resolution_events[0].get("eventVersion") == 3
+            and resolution_events[0].get("requestPath") == "/api/trpc/sync.resolveConflict"
+            and resolved_source.get("status", {}).get("slug") == "in-stock"
+            and resolved_target.get("status", {}).get("slug") == "in-stock"
+            and resolved_source.get("responsibleUserId") is None
+            and resolved_target.get("responsibleUserId") is None
+            and target_resolved_conflicts >= 1,
+            str({"resolution": resolution, "import": resolved_import, "target": resolved_target})[:500],
         )
 
         # Wiki-летопись не перезаписывает одну офлайн-версию другой: обе

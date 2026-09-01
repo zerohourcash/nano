@@ -159,7 +159,14 @@ export const syncRouter = createRouter({
     item: { id: number; title: string; internalId: string } | null;
   }>),
   resolveConflict: publicQuery
-    .input(z.object({ id: z.number().int().positive(), responsibleUserId: z.number().int().positive().nullable().optional() }))
+    .input(z.object({
+      id: z.number().int().positive(),
+      resolutionGuid: z.string().uuid(),
+      workspaceGuid: z.string().uuid(),
+      itemGuid: z.string().uuid(),
+      responsibleUserId: z.number().int().positive().nullable().optional(),
+      responsibleUserGuid: z.string().uuid().nullable().optional(),
+    }))
     .mutation(async () => ({ ok: true })),
 });
 
