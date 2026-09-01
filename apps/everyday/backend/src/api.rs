@@ -100,6 +100,9 @@ pub fn is_mutation(procedure: &str) -> bool {
             | "bit.transactions"
             | "knowledge.list"
             | "knowledge.bySlug"
+            | "interorg.identity"
+            | "interorg.contacts"
+            | "interorg.inbox"
             | "transfers.outgoing"
             | "transfers.incoming"
             | "transfers.byId"
@@ -456,6 +459,8 @@ fn required_admin_right(procedure: &str) -> Option<&'static str> {
         Some("manageWorkspaces")
     } else if procedure.starts_with("admin.dictionaries.") {
         Some("manageDictionaries")
+    } else if procedure.starts_with("interorg.") {
+        Some("manageWorkspaces")
     } else if procedure.starts_with("sync.")
         || procedure.starts_with("backup.")
         || (procedure.starts_with("content.") && procedure != "content.ingest")
@@ -991,6 +996,13 @@ fn dispatch_inner(
         "knowledge.list" => knowledge_list(conn, input, user_id),
         "knowledge.bySlug" => knowledge_by_slug(conn, input, user_id),
         "knowledge.save" => knowledge_save(conn, input, user_id),
+        "interorg.identity" => interorg_identity(conn, input),
+        "interorg.ensureIdentity" => interorg_ensure_identity(conn, input, user_id),
+        "interorg.contacts" => interorg_contacts(conn, input),
+        "interorg.trustContact" => interorg_trust_contact(conn, input, user_id),
+        "interorg.inbox" => interorg_inbox(conn, input),
+        "interorg.send" => interorg_send(conn, input, user_id),
+        "interorg.accept" => interorg_accept(conn, input, user_id),
         "sync.addPeer" => {
             let url = s(input, "url").ok_or_else(|| ApiError::bad("Укажите адрес узла"))?;
             crate::validate_peer_url(&url).map_err(ApiError::bad)?;
@@ -6318,6 +6330,172 @@ fn chat_send(conn: &mut Connection, input: &Value, user_id: Option<i64>) -> ApiR
     result
 }
 
+fn interorg_identity(conn: &Connection, input: &Value) -> ApiResult {
+    let ws = i64v(input, "workspaceId").unwrap_or_else(|| ws_fallback(conn));
+    Ok(crate::interorg::identity(conn, ws)
+        .map_err(|error| ApiError::internal(error.to_string()))?
+        .unwrap_or(Value::Null))
+}
+
+fn interorg_ensure_identity(
+    conn: &mut Connection,
+    input: &Value,
+    user_id: Option<i64>,
+) -> ApiResult {
+    let uid = require_user(conn, user_id)?;
+    let ws = i64v(input, "workspaceId").unwrap_or_else(|| ws_fallback(conn));
+    require_can_in_workspace(conn, uid, ws, "manageWorkspaces")?;
+    if let Some(existing) = crate::interorg::identity(conn, ws)
+        .map_err(|error| ApiError::internal(error.to_string()))?
+    {
+        return Ok(existing);
+    }
+    atomic(conn, |tx| {
+        let identity = crate::interorg::ensure_identity(tx, ws)
+            .map_err(|error| ApiError::internal(error.to_string()))?;
+        ledger::append(
+            tx,
+            ws,
+            uid,
+            None,
+            "interorg_identity_create",
+            identity.get("destination").and_then(Value::as_str),
+            identity.get("publicKey").and_then(Value::as_str),
+            None,
+            Some("Опубликован межорганизационный адрес"),
+        )
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+        Ok(identity)
+    })
+}
+
+fn interorg_contacts(conn: &Connection, input: &Value) -> ApiResult {
+    let ws = i64v(input, "workspaceId").unwrap_or_else(|| ws_fallback(conn));
+    crate::interorg::list_contacts(conn, ws).map_err(|error| ApiError::internal(error.to_string()))
+}
+
+fn interorg_trust_contact(conn: &mut Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
+    let uid = require_user(conn, user_id)?;
+    let ws = i64v(input, "workspaceId").unwrap_or_else(|| ws_fallback(conn));
+    require_can_in_workspace(conn, uid, ws, "manageWorkspaces")?;
+    let name = s(input, "name").ok_or_else(|| ApiError::bad("name"))?;
+    let remote =
+        s(input, "remoteWorkspaceGuid").ok_or_else(|| ApiError::bad("remoteWorkspaceGuid"))?;
+    let encryption = s(input, "encryptionKey").ok_or_else(|| ApiError::bad("encryptionKey"))?;
+    let signing = s(input, "signingKey").ok_or_else(|| ApiError::bad("signingKey"))?;
+    atomic(conn, |tx| {
+        let contact = crate::interorg::trust_contact(tx, ws, &name, &remote, &encryption, &signing)
+            .map_err(|error| ApiError::bad(error.to_string()))?;
+        ledger::append(
+            tx,
+            ws,
+            uid,
+            None,
+            "interorg_contact_trust",
+            Some(&remote),
+            contact.get("destination").and_then(Value::as_str),
+            None,
+            Some(&name),
+        )
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+        Ok(contact)
+    })
+}
+
+fn interorg_inbox(conn: &Connection, input: &Value) -> ApiResult {
+    let ws = i64v(input, "workspaceId").unwrap_or_else(|| ws_fallback(conn));
+    crate::interorg::receive_local(conn, crate::interorg_work_bits())
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    crate::interorg::inbox(conn, ws).map_err(|error| ApiError::internal(error.to_string()))
+}
+
+fn interorg_send(conn: &mut Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
+    let uid = require_user(conn, user_id)?;
+    let ws = i64v(input, "workspaceId").unwrap_or_else(|| ws_fallback(conn));
+    require_can_in_workspace(conn, uid, ws, "manageWorkspaces")?;
+    let contact = s(input, "contactGuid").ok_or_else(|| ApiError::bad("contactGuid"))?;
+    let kind = s(input, "kind").ok_or_else(|| ApiError::bad("kind"))?;
+    let transaction_id = s(input, "transactionId").ok_or_else(|| ApiError::bad("transactionId"))?;
+    let body = input.get("body").cloned().unwrap_or(Value::Null);
+    let serialized = serde_json::to_vec(&body).map_err(|error| ApiError::bad(error.to_string()))?;
+    if serialized.len() > 48 * 1024 {
+        return Err(ApiError::bad(
+            "Межорганизационная транзакция слишком большая",
+        ));
+    }
+    atomic(conn, |tx| {
+        let envelope = crate::interorg::send_to_contact(
+            tx,
+            ws,
+            &contact,
+            &kind,
+            &transaction_id,
+            body,
+            crate::interorg_work_bits(),
+        )
+        .map_err(|error| ApiError::bad(error.to_string()))?;
+        let event = ledger::append(
+            tx,
+            ws,
+            uid,
+            None,
+            "interorg_send",
+            Some(&contact),
+            Some(&envelope.id),
+            None,
+            Some(&kind),
+        )
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+        Ok(json!({
+            "ok":true,"envelopeId":envelope.id,"transactionId":transaction_id,
+            "destination":envelope.destination,"ledgerHash":event["opId"],"queued":true
+        }))
+    })
+}
+
+fn interorg_accept(conn: &mut Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
+    let uid = require_user(conn, user_id)?;
+    let ws = i64v(input, "workspaceId").unwrap_or_else(|| ws_fallback(conn));
+    require_can_in_workspace(conn, uid, ws, "manageWorkspaces")?;
+    let envelope_id = s(input, "envelopeId").ok_or_else(|| ApiError::bad("envelopeId"))?;
+    atomic(conn, |tx| {
+        let row: Option<(String, String, bool)> = tx
+            .query_row(
+                "SELECT transaction_id,kind,accepted FROM interorg_inbox WHERE envelope_id=?1 AND workspace_id=?2",
+                params![envelope_id, ws],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        let Some((transaction_id, kind, accepted)) = row else {
+            return Err(ApiError::not_found("Входящая транзакция не найдена"));
+        };
+        if accepted {
+            return Ok(
+                json!({"ok":true,"duplicate":true,"envelopeId":envelope_id,"transactionId":transaction_id}),
+            );
+        }
+        let event = ledger::append(
+            tx,
+            ws,
+            uid,
+            None,
+            "interorg_accept",
+            Some(&envelope_id),
+            Some(&transaction_id),
+            None,
+            Some(&kind),
+        )
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+        tx.execute(
+            "UPDATE interorg_inbox SET accepted=1 WHERE envelope_id=?1 AND workspace_id=?2",
+            params![envelope_id, ws],
+        )?;
+        Ok(
+            json!({"ok":true,"envelopeId":envelope_id,"transactionId":transaction_id,"ledgerHash":event["opId"]}),
+        )
+    })
+}
+
 fn backup_export(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
     let uid = require_user(conn, user_id)?;
     require_can(conn, uid, "manageWorkspaces")?;
@@ -8449,6 +8627,102 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error.http, 403);
+        cleanup(conn, path);
+    }
+
+    #[test]
+    fn interorg_directory_and_send_are_workspace_scoped_and_ledger_bound() {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        use ed25519_dalek::SigningKey;
+        use rand::rngs::OsRng;
+        use x25519_dalek::{PublicKey, StaticSecret};
+
+        let (mut conn, path, users, ws) = test_db();
+        let denied = dispatch(
+            &mut conn,
+            "interorg.ensureIdentity",
+            &json!({"workspaceId":ws}),
+            Some(users[1]),
+        )
+        .unwrap_err();
+        assert_eq!(denied.http, 403);
+
+        let identity = dispatch(
+            &mut conn,
+            "interorg.ensureIdentity",
+            &json!({"workspaceId":ws}),
+            Some(users[0]),
+        )
+        .unwrap();
+        assert_eq!(identity["destination"].as_str().unwrap().len(), 64);
+        let remote_secret = StaticSecret::random_from_rng(OsRng);
+        let remote_public = PublicKey::from(&remote_secret);
+        let remote_signer = SigningKey::generate(&mut OsRng);
+        let contact = dispatch(
+            &mut conn,
+            "interorg.trustContact",
+            &json!({
+                "workspaceId":ws,"name":"Поставщик Б","remoteWorkspaceGuid":"org-b",
+                "encryptionKey":STANDARD.encode(remote_public.as_bytes()),
+                "signingKey":STANDARD.encode(remote_signer.verifying_key().as_bytes())
+            }),
+            Some(users[0]),
+        )
+        .unwrap();
+        let transaction_id = Uuid::new_v4().to_string();
+        let sent = dispatch(
+            &mut conn,
+            "interorg.send",
+            &json!({
+                "workspaceId":ws,"contactGuid":contact["guid"],"kind":"invoice.offer",
+                "transactionId":transaction_id,"body":{"amount":17,"currency":"BIT"}
+            }),
+            Some(users[0]),
+        )
+        .unwrap();
+        assert_eq!(sent["queued"], true);
+        assert!(sent["ledgerHash"]
+            .as_str()
+            .is_some_and(|hash| hash.len() == 64));
+        let incoming_id = Uuid::new_v4().to_string();
+        conn.execute(
+            "INSERT INTO interorg_inbox(envelope_id,workspace_id,contact_guid,transaction_id,kind,body_json,received_at) VALUES(?1,?2,?3,?4,'invoice.offer','{}',?5)",
+            params![incoming_id, ws, contact["guid"].as_str().unwrap(), Uuid::new_v4().to_string(), now()],
+        )
+        .unwrap();
+        let accepted = dispatch(
+            &mut conn,
+            "interorg.accept",
+            &json!({"workspaceId":ws,"envelopeId":incoming_id}),
+            Some(users[0]),
+        )
+        .unwrap();
+        assert!(accepted["ledgerHash"].as_str().is_some());
+        let duplicate = dispatch(
+            &mut conn,
+            "interorg.accept",
+            &json!({"workspaceId":ws,"envelopeId":incoming_id}),
+            Some(users[0]),
+        )
+        .unwrap();
+        assert_eq!(duplicate["duplicate"], true);
+        let event_types: Vec<String> = conn
+            .prepare("SELECT type FROM history_entries WHERE workspace_id=?1 AND type LIKE 'interorg_%' ORDER BY id")
+            .unwrap()
+            .query_map([ws], |row| row.get(0))
+            .unwrap()
+            .flatten()
+            .collect();
+        assert_eq!(
+            event_types,
+            [
+                "interorg_identity_create",
+                "interorg_contact_trust",
+                "interorg_send",
+                "interorg_accept"
+            ]
+        );
+        assert!(crate::device::requires_signature("interorg.send"));
         cleanup(conn, path);
     }
 }

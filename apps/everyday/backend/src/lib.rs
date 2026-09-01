@@ -631,7 +631,7 @@ async fn sync_hello(State(state): State<Arc<AppState>>, headers: HeaderMap) -> i
     Json(sync::hello(&db)).into_response()
 }
 
-fn interorg_work_bits() -> u8 {
+pub(crate) fn interorg_work_bits() -> u8 {
     std::env::var("MESHKEEPER_INTERORG_POW_BITS")
         .ok()
         .and_then(|value| value.parse::<u8>().ok())
@@ -649,7 +649,12 @@ async fn interorg_envelope_post(
     let db = state.db.lock();
     match interorg::relay_store(&db, &envelope, interorg_work_bits()) {
         Ok(inserted) => {
-            (StatusCode::OK, Json(json!({"ok":true,"inserted":inserted}))).into_response()
+            let delivered = interorg::receive_local(&db, interorg_work_bits()).unwrap_or(0);
+            (
+                StatusCode::OK,
+                Json(json!({"ok":true,"inserted":inserted,"delivered":delivered})),
+            )
+                .into_response()
         }
         Err(error) => (
             StatusCode::BAD_REQUEST,
@@ -714,6 +719,7 @@ async fn interorg_relay_loop(state: Arc<AppState>, peers: Vec<String>) {
                                 let _ = interorg::relay_store(&db, &envelope, interorg_work_bits());
                             }
                         }
+                        let _ = interorg::receive_local(&db, interorg_work_bits());
                     }
                 }
             }

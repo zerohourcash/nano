@@ -258,6 +258,14 @@ capability, затем применяют только её scope. Неверн�
   через IP, BLE, Wi-Fi Direct, LoRa или ручной store-and-forward.
   Фоновый IP-gossip включается отдельным `MESHKEEPER_RELAY_PEERS`; эти связи не
   получают capability какой-либо организации и переносят только конверты.
+  Адрес gateway создаётся подписанной операцией `interorg.ensureIdentity`, а
+  X25519 secret в БД обёрнут AEAD-ключом, производным от node signing identity.
+  Контрагент добавляется только администратором через подписанный
+  `interorg.trustContact`; QR/визитка должна содержать одновременно GUID,
+  X25519 public key и Ed25519 signing key и подтверждаться по независимому
+  каналу. `interorg.send` ставит envelope в offline-очередь, `interorg.inbox`
+  показывает только расшифрованные сообщения доверенных контрагентов,
+  `interorg.accept` идемпотентно создаёт отдельный Ledger-факт принятия.
 - Android Share receiver принимает только `content://`, потоково применяет лимит
   30 МБ и передаёт ciphertext в авторизованный frontend. Он не обладает API для
   прямой мутации SQLite; импорт сохраняет ACL и обязательный device proof.

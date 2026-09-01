@@ -108,6 +108,10 @@ pub fn requires_signature(procedure: &str) -> bool {
             | "bit.sale"
             | "bit.mint"
             | "knowledge.save"
+            | "interorg.ensureIdentity"
+            | "interorg.trustContact"
+            | "interorg.send"
+            | "interorg.accept"
             | "sync.importBundle"
             | "sync.approveNodeKey"
             | "sync.revokeNodeKey"
@@ -301,6 +305,7 @@ pub fn verify_request(
                 path,
                 "/api/trpc/items.addPhoto" | "/api/trpc/items.addDocument"
             )
+            || (path.starts_with("/api/trpc/interorg.") && body.len() <= 64 * 1024)
             || (path == "/api/trpc/knowledge.save" && is_compact_knowledge_intent(body))
             || (path == "/api/trpc/chat.send" && is_compact_chat_intent(body)))
         .then(|| String::from_utf8(body.to_vec()))

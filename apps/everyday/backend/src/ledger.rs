@@ -105,7 +105,7 @@ fn decode_signing_key(encoded: &str) -> anyhow::Result<SigningKey> {
     })?))
 }
 
-fn signing_key(conn: &Connection) -> anyhow::Result<SigningKey> {
+pub(crate) fn signing_key(conn: &Connection) -> anyhow::Result<SigningKey> {
     let external = std::env::var(EXTERNAL_KEY_ENV).ok();
     signing_key_with_external(conn, external.as_deref())
 }

@@ -226,6 +226,7 @@ revision DAG, явно показывают конфликт и детермин
 | Принимающий/mesh-узел | `MESHKEEPER_SYNC_TOKEN` |
 | Узел с постоянным peer | `MESHKEEPER_SYNC_TOKEN` + `MESHKEEPER_UPSTREAM` |
 | Несколько изолированных организаций | `MESHKEEPER_SYNC_CAPABILITIES` |
+| Непрозрачные relay-соседи между организациями | `MESHKEEPER_RELAY_PEERS` |
 | Самоорганизующаяся offline LAN | предыдущие + `MESHKEEPER_DISCOVERY_BIND` |
 | Полностью изолированный | ничего |
 
