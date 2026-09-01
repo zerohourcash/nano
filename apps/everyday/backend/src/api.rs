@@ -968,13 +968,17 @@ fn dispatch_inner(
         "sync.approveNodeKey" => {
             let uid = require_user(conn, user_id)?;
             let key = s(input, "publicKey").ok_or_else(|| ApiError::bad("publicKey"))?;
-            crate::sync::approve_node_key(conn, &key, s(input, "label").as_deref(), uid)
-                .map_err(|e| ApiError::bad(e.to_string()))?;
+            atomic(conn, |conn| {
+                crate::sync::approve_node_key(conn, &key, s(input, "label").as_deref(), uid)
+                    .map_err(|e| ApiError::bad(e.to_string()))
+            })?;
             Ok(crate::sync::node_keys(conn))
         }
         "sync.revokeNodeKey" => {
             let key = s(input, "publicKey").ok_or_else(|| ApiError::bad("publicKey"))?;
-            crate::sync::revoke_node_key(conn, &key).map_err(|e| ApiError::bad(e.to_string()))?;
+            atomic(conn, |conn| {
+                crate::sync::revoke_node_key(conn, &key).map_err(|e| ApiError::bad(e.to_string()))
+            })?;
             Ok(crate::sync::node_keys(conn))
         }
         "content.status" => Ok(crate::content::status(conn)),

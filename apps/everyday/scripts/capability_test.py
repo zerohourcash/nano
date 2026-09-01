@@ -196,6 +196,13 @@ def main() -> int:
         with sqlite3.connect(peer_a.db) as db_a, sqlite3.connect(peer_b.db) as db_b:
             check("на каждом peer ровно один workspace", db_a.execute("SELECT count(*) FROM workspaces").fetchone()[0] == 1
                   and db_b.execute("SELECT count(*) FROM workspaces").fetchone()[0] == 1)
+            qr_scopes_a = {row[0] for row in db_a.execute(
+                "SELECT workspace_guid FROM trusted_node_key_workspaces")}
+            qr_scopes_b = {row[0] for row in db_b.execute(
+                "SELECT workspace_guid FROM trusted_node_key_workspaces")}
+            check("доверие QR-ключу ограничено своей организацией",
+                  qr_scopes_a == {first["guid"]} and qr_scopes_b == {second["guid"]},
+                  f"A={qr_scopes_a} B={qr_scopes_b}")
             blobs_a = {row[0] for row in db_a.execute("SELECT hash FROM content_blobs")}
             blobs_b = {row[0] for row in db_b.execute("SELECT hash FROM content_blobs")}
             check("full peer получает свой chat CAS и не получает чужой",

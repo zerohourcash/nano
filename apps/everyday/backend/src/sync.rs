@@ -3731,6 +3731,10 @@ pub fn apply_remote_journal(conn: &Connection, journal: &Value, peer_url: &str) 
         let _ = conn.execute_batch("ROLLBACK TO verified_sync; RELEASE verified_sync");
         return json!({"ok":false,"error":format!("Не удалось сохранить anti-rollback квитанцию: {error}")});
     }
+    if let Err(error) = store_node_workspace_trust(conn, journal, &receipt.public_key) {
+        let _ = conn.execute_batch("ROLLBACK TO verified_sync; RELEASE verified_sync");
+        return json!({"ok":false,"error":format!("Не удалось ограничить доверие ключа организацией: {error}")});
+    }
     if let Err(error) = conn.execute_batch("RELEASE verified_sync") {
         return json!({"ok":false,"error":error.to_string()});
     }
@@ -7450,6 +7454,80 @@ fn store_journal_receipt(conn: &Connection, receipt: &JournalReceipt) -> anyhow:
     Ok(())
 }
 
+fn store_node_workspace_trust(
+    conn: &Connection,
+    journal: &Value,
+    public_key: &str,
+) -> anyhow::Result<usize> {
+    let mut stored = 0;
+    for workspace in journal
+        .get("workspaces")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let Some(guid) = workspace.get("guid").and_then(Value::as_str) else {
+            continue;
+        };
+        if guid.is_empty() || guid.len() > 128 {
+            anyhow::bail!("некорректная область доверия ключа");
+        }
+        stored += store_node_workspace_scope(conn, public_key, guid)?;
+    }
+    for event in journal
+        .get("history")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let (Some(key), Some(guid)) = (
+            event.get("pubkey").and_then(Value::as_str),
+            event.get("workspaceGuid").and_then(Value::as_str),
+        ) else {
+            continue;
+        };
+        if key.is_empty() || key.len() > 256 || guid.is_empty() || guid.len() > 128 {
+            anyhow::bail!("некорректный Ledger signer scope");
+        }
+        conn.execute(
+            "INSERT OR IGNORE INTO trusted_node_keys(public_key,label,source,created_at)
+             SELECT ?1,'Ключ из проверенной летописи','verified-workspace-ledger',?2
+             WHERE NOT EXISTS (SELECT 1 FROM revoked_node_keys WHERE public_key=?1)",
+            params![key, chrono::Utc::now().to_rfc3339()],
+        )?;
+        stored += store_node_workspace_scope(conn, key, guid)?;
+    }
+    Ok(stored)
+}
+
+fn store_node_workspace_scope(
+    conn: &Connection,
+    public_key: &str,
+    workspace_guid: &str,
+) -> anyhow::Result<usize> {
+    let revoked: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM revoked_node_keys WHERE public_key=?1",
+        [public_key],
+        |row| row.get(0),
+    )?;
+    if revoked != 0 {
+        return Ok(0);
+    }
+    let exists: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM workspaces WHERE guid=?1",
+        [workspace_guid],
+        |row| row.get(0),
+    )?;
+    if exists != 1 {
+        anyhow::bail!("область доверия ключа не импортирована");
+    }
+    Ok(conn.execute(
+        "INSERT OR IGNORE INTO trusted_node_key_workspaces(public_key,workspace_guid,first_verified_at)
+         VALUES(?1,?2,?3)",
+        params![public_key, workspace_guid, chrono::Utc::now().to_rfc3339()],
+    )?)
+}
+
 fn enforce_node_trust(conn: &Connection, journal: &Value, peer_url: &str) -> anyhow::Result<()> {
     enforce_node_trust_mode(conn, journal, peer_url, strict_node_trust())
 }
@@ -7473,7 +7551,8 @@ fn enforce_node_trust_mode(
         .ok_or_else(|| anyhow::anyhow!("нет публичного ключа"))?;
     if conn
         .query_row(
-            "SELECT 1 FROM trusted_node_keys WHERE public_key=?1",
+            "SELECT 1 FROM trusted_node_keys
+             WHERE public_key=?1 AND source IN ('local','bootstrap','approved')",
             [key],
             |_| Ok(()),
         )
@@ -7498,10 +7577,12 @@ fn enforce_node_trust_mode(
 
 pub fn node_keys(conn: &Connection) -> Value {
     let mut trusted = Vec::new();
-    if let Ok(mut s)=conn.prepare("SELECT public_key,label,approved_by,source,created_at FROM trusted_node_keys ORDER BY created_at") {if let Ok(rows)=s.query_map([],|r|Ok(json!({"publicKey":r.get::<_,String>(0)?,"label":r.get::<_,Option<String>>(1)?,"approvedBy":r.get::<_,Option<i64>>(2)?,"source":r.get::<_,String>(3)?,"createdAt":r.get::<_,String>(4)?}))){trusted.extend(rows.flatten())}}
+    if let Ok(mut s)=conn.prepare("SELECT k.public_key,k.label,k.approved_by,k.source,k.created_at,COALESCE((SELECT json_group_array(workspace_guid) FROM trusted_node_key_workspaces WHERE public_key=k.public_key),'[]') FROM trusted_node_keys k ORDER BY k.created_at") {if let Ok(rows)=s.query_map([],|r|Ok(json!({"publicKey":r.get::<_,String>(0)?,"label":r.get::<_,Option<String>>(1)?,"approvedBy":r.get::<_,Option<i64>>(2)?,"source":r.get::<_,String>(3)?,"createdAt":r.get::<_,String>(4)?,"workspaceGuids":serde_json::from_str::<Value>(&r.get::<_,String>(5)?).unwrap_or_else(|_|json!([]))}))){trusted.extend(rows.flatten())}}
     let mut pending = Vec::new();
     if let Ok(mut s)=conn.prepare("SELECT public_key,peer_url,node_name,first_seen,last_seen FROM pending_node_keys ORDER BY last_seen DESC") {if let Ok(rows)=s.query_map([],|r|Ok(json!({"publicKey":r.get::<_,String>(0)?,"peerUrl":r.get::<_,Option<String>>(1)?,"nodeName":r.get::<_,Option<String>>(2)?,"firstSeen":r.get::<_,String>(3)?,"lastSeen":r.get::<_,String>(4)?}))){pending.extend(rows.flatten())}}
-    json!({"strict":strict_node_trust(),"trusted":trusted,"pending":pending})
+    let mut revoked = Vec::new();
+    if let Ok(mut s)=conn.prepare("SELECT public_key,revoked_at FROM revoked_node_keys ORDER BY revoked_at DESC") {if let Ok(rows)=s.query_map([],|r|Ok(json!({"publicKey":r.get::<_,String>(0)?,"revokedAt":r.get::<_,String>(1)?}))){revoked.extend(rows.flatten())}}
+    json!({"strict":strict_node_trust(),"trusted":trusted,"pending":pending,"revoked":revoked})
 }
 
 pub fn approve_node_key(
@@ -7518,19 +7599,33 @@ pub fn approve_node_key(
     if pending != 1 {
         anyhow::bail!("ключ отсутствует в ожидающих")
     }
-    conn.execute("INSERT INTO trusted_node_keys(public_key,label,approved_by,source,created_at) VALUES(?1,?2,?3,'approved',?4) ON CONFLICT(public_key) DO NOTHING",params![key,label,actor,chrono::Utc::now().to_rfc3339()])?;
+    conn.execute("DELETE FROM revoked_node_keys WHERE public_key=?1", [key])?;
+    conn.execute("INSERT INTO trusted_node_keys(public_key,label,approved_by,source,created_at) VALUES(?1,?2,?3,'approved',?4)
+                  ON CONFLICT(public_key) DO UPDATE SET label=excluded.label,approved_by=excluded.approved_by,source='approved'",params![key,label,actor,chrono::Utc::now().to_rfc3339()])?;
     conn.execute("DELETE FROM pending_node_keys WHERE public_key=?1", [key])?;
     Ok(())
 }
 
 pub fn revoke_node_key(conn: &Connection, key: &str) -> anyhow::Result<()> {
-    let changed = conn.execute(
-        "DELETE FROM trusted_node_keys WHERE public_key=?1 AND source!='local'",
-        [key],
-    )?;
-    if changed != 1 {
+    let source: Option<String> = conn
+        .query_row(
+            "SELECT source FROM trusted_node_keys WHERE public_key=?1",
+            [key],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if source.as_deref().is_none_or(|source| source == "local") {
         anyhow::bail!("локальный или неизвестный ключ нельзя отозвать")
     }
+    conn.execute(
+        "INSERT OR REPLACE INTO revoked_node_keys(public_key,revoked_at) VALUES(?1,?2)",
+        params![key, chrono::Utc::now().to_rfc3339()],
+    )?;
+    conn.execute("DELETE FROM trusted_node_keys WHERE public_key=?1", [key])?;
+    conn.execute(
+        "DELETE FROM trusted_node_key_workspaces WHERE public_key=?1",
+        [key],
+    )?;
     Ok(())
 }
 
@@ -9458,6 +9553,18 @@ mod tests {
         assert_eq!(first["v"], 2);
         assert_eq!(first["journalSequence"], 1);
         assert_eq!(apply_remote_journal(&target, &first, "")["ok"], true);
+        let source_key = first["journalPublicKey"].as_str().unwrap();
+        assert_eq!(
+            target
+                .query_row(
+                    "SELECT COUNT(*) FROM trusted_node_key_workspaces WHERE public_key=?1 AND workspace_guid='sequence-workspace'",
+                    [source_key],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1,
+            "accepted node key must be scoped to the verified organization"
+        );
 
         source
             .execute(
@@ -9509,6 +9616,54 @@ mod tests {
             .unwrap();
         assert_eq!(receipt.0, 2);
         assert_eq!(receipt.1, second["journalHash"]);
+        revoke_node_key(&target, source_key).unwrap();
+        assert_eq!(
+            target
+                .query_row(
+                    "SELECT COUNT(*) FROM trusted_node_key_workspaces WHERE public_key=?1",
+                    [source_key],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0,
+            "revocation must remove every tenant-scoped QR authorization"
+        );
+
+        drop(target);
+        let target = crate::db::open(&target_path).unwrap();
+        assert_eq!(
+            target
+                .query_row(
+                    "SELECT COUNT(*) FROM revoked_node_keys WHERE public_key=?1",
+                    [source_key],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1,
+            "revocation tombstone must survive a database restart"
+        );
+        assert_eq!(
+            target
+                .query_row(
+                    "SELECT COUNT(*) FROM trusted_node_keys WHERE public_key=?1",
+                    [source_key],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0,
+            "migration backfill must not resurrect a revoked signer"
+        );
+        assert_eq!(
+            target
+                .query_row(
+                    "SELECT COUNT(*) FROM trusted_node_key_workspaces WHERE public_key=?1",
+                    [source_key],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0,
+            "migration backfill must not restore a revoked tenant scope"
+        );
 
         drop((source, target));
         for path in [source_path, target_path] {
@@ -10862,9 +11017,12 @@ mod tests {
             std::env::temp_dir().join(format!("item-state-target-{}.db", uuid::Uuid::new_v4()));
         let rejected_path =
             std::env::temp_dir().join(format!("item-state-rejected-{}.db", uuid::Uuid::new_v4()));
+        let downstream_path =
+            std::env::temp_dir().join(format!("item-state-downstream-{}.db", uuid::Uuid::new_v4()));
         let mut source = crate::db::open(&source_path).unwrap();
         let mut target = crate::db::open(&target_path).unwrap();
         let rejected = crate::db::open(&rejected_path).unwrap();
+        let downstream = crate::db::open(&downstream_path).unwrap();
         let created = chrono::Utc::now().to_rfc3339();
         source.execute("INSERT INTO workspaces(name,internal_id_prefix,created_at,guid) VALUES('Item org','I-',?1,'00000000-0000-4000-8000-000000000088')",[&created]).unwrap();
         let workspace = source.last_insert_rowid();
@@ -10895,7 +11053,7 @@ mod tests {
         crate::api::dispatch(
             &mut source,
             "transfers.take",
-            &json!({"itemId":created_item["id"],"qrLabel":checkout_qr,"quantity":4}),
+            &json!({"itemId":created_item["id"],"qrLabel":checkout_qr.clone(),"quantity":4}),
             Some(owner),
         )
         .unwrap();
@@ -10911,6 +11069,19 @@ mod tests {
             "Signed drill"
         );
         assert_eq!(target.query_row("SELECT COALESCE(sum(h.quantity),0) FROM item_holdings h JOIN items i ON i.id=h.item_id WHERE i.guid=?1 AND h.returned_at IS NULL",[&item_guid],|r|r.get::<_,f64>(0)).unwrap(),4.0);
+        let relayed = export_journal(&target);
+        let relayed_result = apply_remote_journal(&downstream, &relayed, "");
+        assert_eq!(relayed_result["ok"], true, "{relayed_result}");
+        if let Err(error) = crate::qr_label::verify(&downstream, &checkout_qr) {
+            let scopes: Vec<(String, String, String)> = downstream
+                .prepare("SELECT k.public_key,s.workspace_guid,k.source FROM trusted_node_keys k JOIN trusted_node_key_workspaces s ON s.public_key=k.public_key")
+                .unwrap()
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+                .unwrap()
+                .flatten()
+                .collect();
+            panic!("a physical label signed by the origin must remain valid after a multi-hop relay: {error}; scopes={scopes:?}");
+        }
         let repeated = apply_remote_journal(&target, &export_journal(&source), "");
         assert_eq!(repeated["ok"], true, "{repeated}");
         assert_eq!(target.query_row("SELECT COALESCE(sum(h.quantity),0) FROM item_holdings h JOIN items i ON i.id=h.item_id WHERE i.guid=?1 AND h.returned_at IS NULL",[&item_guid],|r|r.get::<_,f64>(0)).unwrap(),4.0);
@@ -11002,8 +11173,8 @@ mod tests {
                 .unwrap(),
             0
         );
-        drop((source, target, rejected));
-        for path in [source_path, target_path, rejected_path] {
+        drop((source, target, rejected, downstream));
+        for path in [source_path, target_path, rejected_path, downstream_path] {
             let _ = std::fs::remove_file(path);
         }
     }

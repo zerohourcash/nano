@@ -216,6 +216,14 @@ fn migrate(conn: &Connection) -> Result<()> {
            public_key TEXT PRIMARY KEY, peer_url TEXT, node_name TEXT,
            first_seen TEXT NOT NULL, last_seen TEXT NOT NULL
          );
+         CREATE TABLE IF NOT EXISTS trusted_node_key_workspaces(
+           public_key TEXT NOT NULL, workspace_guid TEXT NOT NULL,
+           first_verified_at TEXT NOT NULL,
+           PRIMARY KEY(public_key,workspace_guid)
+         );
+         CREATE TABLE IF NOT EXISTS revoked_node_keys(
+           public_key TEXT PRIMARY KEY, revoked_at TEXT NOT NULL
+         );
          CREATE TABLE IF NOT EXISTS accepted_node_journals(
            public_key TEXT NOT NULL,
            scope TEXT NOT NULL,
@@ -687,6 +695,22 @@ fn migrate(conn: &Connection) -> Result<()> {
         );
         "#,
     );
+    let migrated_at = chrono::Utc::now().to_rfc3339();
+    conn.execute(
+        "INSERT OR IGNORE INTO trusted_node_keys(public_key,label,source,created_at)
+         SELECT DISTINCT h.pubkey,'Ключ из сохранённой летописи','verified-workspace-ledger',?1
+         FROM history_entries h WHERE h.pubkey IS NOT NULL AND h.signature IS NOT NULL
+           AND NOT EXISTS (SELECT 1 FROM revoked_node_keys r WHERE r.public_key=h.pubkey)",
+        [&migrated_at],
+    )?;
+    conn.execute(
+        "INSERT OR IGNORE INTO trusted_node_key_workspaces(public_key,workspace_guid,first_verified_at)
+         SELECT DISTINCT h.pubkey,w.guid,?1 FROM history_entries h
+         JOIN workspaces w ON w.id=h.workspace_id
+         WHERE h.pubkey IS NOT NULL AND h.signature IS NOT NULL AND w.guid IS NOT NULL
+           AND NOT EXISTS (SELECT 1 FROM revoked_node_keys r WHERE r.public_key=h.pubkey)",
+        [&migrated_at],
+    )?;
     Ok(())
 }
 

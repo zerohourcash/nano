@@ -116,12 +116,17 @@ pub fn verify(conn: &Connection, label: &str) -> Result<VerifiedLabel> {
         .context("invalid signed QR signature")?;
 
     let local_key = decode_public_key(&crate::ledger::node_public_key(conn)?)?;
-    let mut trusted = conn.prepare("SELECT public_key FROM trusted_node_keys")?;
+    let canonical_public_key = STANDARD_NO_PAD.encode(public_key);
     let trusted = public_key == local_key
-        || trusted
-            .query_map([], |row| row.get::<_, String>(0))?
-            .flatten()
-            .any(|candidate| decode_public_key(&candidate).is_ok_and(|key| key == public_key));
+        || conn
+            .query_row(
+                "SELECT 1 FROM trusted_node_keys k
+                 JOIN trusted_node_key_workspaces s ON s.public_key=k.public_key
+                 WHERE k.public_key=?1 AND s.workspace_guid=?2",
+                params![canonical_public_key, payload.workspace_guid],
+                |_| Ok(()),
+            )
+            .is_ok();
     if !trusted {
         bail!("QR label signer is not a trusted node")
     }
@@ -159,10 +164,13 @@ mod tests {
         db.execute_batch(
             "CREATE TABLE kv(k TEXT PRIMARY KEY,v TEXT NOT NULL);
              CREATE TABLE trusted_node_keys(public_key TEXT PRIMARY KEY,label TEXT,approved_by INTEGER,source TEXT,created_at TEXT);
+             CREATE TABLE trusted_node_key_workspaces(public_key TEXT NOT NULL,workspace_guid TEXT NOT NULL,first_verified_at TEXT NOT NULL,PRIMARY KEY(public_key,workspace_guid));
              CREATE TABLE workspaces(id INTEGER PRIMARY KEY,guid TEXT NOT NULL);
              CREATE TABLE items(id INTEGER PRIMARY KEY,workspace_id INTEGER NOT NULL,guid TEXT NOT NULL,internal_id TEXT NOT NULL,archived INTEGER NOT NULL DEFAULT 0);
              INSERT INTO workspaces VALUES(1,'00000000-0000-4000-8000-000000000001');
-             INSERT INTO items VALUES(1,1,'00000000-0000-4000-8000-000000000002','TOOL-1',0);",
+             INSERT INTO workspaces VALUES(2,'00000000-0000-4000-8000-000000000003');
+             INSERT INTO items VALUES(1,1,'00000000-0000-4000-8000-000000000002','TOOL-1',0);
+             INSERT INTO items VALUES(2,2,'00000000-0000-4000-8000-000000000004','TOOL-2',0);",
         )
         .unwrap();
         let public = crate::ledger::node_public_key(&db).unwrap();
@@ -179,20 +187,45 @@ mod tests {
         let issuer = inventory_db();
         let verifier = inventory_db();
         let label = issue(&issuer, 1).unwrap();
+        let other_workspace_label = issue(&issuer, 2).unwrap();
         assert!(verify(&issuer, &label).is_ok());
         assert!(verify(&verifier, &label)
             .unwrap_err()
             .to_string()
             .contains("not a trusted node"));
 
-        let issuer_key = crate::ledger::node_public_key(&issuer).unwrap();
+        let payload_raw = label
+            .strip_prefix(PREFIX)
+            .unwrap()
+            .split_once('.')
+            .unwrap()
+            .0;
+        let issuer_payload_key =
+            serde_json::from_slice::<LabelPayload>(&URL_SAFE_NO_PAD.decode(payload_raw).unwrap())
+                .unwrap()
+                .public_key;
+        let issuer_key = STANDARD_NO_PAD.encode(decode_public_key(&issuer_payload_key).unwrap());
         verifier
             .execute(
                 "INSERT INTO trusted_node_keys(public_key,source,created_at) VALUES(?1,'approved',?2)",
                 params![issuer_key, Utc::now().to_rfc3339()],
             )
             .unwrap();
+        assert!(verify(&verifier, &label)
+            .unwrap_err()
+            .to_string()
+            .contains("not a trusted node"));
+        verifier
+            .execute(
+                "INSERT INTO trusted_node_key_workspaces(public_key,workspace_guid,first_verified_at) VALUES(?1,'00000000-0000-4000-8000-000000000001',?2)",
+                params![issuer_key, Utc::now().to_rfc3339()],
+            )
+            .unwrap();
         assert!(verify(&verifier, &label).is_ok());
+        assert!(verify(&verifier, &other_workspace_label)
+            .unwrap_err()
+            .to_string()
+            .contains("not a trusted node"));
         verifier
             .execute("UPDATE items SET internal_id='OTHER' WHERE id=1", [])
             .unwrap();
