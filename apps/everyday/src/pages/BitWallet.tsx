@@ -108,7 +108,7 @@ export default function BitWallet() {
           </div>
           <label className="mt-4 block text-sm font-semibold text-ink-900">
             {mode === 'sale' ? 'Продавец' : 'Получатель'}
-            <select aria-label={mode === 'sale' ? 'Продавец' : 'Получатель Bit'} value={recipientId} onChange={(event) => setRecipientId(event.target.value)} className="mt-1.5 h-11 w-full rounded-xl border border-brand-100 bg-white px-3 font-normal">
+            <select aria-label={mode === 'sale' ? 'Продавец' : 'Получатель Bit'} value={recipientId} onChange={(event) => { setRecipientId(event.target.value); if (mode === 'sale') setItemId('') }} className="mt-1.5 h-11 w-full rounded-xl border border-brand-100 bg-white px-3 font-normal">
               <option value="">Выберите участника</option>
               {recipients.filter((user) => mode === 'mint' || user.id !== currentUser?.id).map((user) => <option key={user.id} value={user.id}>{user.fullName}{user.position ? ` · ${user.position}` : ''}</option>)}
             </select>
@@ -117,7 +117,7 @@ export default function BitWallet() {
             <label className="mt-3 block text-sm font-semibold text-ink-900">Товар / ТМЦ
               <select aria-label="Товар или ТМЦ" value={itemId} onChange={(event) => setItemId(event.target.value)} className="mt-1.5 h-11 w-full rounded-xl border border-brand-100 bg-white px-3 font-normal">
                 <option value="">Выберите позицию</option>
-                {(itemsQ.data?.rows ?? []).map((item) => <option key={item.id} value={item.id}>{item.internalId} · {item.title}</option>)}
+                {(itemsQ.data?.rows ?? []).filter((item) => item.responsibleUserId === Number(recipientId)).map((item) => <option key={item.id} value={item.id}>{item.internalId} · {item.title}</option>)}
               </select>
             </label>
           )}

@@ -4503,6 +4503,23 @@ fn bit_sale(conn: &mut Connection, input: &Value, user_id: Option<i64>) -> ApiRe
             .as_i64()
             .ok_or_else(|| ApiError::bad("У товара нет организации"))?;
         let seller = i64v(input, "sellerUserId").ok_or_else(|| ApiError::bad("sellerUserId"))?;
+        require_member(conn, seller, ws)
+            .map_err(|_| ApiError::bad("Продавец не состоит в организации"))?;
+        let seller_active = conn
+            .query_row(
+                "SELECT status='active' FROM users WHERE id=?1",
+                [seller],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap_or(false);
+        if !seller_active {
+            return Err(ApiError::conflict("Учётная запись продавца не активна"));
+        }
+        if item["responsibleUserId"].as_i64() != Some(seller) {
+            return Err(ApiError::conflict(
+                "Продажа отклонена: продавец не является ответственным за этот ТМЦ",
+            ));
+        }
         let amount = i64v(input, "amount")
             .ok_or_else(|| ApiError::bad("amount должен быть целым числом Bit"))?;
         let item_guid = item["guid"]
@@ -8985,7 +9002,7 @@ mod tests {
             bit_balance(&conn, &json!({"workspaceId":ws}), Some(users[1])).unwrap()["balance"],
             40
         );
-        let item = insert_item(&conn, ws, None, false, None);
+        let item = insert_item(&conn, ws, Some(users[1]), false, None);
         let sale = dispatch(
             &mut conn,
             "bit.sale",
@@ -8994,6 +9011,27 @@ mod tests {
         )
         .unwrap();
         assert_eq!(sale["kind"], "sale");
+        let transactions_before_spoof: i64 = conn
+            .query_row("SELECT count(*) FROM accounting_transactions", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let spoofed_seller = dispatch(
+            &mut conn,
+            "bit.sale",
+            &json!({"itemId":item,"sellerUserId":users[2],"amount":1,"memo":"Подмена продавца"}),
+            Some(users[0]),
+        )
+        .unwrap_err();
+        assert_eq!(spoofed_seller.http, 409);
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM accounting_transactions", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+            transactions_before_spoof,
+            "подмена продавца не должна оставлять бухгалтерскую полупроводку"
+        );
         assert_eq!(
             bit_balance(&conn, &json!({"workspaceId":ws}), Some(users[0])).unwrap()["balance"],
             50

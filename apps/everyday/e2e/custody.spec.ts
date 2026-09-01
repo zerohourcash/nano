@@ -345,6 +345,12 @@ test('browser signs a real custody transaction and ledger retains its proof', as
     id: bitRecipient.id,
     status: 'active',
   });
+  const saleItem = await trpc<{ id: number }>(page, 'items.create', {
+    workspaceId: workspaces[0].id,
+    internalId: 'BIT-SALE-E2E',
+    title: 'Расходник для продажи Bit',
+    responsibleUserId: bitRecipient.id,
+  });
   const currentUser = await trpc<{ id: number }>(page, 'auth.me', null, false);
   await page.goto('/bit');
   await expect(page.getByRole('heading', { name: 'Кошелёк Bit' })).toBeVisible();
@@ -364,7 +370,16 @@ test('browser signs a real custody transaction and ledger retains its proof', as
 
   await page.getByRole('button', { name: 'Покупка' }).click();
   await page.getByLabel('Продавец').selectOption(String(bitRecipient.id));
-  await page.getByLabel('Товар или ТМЦ').selectOption(String(qrItem.id));
+  await expect(
+    trpc(page, 'bit.sale', {
+      itemId: saleItem.id,
+      sellerUserId: currentUser.id,
+      amount: 1,
+      memo: 'Попытка подменить продавца',
+    })
+  ).rejects.toThrow(/не является ответственным/);
+  await expect(page.getByTestId('bit-transaction')).toHaveCount(2);
+  await page.getByLabel('Товар или ТМЦ').selectOption(String(saleItem.id));
   await page.getByLabel('Сумма Bit').fill('10');
   await page.getByLabel('Назначение платежа').fill('Покупка расходника');
   await page.getByRole('button', { name: 'Подписать транзакцию' }).click();
