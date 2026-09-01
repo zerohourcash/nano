@@ -10,8 +10,8 @@ production HTTP/Chromium, offline sync, mesh/discovery, adversarial,
 multi-tenant capability, interorg AEAD, spam, constrained-MTU transport,
 mobile restart, SQLCipher, backup/restore, 100 отдельных процессов и Android
 APK. Debug APK содержит Rust JNI-ноду для `arm64-v8a` и `x86_64`, размер
-75 589 676 байт, SHA-256
-`02c21b9dea7a20b2d261d5bfec43eb3bd3acdc844f22bf3707c0a4bad61fa04e`.
+75 709 764 байта, SHA-256
+`271a7b310daafd4641a58eb3c1e9e0de6fd0ae6421f4b7b7d9164ed56c14110a`.
 Это воспроизводимое программное доказательство; BLE RF на двух физических
 телефонах и независимый криптографический аудит остаются внешними release-gate.
 Контур скачивания отдельно проверяет совпадение metadata/байтов/SHA-256 и
@@ -19,7 +19,9 @@ fail-closed запуск до создания базы при подменён�
 `npm run android:release:http:test`. Публичный Linux x86_64 архив также собран
 из проверенного desktop-каталога, повторно проходит SHA-256 при старте узла и
 доступен с экрана входа; его распакованный бинарник прошёл startup/health/UI
-smoke без Node.js и сети.
+smoke без Node.js и сети. Архив, пересобранный после security-коммита
+`acdfeb6`, имеет размер 28 073 520 байт и SHA-256
+`cffe9246cd13b40cee366156dfd9f89e234bc71c7712fedf06badb6915b9838e`.
 Публичный тестовый стенд использует отдельную демо-БД и явную связанную пару
 `DEMO_DATA+DEMO_LOGIN`: посетители выбирают разные роли на экране входа без
 API-токена. Неполная пара запрещена startup-тестом; production onboarding
