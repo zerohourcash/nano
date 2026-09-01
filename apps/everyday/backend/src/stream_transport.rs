@@ -18,6 +18,7 @@ pub const MAX_FRAMES: usize = 262_144;
 pub enum PayloadKind {
     EncryptedBundle = 1,
     CasObject = 2,
+    InterorgEnvelope = 3,
 }
 
 impl TryFrom<u8> for PayloadKind {
@@ -27,6 +28,7 @@ impl TryFrom<u8> for PayloadKind {
         match value {
             1 => Ok(Self::EncryptedBundle),
             2 => Ok(Self::CasObject),
+            3 => Ok(Self::InterorgEnvelope),
             _ => bail!("unknown stream payload kind"),
         }
     }
@@ -316,6 +318,22 @@ mod tests {
         let frames = fragment(PayloadKind::EncryptedBundle, b"", 96).unwrap();
         let completed = Assembler::default().accept(&frames[0]).unwrap().unwrap();
         assert!(completed.bytes.is_empty());
+    }
+
+    #[test]
+    fn interorg_envelope_survives_small_radio_frames() {
+        let payload = vec![0xA5; 4096];
+        let frames = fragment(PayloadKind::InterorgEnvelope, &payload, 128).unwrap();
+        let mut assembler = Assembler::default();
+        let mut completed = None;
+        for frame in frames.iter().rev() {
+            if let Some(value) = assembler.accept(frame).unwrap() {
+                completed = Some(value);
+            }
+        }
+        let completed = completed.unwrap();
+        assert_eq!(completed.kind, PayloadKind::InterorgEnvelope);
+        assert_eq!(completed.bytes, payload);
     }
 
     #[test]

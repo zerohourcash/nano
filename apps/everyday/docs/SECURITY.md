@@ -245,6 +245,19 @@ capability, затем применяют только её scope. Неверн�
   XChaCha20-Poly1305 с новым 192-битным nonce, фиксированным AAD и ключом
   HKDF-SHA256, доменно отделённым от bearer/CAS. Wrong-key и tampering
   отклоняются AEAD до разбора journal; затем отдельно проверяется Ed25519.
+- Между независимыми организациями передаётся не scoped journal, а отдельный
+  opaque envelope. Полезная нагрузка шифруется XChaCha20-Poly1305 на одноразовом
+  X25519 shared secret; HKDF-SHA256 привязывает ключ к адресу получателя, а
+  Ed25519 подписывает заголовок и ciphertext. Relay проверяет подпись, TTL,
+  размер, replay и proof-of-work, хранит не более 4096 живых конвертов и не
+  видит GUID организаций, вид транзакции или текст. Получатель дополнительно
+  сверяет свой workspace и ключ отправителя с локальным доверенным каталогом.
+  `POST /mesh/envelopes`, адресный `GET /mesh/envelopes/{destination}` и
+  ограниченный 128 элементами `GET /mesh/gossip` доступны на sync-only
+  listener; тот же ciphertext имеет отдельный MTU payload kind и может идти
+  через IP, BLE, Wi-Fi Direct, LoRa или ручной store-and-forward.
+  Фоновый IP-gossip включается отдельным `MESHKEEPER_RELAY_PEERS`; эти связи не
+  получают capability какой-либо организации и переносят только конверты.
 - Android Share receiver принимает только `content://`, потоково применяет лимит
   30 МБ и передаёт ciphertext в авторизованный frontend. Он не обладает API для
   прямой мутации SQLite; импорт сохраняет ACL и обязательный device proof.

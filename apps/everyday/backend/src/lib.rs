@@ -6,6 +6,7 @@ mod db;
 mod device;
 mod diagnostics;
 mod discovery;
+pub mod interorg;
 mod json;
 mod knowledge;
 mod ledger;
@@ -630,6 +631,104 @@ async fn sync_hello(State(state): State<Arc<AppState>>, headers: HeaderMap) -> i
     Json(sync::hello(&db)).into_response()
 }
 
+fn interorg_work_bits() -> u8 {
+    std::env::var("MESHKEEPER_INTERORG_POW_BITS")
+        .ok()
+        .and_then(|value| value.parse::<u8>().ok())
+        .filter(|bits| (8..=24).contains(bits))
+        .unwrap_or(18)
+}
+
+/// Public mesh ingress for opaque cross-organization envelopes. It has no
+/// organization capability by design: relays validate signature/PoW/TTL and
+/// retain only bounded ciphertext, while organization data stays encrypted.
+async fn interorg_envelope_post(
+    State(state): State<Arc<AppState>>,
+    Json(envelope): Json<interorg::Envelope>,
+) -> impl IntoResponse {
+    let db = state.db.lock();
+    match interorg::relay_store(&db, &envelope, interorg_work_bits()) {
+        Ok(inserted) => {
+            (StatusCode::OK, Json(json!({"ok":true,"inserted":inserted}))).into_response()
+        }
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"ok":false,"error":error.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+async fn interorg_envelopes_get(
+    State(state): State<Arc<AppState>>,
+    Path(destination): Path<String>,
+) -> impl IntoResponse {
+    let db = state.db.lock();
+    match interorg::pending_for(&db, &destination, 128) {
+        Ok(envelopes) => Json(json!({"envelopes":envelopes})).into_response(),
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error":error.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+async fn interorg_gossip_get(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let db = state.db.lock();
+    match interorg::gossip_batch(&db, 128) {
+        Ok(envelopes) => Json(json!({"envelopes":envelopes})).into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error":error.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+async fn interorg_relay_loop(state: Arc<AppState>, peers: Vec<String>) {
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(8))
+        .build()
+    {
+        Ok(client) => client,
+        Err(error) => {
+            eprintln!("Interorg relay client: {error}");
+            return;
+        }
+    };
+    loop {
+        let outgoing = {
+            let db = state.db.lock();
+            interorg::gossip_batch(&db, 128).unwrap_or_default()
+        };
+        for peer in &peers {
+            if let Ok(response) = client.get(format!("{peer}/mesh/gossip")).send().await {
+                if let Ok(body) = response.json::<Value>().await {
+                    if let Some(envelopes) = body.get("envelopes").and_then(Value::as_array) {
+                        let db = state.db.lock();
+                        for raw in envelopes {
+                            if let Ok(envelope) =
+                                serde_json::from_value::<interorg::Envelope>(raw.clone())
+                            {
+                                let _ = interorg::relay_store(&db, &envelope, interorg_work_bits());
+                            }
+                        }
+                    }
+                }
+            }
+            for envelope in &outgoing {
+                let _ = client
+                    .post(format!("{peer}/mesh/envelopes"))
+                    .json(envelope)
+                    .send()
+                    .await;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+}
+
 async fn sync_journal_get(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -1104,6 +1203,22 @@ pub async fn run() -> anyhow::Result<()> {
     let state = Arc::new(AppState {
         db: Mutex::new(conn),
     });
+    let relay_peers: Vec<String> = std::env::var("MESHKEEPER_RELAY_PEERS")
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|peer| !peer.is_empty())
+        .map(|peer| peer.trim_end_matches('/').to_owned())
+        .collect();
+    if relay_peers.len() > sync::MAX_PEERS as usize {
+        anyhow::bail!("MESHKEEPER_RELAY_PEERS превышает лимит peers");
+    }
+    for peer in &relay_peers {
+        validate_peer_url(peer).map_err(anyhow::Error::msg)?;
+    }
+    if !relay_peers.is_empty() {
+        tokio::spawn(interorg_relay_loop(state.clone(), relay_peers));
+    }
     let capabilities = sync_capabilities().map_err(anyhow::Error::msg)?;
     if capabilities.is_empty() && upstream_url().is_some() {
         anyhow::bail!("MESHKEEPER_UPSTREAM требует MESHKEEPER_SYNC_TOKEN не короче 32 символов");
@@ -1170,6 +1285,9 @@ pub async fn run() -> anyhow::Result<()> {
                 )
                 .route("/sync/journal/pull", post(sync_journal_pull))
                 .route("/sync/blob/{hash}", get(sync_blob_get))
+                .route("/mesh/envelopes", post(interorg_envelope_post))
+                .route("/mesh/envelopes/{destination}", get(interorg_envelopes_get))
+                .route("/mesh/gossip", get(interorg_gossip_get))
                 .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
                 .layer(middleware::from_fn(security_headers))
                 .with_state(state.clone());
@@ -1191,6 +1309,9 @@ pub async fn run() -> anyhow::Result<()> {
         )
         .route("/sync/journal/pull", post(sync_journal_pull))
         .route("/sync/blob/{hash}", get(sync_blob_get))
+        .route("/mesh/envelopes", post(interorg_envelope_post))
+        .route("/mesh/envelopes/{destination}", get(interorg_envelopes_get))
+        .route("/mesh/gossip", get(interorg_gossip_get))
         .route("/api/trpc/{*procedures}", any(trpc))
         .fallback_service(static_files)
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))

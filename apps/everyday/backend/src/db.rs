@@ -13,6 +13,7 @@ pub fn open(path: &Path) -> Result<Connection> {
     conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
     init_schema(&conn)?;
     migrate(&conn)?;
+    crate::interorg::init_schema(&conn)?;
     // Request proofs are an in-process hand-off between HTTP verification and
     // ledger append. They must never survive a crash/restart and be reused by
     // an unrelated operation.
