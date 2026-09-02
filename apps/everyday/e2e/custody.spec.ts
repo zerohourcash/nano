@@ -361,6 +361,16 @@ test("browser signs a real custody transaction and ledger retains its proof", as
     .getByPlaceholder("Например: Перфоратор Bosch GBH 8-45 DV")
     .fill("Шуруповёрт QR E2E");
   await page.locator("select").first().selectOption(String(category.id));
+  const existingQr = "https://manufacturer.example/assets/E2E-READY-QR-42";
+  await page
+    .getByRole("button", { name: "Привязать существующий QR" })
+    .click();
+  const binding = page.getByTestId("existing-qr-binding");
+  await binding
+    .getByPlaceholder("Или вставьте ссылку / токен")
+    .fill(existingQr);
+  await binding.getByRole("button", { name: "Далее" }).click();
+  await expect(binding).toContainText(`Привязываемый код: ${existingQr}`);
   await page.getByRole("button", { name: "Создать инструмент" }).click();
   await expect(page).toHaveURL(/\/tool\/\d+/, { timeout: 10_000 });
   const qrItemId = Number(page.url().match(/\/tool\/(\d+)/)?.[1]);
@@ -368,8 +378,10 @@ test("browser signs a real custody transaction and ledger retains its proof", as
     id: number;
     internalId: string;
     guid: string;
+    qrCode: string | null;
     history: Array<{ type: string; requestDeviceId?: string }>;
   }>(page, "items.byId", { id: qrItemId }, false);
+  expect(qrItem.qrCode).toBe(existingQr);
   expect(
     qrItem.history.find(entry => entry.type === "item_state_create")
       ?.requestDeviceId
@@ -401,17 +413,17 @@ test("browser signs a real custody transaction and ledger retains its proof", as
   ).toBeVisible();
   await expect(
     page.getByText(
-      "Для выдачи нужна подписанная QR-бирка V2 — обратитесь к кладовщику"
+      "QR не подписан и не привязан к карточке — обратитесь к кладовщику"
     )
   ).toBeVisible();
   await expect(page.getByRole("button", { name: "Взять все (1)" })).toHaveCount(
     0
   );
-  await page.locator('input[type="file"]').setInputFiles({
-    name: "signed-tool-qr.png",
-    mimeType: "image/png",
-    buffer: qrPng,
-  });
+  await manualCode.fill(existingQr);
+  await page.getByRole("button", { name: "Далее" }).click();
+  await expect(
+    page.getByText("Существующая метка привязана подписанной операцией")
+  ).toBeVisible();
   await expect(
     page.getByRole("button", { name: "Взять все (1)" })
   ).toBeVisible();
@@ -438,7 +450,7 @@ test("browser signs a real custody transaction and ledger retains its proof", as
   expect(qrEvent?.qrProofs).toHaveLength(1);
   expect(qrEvent?.qrProofs?.[0]).toMatchObject({
     itemId: qrItem.id,
-    version: 2,
+    version: 1,
   });
   expect(qrEvent?.qrProofs?.[0].sha256).toMatch(/^[a-f0-9]{64}$/);
 

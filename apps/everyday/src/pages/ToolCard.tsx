@@ -594,8 +594,22 @@ function TransferModal({
 }
 
 function QrModal({ open, onClose, item }: { open: boolean; onClose: () => void; item: ItemFull }) {
+  const utils = trpc.useUtils()
   const labelQ = trpc.items.qrLabel.useQuery({ itemId: item.id }, { enabled: open, retry: false })
   const value = labelQ.data?.label
+  const [binding, setBinding] = useState(false)
+  const [existingQr, setExistingQr] = useState('')
+  const [bindingMessage, setBindingMessage] = useState('')
+  const bindQr = trpc.items.update.useMutation({
+    onSuccess: async () => {
+      await utils.items.byId.invalidate({ id: item.id })
+      await utils.items.list.invalidate()
+      setBinding(false)
+      setExistingQr('')
+      setBindingMessage('Существующий QR привязан подписанной операцией')
+    },
+    onError: (error) => setBindingMessage(error.message),
+  })
 
   const downloadPng = () => {
     const canvas = document.getElementById('item-qr-canvas') as HTMLCanvasElement | null
@@ -642,6 +656,39 @@ function QrModal({ open, onClose, item }: { open: boolean; onClose: () => void; 
           Метка подписана Ed25519 и привязана к организации и карточке. Копию
           настоящей наклейки всё равно можно сделать — сверяйте название и номер на корпусе.
         </p>
+        {item.qrCode && item.qrCode !== item.internalId && (
+          <p className="w-full break-all rounded-xl bg-teal/10 p-3 text-xs text-teal-dark">
+            Уже привязана внешняя метка: <span className="font-mono-num">{item.qrCode}</span>
+          </p>
+        )}
+        <SecondaryButton
+          onClick={() => {
+            setBinding((current) => !current)
+            setExistingQr('')
+            setBindingMessage('')
+          }}
+          className="w-full"
+        >
+          <QrCode size={16} />
+          {binding ? 'Отмена привязки' : 'Привязать уже наклеенный QR'}
+        </SecondaryButton>
+        {binding && (
+          <div className="w-full space-y-3" data-testid="existing-qr-rebind">
+            <QrScanner onCode={(code) => setExistingQr(code.trim())} subjectLabel="существующую метку ТМЦ" />
+            {existingQr && (
+              <p className="break-all rounded-xl bg-brand-50 p-3 font-mono-num text-xs">{existingQr}</p>
+            )}
+            <PrimaryButton
+              className="w-full"
+              disabled={!existingQr || bindQr.isPending}
+              onClick={() => bindQr.mutate({ id: item.id, qrCode: existingQr })}
+            >
+              {bindQr.isPending ? <Loader2 size={16} className="animate-spin" /> : <CheckCircle2 size={16} />}
+              Подтвердить привязку
+            </PrimaryButton>
+          </div>
+        )}
+        {bindingMessage && <p className="w-full text-center text-sm text-ink-700">{bindingMessage}</p>}
         <div className="flex gap-2 w-full">
           <SecondaryButton onClick={downloadPng} className="flex-1">
             Скачать PNG
@@ -910,7 +957,7 @@ function TakeModal({
       <div className="space-y-4">
         <div>
           <p className="mb-2 text-[13px] font-semibold text-ink-500">
-            Обязательно отсканируйте подписанную QR-бирку на самом оборудовании
+            Обязательно отсканируйте подписанную или ранее привязанную QR-бирку на самом оборудовании
           </p>
           <QrScanner onCode={(value) => setQrLabel(value.trim())} />
           {qrLabel && <p className="mt-2 text-xs font-semibold text-success">QR получен и будет проверен сервером</p>}

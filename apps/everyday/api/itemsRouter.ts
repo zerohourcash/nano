@@ -85,7 +85,10 @@ export const itemsRouter = createRouter({
         ...item,
         qrVerification: {
           version: 1,
-          authenticity: 'legacy-unverified' as 'legacy-unverified' | 'trusted-node',
+          authenticity: 'legacy-unverified' as
+            | 'legacy-unverified'
+            | 'trusted-node'
+            | 'organization-bound',
         },
       };
     }),

@@ -74,9 +74,9 @@ export default function Scan() {
 
   useEffect(() => {
     if (!itemQ.data) return
-    if (itemQ.data.qrVerification.authenticity !== 'trusted-node') {
+    if (!['trusted-node', 'organization-bound'].includes(itemQ.data.qrVerification.authenticity)) {
       const frame = requestAnimationFrame(() => {
-        setToast('Для выдачи нужна подписанная QR-бирка V2 — обратитесь к кладовщику')
+        setToast('QR не подписан и не привязан к карточке — обратитесь к кладовщику')
       })
       return () => cancelAnimationFrame(frame)
     }
@@ -191,10 +191,12 @@ export default function Scan() {
                 {last.name} · {last.vn}
                 {last.assigneeName ? ` · у ${last.assigneeName}` : ' · на складе'}
               </div>
-              <p className={`text-xs font-semibold ${item.qrVerification.authenticity === 'trusted-node' ? 'text-success' : 'text-warning'}`}>
+              <p className={`text-xs font-semibold ${['trusted-node', 'organization-bound'].includes(item.qrVerification.authenticity) ? 'text-success' : 'text-warning'}`}>
                 {item.qrVerification.authenticity === 'trusted-node'
                   ? 'Подпись бирки проверена'
-                  : 'Старая неподписанная бирка — сверьте название и номер'}
+                  : item.qrVerification.authenticity === 'organization-bound'
+                    ? 'Существующая метка привязана подписанной операцией'
+                    : 'Старая неподписанная бирка — сверьте название и номер'}
               </p>
               {isMine && (
                 <button

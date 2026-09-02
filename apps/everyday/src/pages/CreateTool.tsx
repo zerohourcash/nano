@@ -31,6 +31,7 @@ import { preparePhoto } from '@/lib/photo'
 import type { PreparedPhoto } from '@/lib/photo'
 import { useStore } from '@/lib/store'
 import { BROWSER_FILE_LIMIT_BYTES, BROWSER_FILE_LIMIT_LABEL } from '@/lib/content-limits'
+import QrScanner from '@/components/QrScanner'
 
 // ─── Схема формы ─────────────────────────────────────────────────────────────
 
@@ -251,6 +252,8 @@ export default function CreateTool() {
   const [titlePhoto, setTitlePhoto] = useState<PreparedPhoto | null>(null)
   const [extraPhotos, setExtraPhotos] = useState<PreparedPhoto[]>([])
   const [samplesOpen, setSamplesOpen] = useState(false)
+  const [useExistingQr, setUseExistingQr] = useState(false)
+  const [existingQr, setExistingQr] = useState('')
   const titleFileRef = useRef<HTMLInputElement>(null)
   const extraFileRef = useRef<HTMLInputElement>(null)
 
@@ -307,7 +310,7 @@ export default function CreateTool() {
         statusId: values.statusId ?? undefined,
         comment: values.comment?.trim() || undefined,
         metadata,
-        qrCode: internalId || undefined,
+        qrCode: existingQr || internalId || undefined,
       },
       {
         onSuccess: async (item) => {
@@ -372,6 +375,8 @@ export default function CreateTool() {
             setTitlePhoto(null)
             setExtraPhotos([])
             setDocs([])
+            setUseExistingQr(false)
+            setExistingQr('')
             setToast(`Инструмент ${item?.internalId ?? ''} создан — можно добавить следующий`)
             requestAnimationFrame(() => setFocus('title'))
             // заново подставить дефолты
@@ -1096,13 +1101,26 @@ export default function CreateTool() {
                 transition={{ duration: 0.4 }}
                 className="shrink-0 bg-white rounded-xl p-2.5 border border-teal/40"
               >
-                <QRCodeSVG value={prefix + (internalIdNum || nextNum || '0000')} size={96} level="M" />
+                <QRCodeSVG value={existingQr || prefix + (internalIdNum || nextNum || '0000')} size={96} level="M" />
               </motion.div>
               <div className="space-y-2.5 text-center sm:text-left">
                 <p className="text-sm text-ink-900 flex items-center justify-center sm:justify-start gap-2">
                   <QrCode size={15} strokeWidth={1.75} className="text-teal-dark" />
-                  QR-код сформируется автоматически после создания карточки
+                  {existingQr
+                    ? 'Существующая метка будет криптографически привязана к карточке'
+                    : 'QR-код сформируется автоматически после создания карточки'}
                 </p>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setUseExistingQr((value) => !value)
+                    if (useExistingQr) setExistingQr('')
+                  }}
+                  className="inline-flex h-10 items-center gap-2 rounded-xl border border-brand-100 bg-white px-4 text-sm font-semibold text-brand-600 hover:bg-brand-50"
+                >
+                  <QrCode size={16} />
+                  {useExistingQr ? 'Использовать новый QR' : 'Привязать существующий QR'}
+                </button>
                 <label className="inline-flex items-center gap-2.5 cursor-pointer select-none">
                   <Controller
                     control={control}
@@ -1126,6 +1144,22 @@ export default function CreateTool() {
                 </label>
               </div>
             </div>
+            {useExistingQr && (
+              <div className="mt-4 border-t border-teal/30 pt-4" data-testid="existing-qr-binding">
+                <QrScanner
+                  onCode={(code) => {
+                    setExistingQr(code.trim())
+                    setToast('Существующий QR считан и будет привязан после сохранения')
+                  }}
+                  subjectLabel="существующую метку ТМЦ"
+                />
+                {existingQr && (
+                  <p className="mt-2 break-all rounded-xl bg-white p-3 font-mono-num text-xs text-ink-700">
+                    Привязываемый код: {existingQr}
+                  </p>
+                )}
+              </div>
+            )}
           </SectionCard>
         </div>
 

@@ -16,11 +16,12 @@ fn checkout_qr_proofs(request_body: Option<&str>, history_item_id: i64) -> Vec<V
     };
     let proof = |item_id: Option<i64>, label: Option<&str>| {
         label
-            .filter(|value| value.starts_with("everyday:item:v2:"))
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
             .map(|value| {
                 json!({
                     "itemId":item_id,
-                    "version":2,
+                    "version":if value.starts_with("everyday:item:v2:") { 2 } else { 1 },
                     "sha256":format!("{:x}", Sha256::digest(value.as_bytes()))
                 })
             })

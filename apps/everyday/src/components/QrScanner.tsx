@@ -213,9 +213,10 @@ export default function QrScanner({ onCode, className, subjectLabel = 'QR-код
         Загрузить фото QR
       </button>
 
-      <form
+      <div
         className="flex gap-2"
-        onSubmit={(e) => {
+        onKeyDown={(e) => {
+          if (e.key !== 'Enter') return
           e.preventDefault()
           const code = manual.trim()
           if (code) emit(code)
@@ -231,12 +232,16 @@ export default function QrScanner({ onCode, className, subjectLabel = 'QR-код
           />
         </div>
         <button
-          type="submit"
+          type="button"
+          onClick={() => {
+            const code = manual.trim()
+            if (code) emit(code)
+          }}
           className="h-11 rounded-xl bg-accent px-4 text-sm font-semibold text-white hover:bg-accent-hover"
         >
           Далее
         </button>
-      </form>
+      </div>
     </div>
   )
 }

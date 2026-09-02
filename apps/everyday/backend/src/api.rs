@@ -2020,6 +2020,59 @@ fn items_by_id(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiRes
     jsn::item_json(conn, id, true).ok_or_else(|| ApiError::not_found("Инструмент не найден"))
 }
 
+fn validate_qr_binding(
+    conn: &Connection,
+    workspace_id: i64,
+    item_id: Option<i64>,
+    internal_id: &str,
+    raw: &str,
+) -> Result<String, ApiError> {
+    let code = raw.trim();
+    if code.is_empty() || code.len() > 4096 || code.chars().any(char::is_control) {
+        return Err(ApiError::bad(
+            "QR-код должен содержать от 1 до 4096 печатных символов",
+        ));
+    }
+    if code != internal_id && code.starts_with("everyday:item:") {
+        return Err(ApiError::bad(
+            "Служебный QR Everyday нельзя привязать как внешнюю метку",
+        ));
+    }
+    let duplicate: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM items
+             WHERE workspace_id=?1 AND UPPER(qr_code)=UPPER(?2) AND id<>COALESCE(?3,-1)
+             LIMIT 1",
+            params![workspace_id, code, item_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if duplicate.is_some() {
+        return Err(ApiError::conflict(
+            "Этот QR-код уже привязан к другому ТМЦ в организации",
+        ));
+    }
+    Ok(code.to_string())
+}
+
+fn qr_binding_is_versioned(conn: &Connection, item_guid: &str, code: &str) -> bool {
+    conn.query_row(
+        "SELECT fields_json FROM item_state_versions
+         WHERE item_guid=?1 ORDER BY depth DESC,version_hash DESC LIMIT 1",
+        [item_guid],
+        |row| row.get::<_, String>(0),
+    )
+    .ok()
+    .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+    .and_then(|fields| {
+        fields
+            .get("qrCode")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    })
+    .is_some_and(|bound| bound == code)
+}
+
 fn items_by_code(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
     let uid = require_user(conn, user_id)?;
     let code = s(input, "code").ok_or_else(|| ApiError::bad("code"))?;
@@ -2042,6 +2095,22 @@ fn items_by_code(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiR
         .as_ref()
         .map(|label| label.item_guid.as_str())
         .or(canonical_guid);
+    if lookup_guid.is_none() {
+        let matches: i64 = conn.query_row(
+            "SELECT count(*) FROM items i
+             JOIN user_workspaces m ON m.workspace_id=i.workspace_id
+             JOIN users u ON u.id=m.user_id
+             WHERE m.user_id=?2 AND u.status='active' AND i.archived=0
+               AND (i.qr_code=?1 OR UPPER(i.qr_code)=UPPER(?1))",
+            params![code, uid],
+            |row| row.get(0),
+        )?;
+        if matches > 1 {
+            return Err(ApiError::conflict(
+                "QR найден в нескольких доступных организациях; выберите организацию",
+            ));
+        }
+    }
     let id: Option<i64> = conn.query_row(
         "SELECT i.id
          FROM items i
@@ -2060,6 +2129,12 @@ fn items_by_code(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiR
     item["qrVerification"] = if let Some(label) = signed {
         json!({"version":2,"authenticity":"trusted-node","workspaceGuid":label.workspace_guid,
             "internalId":label.internal_id,"issuedAt":label.issued_at,"publicKey":label.public_key})
+    } else if item["qrCode"].as_str().is_some_and(|stored| {
+        code.trim() == stored
+            && stored != item["internalId"].as_str().unwrap_or_default()
+            && qr_binding_is_versioned(conn, item["guid"].as_str().unwrap_or_default(), stored)
+    }) {
+        json!({"version":1,"authenticity":"organization-bound","algorithm":"Ed25519 item-state"})
     } else {
         json!({"version":1,"authenticity":"legacy-unverified"})
     };
@@ -2083,22 +2158,31 @@ fn verify_checkout_qr(
     let label = label.ok_or_else(|| {
         ApiError::bad("Перед выдачей отсканируйте подписанный QR V2 на оборудовании")
     })?;
-    if !label.trim().starts_with("everyday:item:v2:") {
-        return Err(ApiError::bad(
-            "Для выдачи требуется подписанная QR-бирка V2; старую бирку перепечатайте",
-        ));
-    }
-    let verified = crate::qr_label::verify(conn, &label)
-        .map_err(|error| ApiError::bad(format!("QR выдачи отклонён: {error}")))?;
-    let item_guid: Option<String> = conn
+    let item: Option<(String, String, String)> = conn
         .query_row(
-            "SELECT guid FROM items WHERE id=?1 AND archived=0",
+            "SELECT guid,internal_id,COALESCE(qr_code,'') FROM items WHERE id=?1 AND archived=0",
             [item_id],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .optional()?;
-    if item_guid.as_deref() != Some(verified.item_guid.as_str()) {
-        return Err(ApiError::bad("QR относится к другому оборудованию"));
+    let Some((item_guid, internal_id, stored_qr)) = item else {
+        return Err(ApiError::not_found("Инструмент не найден"));
+    };
+    if label.trim().starts_with("everyday:item:v2:") {
+        let verified = crate::qr_label::verify(conn, &label)
+            .map_err(|error| ApiError::bad(format!("QR выдачи отклонён: {error}")))?;
+        if item_guid != verified.item_guid {
+            return Err(ApiError::bad("QR относится к другому оборудованию"));
+        }
+        return Ok(());
+    }
+    if stored_qr == internal_id
+        || stored_qr != label.trim()
+        || !qr_binding_is_versioned(conn, &item_guid, &stored_qr)
+    {
+        return Err(ApiError::bad(
+            "QR не является подписанной или привязанной к этой карточке меткой",
+        ));
     }
     Ok(())
 }
@@ -2284,7 +2368,13 @@ fn items_create_atomic(conn: &Connection, input: &Value, user_id: Option<i64>) -
             .unwrap_or("ВН-0001")
             .to_string()
     };
-    let qr = s(input, "qrCode").or(Some(internal.clone()));
+    let qr = validate_qr_binding(
+        conn,
+        ws,
+        None,
+        &internal,
+        s(input, "qrCode").as_deref().unwrap_or(&internal),
+    )?;
     let metadata = item_metadata(input)?;
     conn.execute(
         "INSERT INTO items (internal_id, title, category_id, brand_id, status_id, responsible_user_id, building_site_id, storage_id, workspace_id, serial_number, cost, quantitative, quantity, unit, comment, qr_code, source_system, external_id, metadata_json, created_at, organization_node_id)
@@ -2343,6 +2433,15 @@ fn items_update_atomic_bound(
         .as_i64()
         .ok_or_else(|| ApiError::bad("Некорректный item"))?;
     validate_item_references(conn, input, ws)?;
+    if let Some(qr) = s(input, "qrCode") {
+        validate_qr_binding(
+            conn,
+            ws,
+            Some(id),
+            before["internalId"].as_str().unwrap_or_default(),
+            &qr,
+        )?;
+    }
     let before_status = before["statusId"].as_i64();
     let next_status = if input.get("statusId").is_some() {
         i64v(input, "statusId")
@@ -8878,6 +8977,93 @@ mod tests {
         )
         .unwrap();
         assert_eq!(checked_out["responsibleUserId"], users[0]);
+        cleanup(conn, path);
+    }
+
+    #[test]
+    fn existing_qr_is_unique_versioned_and_accepted_for_checkout() {
+        let (mut conn, path, users, ws) = test_db();
+        let code = "https://manufacturer.example/assets/READY-42";
+        let created = dispatch(
+            &mut conn,
+            "items.create",
+            &json!({
+                "workspaceId":ws,
+                "title":"Already labelled drill",
+                "internalId":"BOUND-42",
+                "qrCode":code
+            }),
+            Some(users[0]),
+        )
+        .unwrap();
+        let item_id = created["id"].as_i64().unwrap();
+
+        let found = dispatch(
+            &mut conn,
+            "items.byCode",
+            &json!({"code":code}),
+            Some(users[0]),
+        )
+        .unwrap();
+        assert_eq!(found["id"], item_id);
+        assert_eq!(
+            found["qrVerification"]["authenticity"],
+            "organization-bound"
+        );
+        let canonical = dispatch(
+            &mut conn,
+            "items.byCode",
+            &json!({"code":format!("everyday:item:{}", created["guid"].as_str().unwrap())}),
+            Some(users[0]),
+        )
+        .unwrap();
+        assert_eq!(canonical["qrVerification"]["authenticity"], "legacy-unverified");
+
+        let duplicate = dispatch(
+            &mut conn,
+            "items.create",
+            &json!({
+                "workspaceId":ws,
+                "title":"Duplicate label",
+                "internalId":"BOUND-43",
+                "qrCode":code.to_lowercase()
+            }),
+            Some(users[0]),
+        )
+        .unwrap_err();
+        assert_eq!(duplicate.http, 409);
+
+        let wrong = dispatch(
+            &mut conn,
+            "transfers.take",
+            &json!({"itemId":item_id,"qrLabel":"READY-41"}),
+            Some(users[0]),
+        )
+        .unwrap_err();
+        assert_eq!(wrong.http, 400);
+
+        let checked_out = dispatch(
+            &mut conn,
+            "transfers.take",
+            &json!({"itemId":item_id,"qrLabel":code}),
+            Some(users[0]),
+        )
+        .unwrap();
+        assert_eq!(checked_out["responsibleUserId"], users[0]);
+
+        let reserved = dispatch(
+            &mut conn,
+            "items.create",
+            &json!({
+                "workspaceId":ws,
+                "title":"Reserved label",
+                "internalId":"BOUND-44",
+                "qrCode":"everyday:item:v2:forged"
+            }),
+            Some(users[0]),
+        )
+        .unwrap_err();
+        assert_eq!(reserved.http, 400);
         cleanup(conn, path);
     }
 
