@@ -4,26 +4,26 @@
 
 @layer base {
   :root {
-    --background: 240 23% 94%;
-    --foreground: 236 36% 29%;
+    --background: 0 0% 97%;
+    --foreground: 0 0% 10%;
     --card: 0 0% 100%;
-    --card-foreground: 236 36% 29%;
+    --card-foreground: 0 0% 10%;
     --popover: 0 0% 100%;
-    --popover-foreground: 236 36% 29%;
-    --primary: 236 24% 49%;
+    --popover-foreground: 0 0% 10%;
+    --primary: 0 0% 10%;
     --primary-foreground: 0 0% 100%;
-    --secondary: 240 38% 95%;
-    --secondary-foreground: 236 36% 29%;
-    --muted: 240 38% 95%;
-    --muted-foreground: 236 21% 52%;
-    --accent: 342 75% 51%;
+    --secondary: 0 0% 96%;
+    --secondary-foreground: 0 0% 10%;
+    --muted: 0 0% 96%;
+    --muted-foreground: 0 0% 36%;
+    --accent: 0 0% 10%;
     --accent-foreground: 0 0% 100%;
     --destructive: 0 64% 55%;
     --destructive-foreground: 0 0% 100%;
-    --border: 240 57% 86%;
-    --input: 240 57% 86%;
-    --ring: 236 24% 49%;
-    --radius: 0.75rem;
+    --border: 0 0% 88%;
+    --input: 0 0% 88%;
+    --ring: 0 0% 10%;
+    --radius: 0.25rem;
   }
 }
 
@@ -32,21 +32,22 @@
     @apply border-border;
   }
   html {
-    font-family: 'Segoe UI', Roboto, system-ui, -apple-system, sans-serif;
+    font-family: 'Helvetica Neue', Helvetica, Arial, system-ui, sans-serif;
     -webkit-text-size-adjust: 100%;
   }
   body {
     @apply bg-app text-ink-900 antialiased;
     min-width: 320px;
     overscroll-behavior-y: none;
+    letter-spacing: 0.01em;
   }
   ::selection {
-    background: #5e629b33;
+    background: #19191922;
   }
   /* Тонкие скроллбары (design.md §7) */
   * {
     scrollbar-width: thin;
-    scrollbar-color: #c9c9f0 transparent;
+    scrollbar-color: #c8c8c8 transparent;
   }
   *::-webkit-scrollbar {
     width: 8px;
@@ -56,17 +57,18 @@
     background: transparent;
   }
   *::-webkit-scrollbar-thumb {
-    background: #c9c9f0;
-    border-radius: 999px;
+    background: #c8c8c8;
+    border-radius: 0;
   }
   *::-webkit-scrollbar-thumb:hover {
-    background: #5e629b;
+    background: #191919;
   }
   input:focus-visible,
   button:focus-visible,
   select:focus-visible,
   a:focus-visible {
-    outline: none;
+    outline: 1px solid #191919;
+    outline-offset: 3px;
   }
 }
 
@@ -83,5 +85,11 @@
     font-weight: 600;
     letter-spacing: 0.04em;
     text-transform: uppercase;
+  }
+  .font-bold {
+    font-weight: 500;
+  }
+  .font-semibold {
+    font-weight: 500;
   }
 }

@@ -32,16 +32,16 @@ export default function TopBar() {
   }
 
   return (
-    <header className="hidden lg:flex sticky top-0 z-40 h-16 items-center gap-4 bg-surface px-6 shadow-card">
+    <header className="hidden lg:flex sticky top-0 z-40 h-[72px] items-center gap-5 border-b border-brand-100 bg-surface px-8">
       {/* Глобальный поиск */}
-      <div className="relative w-[360px] shrink-0">
+      <div className="relative w-[320px] shrink-0 xl:w-[360px]">
         <Search size={18} className="absolute left-3.5 top-1/2 -translate-y-1/2 text-ink-300" />
         <input
           value={query}
           onChange={(e) => setQuery(e.target.value)}
           onKeyDown={(e) => e.key === 'Enter' && submitSearch()}
           placeholder="Поиск по названию или вн. номеру"
-          className="h-11 w-full rounded-xl border border-brand-100 bg-white pl-10 pr-16 text-sm text-ink-900 placeholder:text-ink-300 focus:border-brand-600 focus:shadow-[0_0_0_3px_#5E629B22] transition-shadow"
+          className="h-11 w-full rounded-none border-0 border-b border-brand-100 bg-white pl-10 pr-16 text-sm text-ink-900 placeholder:text-ink-300 focus:border-brand-600"
         />
         {query ? (
           <button
@@ -60,10 +60,9 @@ export default function TopBar() {
       <div ref={wsRef} className="relative">
         <button
           onClick={() => setWsOpen((v) => !v)}
-          className="flex items-center gap-1.5 rounded-xl px-3 py-2 text-sm text-ink-500 hover:bg-brand-50 transition-colors"
+          className="flex max-w-52 items-center gap-1.5 whitespace-nowrap rounded-xl px-3 py-2 text-sm text-ink-500 hover:bg-brand-50 transition-colors"
         >
-          <span>Вы работаете в:</span>
-          <span className="font-semibold text-ink-900">{workspace?.name ?? '—'}</span>
+          <span className="truncate font-semibold text-ink-900">{workspace?.name ?? '—'}</span>
           <ChevronDown size={16} className={cn('transition-transform', wsOpen && 'rotate-180')} />
         </button>
         {wsOpen && (
@@ -102,20 +101,14 @@ export default function TopBar() {
       {/* Плашка передач */}
       <Link
         to="/transfers"
-        className="flex items-center gap-1.5 rounded-full bg-warning-bg px-3.5 py-2 text-[13px] font-semibold text-warning hover:brightness-[0.98] transition"
+        className="flex items-center gap-1.5 whitespace-nowrap rounded-full bg-warning-bg px-3.5 py-2 text-[13px] font-semibold text-warning hover:brightness-[0.98] transition"
       >
-        <span>
-          На передачу <span className="font-mono">{transfersToSend}</span>
-        </span>
-        <span className="text-warning/50">·</span>
-        <span>
-          Ожидает приёма <span className="font-mono">{transfersToReceive}</span>
-        </span>
+        Передачи <span className="font-mono">{transfersToSend + transfersToReceive}</span>
       </Link>
 
       {/* Индикатор синхронизации */}
       <div
-        className="hidden xl:flex items-center gap-1.5 text-[13px] font-semibold text-teal-dark"
+        className="hidden 2xl:flex items-center gap-1.5 whitespace-nowrap text-[13px] font-semibold text-teal-dark"
         title="Журнал операций сохранён на сервере · закладка под офлайн-ноду"
       >
         <span className="w-2 h-2 rounded-full bg-teal" />

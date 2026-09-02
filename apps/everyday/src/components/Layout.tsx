@@ -17,7 +17,7 @@ export default function Layout() {
         <TopBar />
         <MobileNav />
         <main className="flex-1 pb-24 lg:pb-8">
-          <div className="mx-auto max-w-container px-3 sm:px-4 lg:px-6 py-4 lg:py-6">
+          <div className="mx-auto max-w-container px-4 sm:px-6 lg:px-10 py-6 lg:py-10">
             <Outlet />
           </div>
         </main>

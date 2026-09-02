@@ -44,7 +44,7 @@ export default function Sidebar() {
     <aside
       className={cn(
         'hidden lg:flex flex-col bg-surface border-r border-brand-100 sticky top-0 h-[100dvh] shrink-0 transition-[width] duration-200',
-        sidebarCollapsed ? 'w-[72px]' : 'w-60'
+        sidebarCollapsed ? 'w-[72px]' : 'w-64'
       )}
     >
       {/* Логотип */}
@@ -56,9 +56,9 @@ export default function Sidebar() {
         )}
       >
         {sidebarCollapsed ? (
-          <img src="/logo-mark.svg" alt="Everyday" className="w-10 h-10" />
+          <img src="/logo-mark.svg" alt="Everyday" className="w-10 h-10 grayscale" />
         ) : (
-          <img src="/logo.svg" alt="Everyday" className="h-9 w-auto" />
+          <img src="/logo.svg" alt="Everyday" className="h-8 w-auto grayscale" />
         )}
       </Link>
 

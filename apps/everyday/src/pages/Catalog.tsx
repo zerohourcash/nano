@@ -538,7 +538,7 @@ export default function Catalog() {
           animate={{ opacity: 1, y: 0 }}
           transition={{ duration: 0.28, ease: [0.22, 1, 0.36, 1] }}
         >
-          <h1 className="text-2xl lg:text-[28px] leading-9 font-bold tracking-[-0.01em] text-ink-900">
+          <h1 className="text-2xl lg:text-[32px] leading-10 font-bold tracking-[-0.01em] text-ink-900">
             {activeOrganizationTab?.tabLabel ?? 'Все ТМЦ'}{' '}
             <span className="font-mono-num text-ink-500 font-semibold">({listQ.data?.total ?? tools.length} ед.)</span>
           </h1>
@@ -550,16 +550,9 @@ export default function Catalog() {
           transition={{ duration: 0.28, delay: 0.05, ease: [0.22, 1, 0.36, 1] }}
           className="flex flex-wrap items-center gap-2"
         >
-          <Link
-            to="/invite"
-            className="inline-flex items-center gap-2 h-10 px-4 rounded-xl bg-accent text-white text-sm font-semibold hover:bg-accent-hover hover:-translate-y-px active:scale-[0.97] transition"
-          >
-            <QrCode size={16} strokeWidth={2.25} />
-            Пригласить по QR
-          </Link>
           <button
             onClick={() => navigate('/scan')}
-            className="inline-flex items-center gap-2 h-10 px-4 rounded-xl border border-brand-100 bg-white text-sm font-semibold text-ink-900 hover:bg-brand-50 transition"
+            className="inline-flex items-center gap-2 h-10 px-5 rounded-xl bg-accent text-white text-sm font-semibold hover:bg-accent-hover transition"
           >
             <QrCode size={16} strokeWidth={2.25} />
             Сканировать QR
