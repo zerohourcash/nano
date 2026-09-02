@@ -23,6 +23,7 @@ const Chat = lazy(() => import('@/pages/Chat'))
 const Invite = lazy(() => import('@/pages/Invite'))
 const Knowledge = lazy(() => import('@/pages/Knowledge'))
 const BitWallet = lazy(() => import('@/pages/BitWallet'))
+const VoiceCommands = lazy(() => import('@/pages/VoiceCommands'))
 
 function PageFallback() {
   return (
@@ -44,6 +45,7 @@ export default function App() {
           <Route element={<Layout />}>
             <Route index element={<Catalog />} />
             <Route path="scan" element={<Scan />} />
+            <Route path="voice" element={<VoiceCommands />} />
             <Route path="my" element={<MyTools />} />
             <Route path="tool/:id" element={<ToolCard />} />
             <Route path="create" element={<CreateTool />} />

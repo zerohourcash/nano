@@ -824,6 +824,23 @@ test("browser signs a real custody transaction and ledger retains its proof", as
   await expect(page.getByText("Файл из локального чата")).toBeVisible();
   await expect(page.getByRole("link", { name: "mesh-note.txt" })).toBeVisible();
 
+  await page.goto("/voice");
+  await expect(page.getByTestId("voice-commands")).toBeVisible();
+  await page
+    .getByLabel("Текст голосовой команды")
+    .fill("Отправь сообщение в чат: Голосовая смена завершена");
+  await page.getByRole("button", { name: "Разобрать" }).click();
+  await expect(page.getByText("Голосовая смена завершена")).toBeVisible();
+  await page.getByRole("button", { name: "Подписать и отправить" }).click();
+  await expect(page.getByRole("status")).toContainText(
+    "Сообщение подписано"
+  );
+  await page
+    .getByLabel("Текст голосовой команды")
+    .fill("Найди инструмент Шуруповёрт QR E2E");
+  await page.getByRole("button", { name: "Разобрать" }).click();
+  await expect(page.getByText(/Шуруповёрт QR E2E.*ВН-/)).toBeVisible();
+
   const transportBundle = await trpc<{
     format: string;
     version: number;

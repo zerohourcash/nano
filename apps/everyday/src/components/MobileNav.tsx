@@ -18,12 +18,14 @@ import {
   UserRound,
   X,
   Coins,
+  Mic,
 } from 'lucide-react'
 import { AnimatePresence, motion } from 'framer-motion'
 import { cn } from '@/lib/utils'
 import { useStore } from '@/lib/store'
 
 const moreItems = [
+  { to: '/voice', label: 'Голосовые команды', icon: Mic },
   { to: '/invite', label: 'Пригласить по QR', icon: QrCode },
   { to: '/notifications', label: 'Сроки и уведомления', icon: Bell },
   { to: '/history', label: 'История', icon: History },

@@ -14,6 +14,7 @@ import {
   ChevronsLeft,
   ChevronsRight,
   Coins,
+  Mic,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { useStore } from '@/lib/store'
@@ -21,6 +22,7 @@ import { useStore } from '@/lib/store'
 const navItems = [
   { to: '/', label: 'Все ТМЦ', icon: Wrench, end: true },
   { to: '/invite', label: 'Пригласить по QR', icon: QrCode },
+  { to: '/voice', label: 'Голосовые команды', icon: Mic },
   { to: '/my', label: 'Мои ТМЦ', icon: Package },
   { to: '/transfers', label: 'Приём-передача', icon: ArrowLeftRight, badge: true },
   { to: '/history', label: 'История', icon: History },
