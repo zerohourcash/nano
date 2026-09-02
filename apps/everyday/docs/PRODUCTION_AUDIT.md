@@ -10,8 +10,8 @@ production HTTP/Chromium, offline sync, mesh/discovery, adversarial,
 multi-tenant capability, interorg AEAD, spam, constrained-MTU transport,
 mobile restart, SQLCipher, backup/restore, 100 отдельных процессов и Android
 APK. Debug APK содержит Rust JNI-ноду для `arm64-v8a` и `x86_64`, размер
-75 725 388 байт, SHA-256
-`7755df1830952ef09d25446ca2bbf540dec7e497a783b525f9b460342a84ba42`.
+75 751 158 байт, SHA-256
+`245a6b1bac2065eb695a532d863645a2dcacef9cab60af4c0bad9aedc4b50cfa`.
 Это воспроизводимое программное доказательство; BLE RF на двух физических
 телефонах и независимый криптографический аудит остаются внешними release-gate.
 Контур скачивания отдельно проверяет совпадение metadata/байтов/SHA-256 и
@@ -20,10 +20,10 @@ fail-closed запуск до создания базы при подменён�
 из проверенного desktop-каталога, повторно проходит SHA-256 при старте узла и
 доступен с экрана входа; его распакованный бинарник прошёл startup/health/UI
 smoke без Node.js и сети. Manifest v2 внутри публичного архива фиксирует
-`sourceRevision=7ceb12fbee30cc423c7c80396563e552f1755810` и
+`sourceRevision=292b44b7bc97cdfa853b27e6a65ceea4f505146a` и
 `sourceDirty=false`; runtime `/health.buildRevision` совпадает с manifest.
-Архив имеет размер 28 070 785 байт и SHA-256
-`2ac43691e3f4433f0a554d5ab02bedf51386d766e89148ab7d60ef8ea005e55c`.
+Архив имеет размер 28 075 731 байт и SHA-256
+`bbd16f6a799cf68f48df2149212d27f8fa7240f1cf7044211a22f72f72ab4b5e`.
 Публичный тестовый стенд использует отдельную демо-БД и явную связанную пару
 `DEMO_DATA+DEMO_LOGIN`: посетители выбирают разные роли на экране входа без
 API-токена. Неполная пара запрещена startup-тестом; production onboarding
